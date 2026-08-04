@@ -19,9 +19,13 @@ AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
 AIRTABLE_TABLE_NAME = os.environ["AIRTABLE_TABLE_NAME"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-AI_BATCH_LIMIT = int(os.getenv("AI_BATCH_LIMIT", "100"))
+AI_BATCH_LIMIT = int(os.getenv("AI_BATCH_LIMIT", "20"))
 QUALIFICATION_THRESHOLD = int(os.getenv("QUALIFICATION_THRESHOLD", "55"))
 AIRTABLE_FORMULA_WAIT_SECONDS = int(os.getenv("AIRTABLE_FORMULA_WAIT_SECONDS", "15"))
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2500"))
+OPENAI_MAX_ATTEMPTS = int(os.getenv("OPENAI_MAX_ATTEMPTS", "3"))
+OPENAI_RETRY_DELAY_SECONDS = int(os.getenv("OPENAI_RETRY_DELAY_SECONDS", "5"))
+MAX_POST_CHARS = int(os.getenv("MAX_POST_CHARS", "8000"))
 
 FIELD_URL = "Url"
 FIELD_FACEBOOK_URL = "Facebook url"
@@ -316,6 +320,13 @@ def fetch_ai_queue() -> list[dict[str, Any]]:
 
 
 def qualify_post(fields: dict[str, Any]) -> dict[str, Any]:
+    """Qualify one post with retries for incomplete or malformed output."""
+    raw_post_text = str(fields.get(FIELD_TEXT, ""))
+    post_text = raw_post_text[:MAX_POST_CHARS]
+
+    if len(raw_post_text) > MAX_POST_CHARS:
+        post_text += "\n[Post text truncated by pipeline]"
+
     post_input = f"""
 Evaluate this Facebook post as a potential BruceTech business lead.
 
@@ -329,43 +340,111 @@ FACEBOOK GROUP:
 {fields.get(FIELD_GROUP_TITLE, "")}
 
 POST TEXT:
-{fields.get(FIELD_TEXT, "")}
+{post_text}
 
 POST URL:
 {fields.get(FIELD_URL, "")}
 """.strip()
-    response = OPENAI_CLIENT.responses.create(
-        model=OPENAI_MODEL,
-        instructions=SYSTEM_INSTRUCTIONS,
-        input=post_input,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "brucetech_lead_result",
-                "schema": LEAD_SCHEMA,
-                "strict": True,
-            }
-        },
-        max_output_tokens=1000,
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, OPENAI_MAX_ATTEMPTS + 1):
+        # Give later retries more room in case the first response was cut off.
+        token_budget = OPENAI_MAX_OUTPUT_TOKENS + ((attempt - 1) * 1500)
+
+        try:
+            response = OPENAI_CLIENT.responses.create(
+                model=OPENAI_MODEL,
+                instructions=SYSTEM_INSTRUCTIONS,
+                input=post_input,
+                reasoning={"effort": "low"},
+                text={
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "brucetech_lead_result",
+                        "schema": LEAD_SCHEMA,
+                        "strict": True,
+                    },
+                },
+                max_output_tokens=token_budget,
+                store=False,
+            )
+
+            status = getattr(response, "status", None)
+            incomplete_details = getattr(response, "incomplete_details", None)
+            output_text = (getattr(response, "output_text", "") or "").strip()
+
+            if status == "failed":
+                response_error = getattr(response, "error", None)
+                raise RuntimeError(
+                    f"OpenAI response failed: {response_error}"
+                )
+
+            if status == "incomplete":
+                raise RuntimeError(
+                    "OpenAI response was incomplete. "
+                    f"Details: {incomplete_details}; "
+                    f"token budget: {token_budget}"
+                )
+
+            if not output_text:
+                raise RuntimeError(
+                    "OpenAI returned no output text. "
+                    f"Status: {status}; details: {incomplete_details}"
+                )
+
+            try:
+                result = json.loads(output_text)
+            except json.JSONDecodeError as exc:
+                preview = output_text[:300].replace("\n", " ")
+                raise RuntimeError(
+                    "OpenAI returned incomplete or invalid structured JSON: "
+                    f"{exc}. Output preview: {preview!r}"
+                ) from exc
+
+            score = int(result.get("lead_score", 0))
+            result["lead_score"] = max(0, min(score, 100))
+
+            if result["lead_score"] < QUALIFICATION_THRESHOLD:
+                result["qualified"] = False
+
+            if not result.get("qualified", False):
+                result["qualified"] = False
+                result["suggested_dm"] = ""
+                result["recommended_channel"] = "do_not_contact"
+                result["service_match"] = (
+                    result.get("service_match") or "None"
+                )
+                result["rejection_reason"] = (
+                    result.get("rejection_reason")
+                    or "The post did not meet the qualification threshold."
+                )
+            else:
+                result["rejection_reason"] = (
+                    result.get("rejection_reason") or "None"
+                )
+
+            return result
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt >= OPENAI_MAX_ATTEMPTS:
+                break
+
+            wait_seconds = OPENAI_RETRY_DELAY_SECONDS * attempt
+            print(
+                f"OpenAI attempt {attempt}/{OPENAI_MAX_ATTEMPTS} failed: "
+                f"{exc}. Retrying in {wait_seconds}s...",
+                flush=True,
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        f"OpenAI qualification failed after {OPENAI_MAX_ATTEMPTS} "
+        f"attempts: {last_error}"
     )
-    if not response.output_text:
-        raise RuntimeError("OpenAI returned an empty response.")
-    result = json.loads(response.output_text)
-    score = int(result.get("lead_score", 0))
-    result["lead_score"] = max(0, min(score, 100))
-    if result["lead_score"] < QUALIFICATION_THRESHOLD:
-        result["qualified"] = False
-    if not result.get("qualified", False):
-        result["qualified"] = False
-        result["suggested_dm"] = ""
-        result["recommended_channel"] = "do_not_contact"
-        result["service_match"] = result.get("service_match") or "None"
-        result["rejection_reason"] = result.get("rejection_reason") or (
-            "The post did not meet the qualification threshold."
-        )
-    else:
-        result["rejection_reason"] = result.get("rejection_reason") or "None"
-    return result
 
 
 def map_ai_result_to_airtable(result: dict[str, Any]) -> dict[str, Any]:

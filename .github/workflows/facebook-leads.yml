@@ -10,7 +10,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -20,7 +20,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -33,7 +33,12 @@ jobs:
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-5-mini
+          OPENAI_MODEL: "gpt-5-mini"
           QUALIFICATION_THRESHOLD: "55"
-          AI_BATCH_LIMIT: "100"
-        run: python run_pipeline.py
+          AI_BATCH_LIMIT: "20"
+          OPENAI_MAX_OUTPUT_TOKENS: "2500"
+          OPENAI_MAX_ATTEMPTS: "3"
+          OPENAI_RETRY_DELAY_SECONDS: "5"
+          MAX_POST_CHARS: "8000"
+          AIRTABLE_FORMULA_WAIT_SECONDS: "15"
+    run: python run_pipeline.py
