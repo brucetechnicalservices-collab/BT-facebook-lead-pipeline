@@ -41,4 +41,4 @@ jobs:
           OPENAI_RETRY_DELAY_SECONDS: "5"
           MAX_POST_CHARS: "8000"
           AIRTABLE_FORMULA_WAIT_SECONDS: "15"
-    run: python run_pipeline.py
+        run: python run_pipeline.py
