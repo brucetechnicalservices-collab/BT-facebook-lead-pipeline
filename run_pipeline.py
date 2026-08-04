@@ -186,8 +186,11 @@ Scoring:
 - No credible business context: -25
 - Unrelated request: -40
 
-A score of 55 or higher may be qualified.
-Do not force a post to reach the threshold.
+Qualification must follow the numeric threshold exactly:
+- lead_score 55 or higher: qualified must be true
+- lead_score below 55: qualified must be false
+
+Do not force the score upward merely to qualify a post.
 
 For qualified leads:
 - Write a natural Facebook DM under 80 words
@@ -668,11 +671,41 @@ POST URL:
             score = int(result.get("lead_score", 0))
             result["lead_score"] = max(0, min(score, 100))
 
-            if result["lead_score"] < QUALIFICATION_THRESHOLD:
-                result["qualified"] = False
+            # Qualification is determined consistently by the configured
+            # numeric threshold. The previous version only forced low-scoring
+            # records to False, which allowed a score such as 65 to remain
+            # Qualified=False when the model returned an inconsistent Boolean.
+            result["qualified"] = (
+                result["lead_score"] >= QUALIFICATION_THRESHOLD
+            )
 
-            if not result.get("qualified", False):
-                result["qualified"] = False
+            if result["qualified"]:
+                result["rejection_reason"] = "None"
+
+                if result.get("recommended_channel") == "do_not_contact":
+                    result["recommended_channel"] = "direct_message"
+
+                # Structured output should normally include a DM. This fallback
+                # prevents a threshold-qualified record from being excluded
+                # from the Outreach Ready view because Suggested DM is blank.
+                if not str(result.get("suggested_dm", "")).strip():
+                    author = str(
+                        fields.get(FIELD_USER_NAME, "")
+                    ).strip()
+                    greeting = f"Hi {author}," if author else "Hi,"
+                    service = str(
+                        result.get("service_match") or
+                        "your business technology needs"
+                    ).strip()
+
+                    result["suggested_dm"] = (
+                        f"{greeting} I saw your post and thought BruceTech "
+                        f"may be able to help with {service}. We support "
+                        f"businesses with websites, IT, and automation "
+                        f"solutions. You can see more at brucetech.ca. "
+                        f"Would you be open to a quick chat?"
+                    )
+            else:
                 result["suggested_dm"] = ""
                 result["recommended_channel"] = "do_not_contact"
 
@@ -683,8 +716,6 @@ POST URL:
                     result["rejection_reason"] = (
                         "The post did not meet the qualification threshold."
                     )
-            elif not result.get("rejection_reason"):
-                result["rejection_reason"] = "None"
 
             return result
 
