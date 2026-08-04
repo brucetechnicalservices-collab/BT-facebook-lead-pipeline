@@ -24,17 +24,17 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 AI_BATCH_LIMIT = int(os.getenv("AI_BATCH_LIMIT", "100"))
 QUALIFICATION_THRESHOLD = int(
-os.getenv("QUALIFICATION_THRESHOLD", "55")
+    os.getenv("QUALIFICATION_THRESHOLD", "55")
 )
 
 AIRTABLE_URL = (
-"https://api.airtable.com/v0/"
-f"{AIRTABLE_BASE_ID}/{quote(AIRTABLE_TABLE_NAME, safe='')}"
+    "https://api.airtable.com/v0/"
+    f"{AIRTABLE_BASE_ID}/{quote(AIRTABLE_TABLE_NAME, safe='')}"
 )
 
 AIRTABLE_HEADERS = {
-"Authorization": f"Bearer {AIRTABLE_TOKEN}",
-"Content-Type": "application/json",
+    "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+    "Content-Type": "application/json",
 }
 
 OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
@@ -133,190 +133,190 @@ Always return all fields.
 
 
 LEAD_SCHEMA: dict[str, Any] = {
-"type": "object",
-"properties": {
-"qualified": {
-"type": "boolean"
-},
-"lead_score": {
-"type": "integer",
-"minimum": 0,
-"maximum": 100
-},
-"service_match": {
-"type": "string"
-},
-"lead_summary": {
-"type": "string"
-},
-"rejection_reason": {
-"type": "string"
-},
-"suggested_dm": {
-"type": "string"
-},
-"recommended_channel": {
-"type": "string",
-"enum": [
-"direct_message",
-"public_reply_then_dm",
-"do_not_contact"
-]
-},
-"evidence": {
-"type": "string"
-}
-},
-"required": [
-"qualified",
-"lead_score",
-"service_match",
-"lead_summary",
-"rejection_reason",
-"suggested_dm",
-"recommended_channel",
-"evidence"
-],
-"additionalProperties": False
+    "type": "object",
+    "properties": {
+        "qualified": {
+            "type": "boolean"
+        },
+        "lead_score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+        },
+        "service_match": {
+            "type": "string"
+        },
+        "lead_summary": {
+            "type": "string"
+        },
+        "rejection_reason": {
+            "type": "string"
+        },
+        "suggested_dm": {
+            "type": "string"
+        },
+        "recommended_channel": {
+            "type": "string",
+            "enum": [
+                "direct_message",
+                "public_reply_then_dm",
+                "do_not_contact"
+            ]
+        },
+        "evidence": {
+            "type": "string"
+        }
+    },
+    "required": [
+        "qualified",
+        "lead_score",
+        "service_match",
+        "lead_summary",
+        "rejection_reason",
+        "suggested_dm",
+        "recommended_channel",
+        "evidence"
+    ],
+    "additionalProperties": False
 }
 
 
 def request_with_retry(
-method: str,
-url: str,
-*,
-max_attempts: int = 5,
-**kwargs: Any,
+    method: str,
+    url: str,
+    *,
+    max_attempts: int = 5,
+    **kwargs: Any,
 ) -> requests.Response:
-for attempt in range(1, max_attempts + 1):
-response = requests.request(
-method,
-url,
-timeout=120,
-**kwargs,
-)
+    for attempt in range(1, max_attempts + 1):
+        response = requests.request(
+            method,
+            url,
+            timeout=120,
+            **kwargs,
+        )
 
-if response.status_code < 400:
-return response
+        if response.status_code < 400:
+            return response
 
-if response.status_code in {429, 500, 502, 503, 504}:
-wait_seconds = min(2 ** attempt, 30)
-print(
-f"Request failed with {response.status_code}. "
-f"Retrying in {wait_seconds}s..."
-)
-time.sleep(wait_seconds)
-continue
+        if response.status_code in {429, 500, 502, 503, 504}:
+            wait_seconds = min(2 ** attempt, 30)
+            print(
+                f"Request failed with {response.status_code}. "
+                f"Retrying in {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
+            continue
 
-raise RuntimeError(
-f"Request failed: {response.status_code} "
-f"{response.text}"
-)
+        raise RuntimeError(
+            f"Request failed: {response.status_code} "
+            f"{response.text}"
+        )
 
-raise RuntimeError(
-f"Request failed after {max_attempts} attempts: {url}"
-)
+    raise RuntimeError(
+        f"Request failed after {max_attempts} attempts: {url}"
+    )
 
 
 def fetch_latest_apify_posts() -> list[dict[str, Any]]:
-url = (
-"https://api.apify.com/v2/actor-tasks/"
-f"{APIFY_TASK_ID}/runs/last/dataset/items"
-)
+    url = (
+        "https://api.apify.com/v2/actor-tasks/"
+        f"{APIFY_TASK_ID}/runs/last/dataset/items"
+    )
 
-params = {
-"token": APIFY_TOKEN,
-"status": "SUCCEEDED",
-"format": "json",
-"clean": "true",
-"fields": (
-"legacyId,url,time,text,user,groupTitle,"
-"facebookUrl,inputUrl,likesCount,"
-"commentsCount,sharesCount,error,errorDescription"
-),
-}
+    params = {
+        "token": APIFY_TOKEN,
+        "status": "SUCCEEDED",
+        "format": "json",
+        "clean": "true",
+        "fields": (
+            "legacyId,url,time,text,user,groupTitle,"
+            "facebookUrl,inputUrl,likesCount,"
+            "commentsCount,sharesCount,error,errorDescription"
+        ),
+    }
 
-response = request_with_retry("GET", url, params=params)
-data = response.json()
+    response = request_with_retry("GET", url, params=params)
+    data = response.json()
 
-if not isinstance(data, list):
-raise RuntimeError("Apify returned an unexpected response.")
+    if not isinstance(data, list):
+        raise RuntimeError("Apify returned an unexpected response.")
 
-posts = [
-item
-for item in data
-if item.get("url")
-and item.get("legacyId")
-and not item.get("error")
-]
+    posts = [
+        item
+        for item in data
+        if item.get("url")
+        and item.get("legacyId")
+        and not item.get("error")
+    ]
 
-print(
-f"Fetched {len(data)} Apify items; "
-f"{len(posts)} valid Facebook posts."
-)
-return posts
+    print(
+        f"Fetched {len(data)} Apify items; "
+        f"{len(posts)} valid Facebook posts."
+    )
+    return posts
 
 
 def chunks(items: list[Any], size: int) -> list[list[Any]]:
-return [
-items[index:index + size]
-for index in range(0, len(items), size)
-]
+    return [
+        items[index:index + size]
+        for index in range(0, len(items), size)
+    ]
 
 
 def map_apify_to_airtable(
-post: dict[str, Any]
+    post: dict[str, Any]
 ) -> dict[str, Any]:
-user = post.get("user") or {}
+    user = post.get("user") or {}
 
-return {
-"Url": post.get("url", ""),
-"Facebook url": post.get("facebookUrl", ""),
-"Time": post.get("time"),
-"User id": str(user.get("id", "")),
-"User name": user.get("name", ""),
-"Text": post.get("text", ""),
-"Group title": post.get("groupTitle", ""),
-"Input Url": post.get("inputUrl", ""),
-"Likes count": post.get("likesCount", 0) or 0,
-"Comments count": post.get("commentsCount", 0) or 0,
-"Shares count": post.get("sharesCount", 0) or 0,
-}
+    return {
+        "Url": post.get("url", ""),
+        "Facebook url": post.get("facebookUrl", ""),
+        "Time": post.get("time"),
+        "User id": str(user.get("id", "")),
+        "User name": user.get("name", ""),
+        "Text": post.get("text", ""),
+        "Group title": post.get("groupTitle", ""),
+        "Input Url": post.get("inputUrl", ""),
+        "Likes count": post.get("likesCount", 0) or 0,
+        "Comments count": post.get("commentsCount", 0) or 0,
+        "Shares count": post.get("sharesCount", 0) or 0,
+    }
 
 
 def upsert_posts_to_airtable(
-posts: list[dict[str, Any]]
+    posts: list[dict[str, Any]]
 ) -> None:
-mapped = [
-{
-"fields": map_apify_to_airtable(post)
-}
-for post in posts
-]
+    mapped = [
+        {
+            "fields": map_apify_to_airtable(post)
+        }
+        for post in posts
+    ]
 
-for batch in chunks(mapped, 10):
-payload = {
-"performUpsert": {
-"fieldsToMergeOn": ["Url"]
-},
-"records": batch,
-"typecast": True,
-}
+    for batch in chunks(mapped, 10):
+        payload = {
+            "performUpsert": {
+                "fieldsToMergeOn": ["Url"]
+            },
+            "records": batch,
+            "typecast": True,
+        }
 
-response = request_with_retry(
-"PATCH",
-AIRTABLE_URL,
-headers=AIRTABLE_HEADERS,
-json=payload,
-)
+        response = request_with_retry(
+            "PATCH",
+            AIRTABLE_URL,
+            headers=AIRTABLE_HEADERS,
+            json=payload,
+        )
 
-result = response.json()
-created = len(result.get("createdRecords", []))
-updated = len(result.get("updatedRecords", []))
+        result = response.json()
+        created = len(result.get("createdRecords", []))
+        updated = len(result.get("updatedRecords", []))
 
-print(
-f"Airtable import: {created} created, "
-f"{updated} updated."
-)
+        print(
+            f"Airtable import: {created} created, "
+            f"{updated} updated."
+        )
 
-time.sleep(0.25)
+        time.sleep(0.25)
