@@ -320,3 +320,25 @@ def upsert_posts_to_airtable(
         )
 
         time.sleep(0.25)
+
+def main() -> None:
+    print("Starting BruceTech lead pipeline...", flush=True)
+
+    posts = fetch_latest_apify_posts()
+    print(f"Fetched {len(posts)} valid posts from Apify.", flush=True)
+
+    upsert_posts_to_airtable(posts)
+
+    print("Waiting for Airtable formulas to calculate...", flush=True)
+    time.sleep(10)
+
+    ai_records = fetch_ai_queue()
+    print(f"Found {len(ai_records)} AI candidates.", flush=True)
+
+    process_ai_queue(ai_records)
+
+    print("BruceTech lead pipeline completed.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
