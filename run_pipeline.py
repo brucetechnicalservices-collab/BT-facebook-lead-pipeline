@@ -538,21 +538,32 @@ def create_new_posts_in_airtable(
 
 
 # ---------------------------------------------------------------------------
-# AI queue: only records created during the current workflow run
+# AI queue: process all unprocessed Airtable backlog records
 # ---------------------------------------------------------------------------
 
-def fetch_new_records_for_ai(
-    created_record_ids: list[str],
-) -> list[dict[str, Any]]:
+def fetch_ai_queue() -> list[dict[str, Any]]:
     """
-    Fetch only newly created records, then keep the ones whose Airtable
-    formula fields resolved to Send to AI.
+    Retrieve Airtable records that passed formula prequalification and have
+    never been processed by OpenAI.
 
-    Processed historical records are never queried or reprocessed.
+    This includes:
+    - Newly imported records from the current workflow run
+    - Older backlog records whose AI Status is blank or Pending
+
+    Records with AI Status = Processed or Error are not reprocessed.
+    The number processed per workflow run is capped by AI_BATCH_LIMIT.
     """
-    if not created_record_ids:
-        print("No newly created records are available for AI.", flush=True)
-        return []
+    formula = (
+        "AND("
+        f"{{{FIELD_PREQUALIFICATION}}}='Send to AI',"
+        "OR("
+        f"{{{FIELD_AI_STATUS}}}=BLANK(),"
+        f"{{{FIELD_AI_STATUS}}}='Pending'"
+        "),"
+        f"LEN({{{FIELD_TEXT}}}&'')>0,"
+        f"LEN({{{FIELD_URL}}}&'')>0"
+        ")"
+    )
 
     fields = [
         FIELD_URL,
@@ -564,50 +575,18 @@ def fetch_new_records_for_ai(
         FIELD_AI_STATUS,
     ]
 
-    candidates: list[dict[str, Any]] = []
-
-    # Keep each OR formula short enough for a normal request URL.
-    for id_batch in chunks(created_record_ids, 25):
-        record_checks = ",".join(
-            f"RECORD_ID()='{record_id}'"
-            for record_id in id_batch
-        )
-        formula = f"OR({record_checks})"
-
-        batch_records = list_airtable_records(
-            formula=formula,
-            fields=fields,
-        )
-
-        for record in batch_records:
-            record_fields = record.get("fields", {})
-            prequalification = record_fields.get(
-                FIELD_PREQUALIFICATION,
-                "",
-            )
-            ai_status = record_fields.get(FIELD_AI_STATUS, "")
-            text = str(record_fields.get(FIELD_TEXT, "")).strip()
-            url = str(record_fields.get(FIELD_URL, "")).strip()
-
-            if (
-                prequalification == "Send to AI"
-                and ai_status in {"", "Pending"}
-                and text
-                and url
-            ):
-                candidates.append(record)
-
-        time.sleep(0.25)
-
-    candidates = candidates[:AI_BATCH_LIMIT]
+    records = list_airtable_records(
+        formula=formula,
+        fields=fields,
+        max_records=AI_BATCH_LIMIT,
+    )
 
     print(
-        f"Among this run's new records, {len(candidates)} passed "
-        f"prequalification and will be sent to AI "
-        f"(limit: {AI_BATCH_LIMIT}).",
+        f"Found {len(records)} unprocessed Airtable records "
+        f"eligible for AI (limit: {AI_BATCH_LIMIT}).",
         flush=True,
     )
-    return candidates
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -881,11 +860,12 @@ def main() -> None:
         flush=True,
     )
 
+    # 1. Pull the latest Apify dataset.
     apify_posts = fetch_latest_apify_posts()
 
+    # 2. Import only Facebook post URLs that are not already in Airtable.
     existing_urls = fetch_existing_facebook_urls()
     new_posts = select_new_posts(apify_posts, existing_urls)
-
     created_record_ids = create_new_posts_in_airtable(new_posts)
 
     if created_record_ids:
@@ -894,14 +874,23 @@ def main() -> None:
             flush=True,
         )
         time.sleep(AIRTABLE_FORMULA_WAIT_SECONDS)
-
-        ai_records = fetch_new_records_for_ai(created_record_ids)
-        process_ai_queue(ai_records)
     else:
         print(
-            "No new posts were imported, so OpenAI was not called.",
+            "No new Facebook posts were imported.",
             flush=True,
         )
+
+    # 3. Process the unprocessed AI backlog, including older records.
+    #
+    # Only records matching all of the following are fetched:
+    # - Prequalification = Send to AI
+    # - AI Status is blank or Pending
+    # - Text and Url are not empty
+    #
+    # Processed and Error records are excluded, so completed records are
+    # never sent to OpenAI again.
+    ai_records = fetch_ai_queue()
+    process_ai_queue(ai_records)
 
     completed_at = datetime.now(timezone.utc)
     duration = (completed_at - started_at).total_seconds()
