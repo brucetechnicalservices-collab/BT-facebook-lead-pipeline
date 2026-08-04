@@ -273,7 +273,7 @@ def map_apify_to_airtable(
         "Url": post.get("url", ""),
         "Facebook url": post.get("facebookUrl", ""),
         "Time": post.get("time"),
-        "User id": str(user.get("id", "")),
+        "User ID": str(user.get("id", "")),
         "User name": user.get("name", ""),
         "Text": post.get("text", ""),
         "Group title": post.get("groupTitle", ""),
