@@ -1,39 +1,39 @@
 name: BruceTech Facebook Leads
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
-schedule:
-- cron: "30 6 * * *"
-timezone: "America/Toronto"
+  schedule:
+    - cron: "30 6 * * *"
+      timezone: "America/Toronto"
 
 jobs:
-run-pipeline:
-runs-on: ubuntu-latest
-timeout-minutes: 30
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
-steps:
-- name: Check out repository
-uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-- name: Set up Python
-uses: actions/setup-python@v5
-with:
-python-version: "3.12"
-cache: pip
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
 
-- name: Install dependencies
-run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-- name: Run BruceTech lead pipeline
-env:
-APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-APIFY_TASK_ID: ${{ secrets.APIFY_TASK_ID }}
-AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
-OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-OPENAI_MODEL: gpt-5-mini
-QUALIFICATION_THRESHOLD: "55"
-AI_BATCH_LIMIT: "100"
-run: python run_pipeline.py
+      - name: Run BruceTech lead pipeline
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          APIFY_TASK_ID: ${{ secrets.APIFY_TASK_ID }}
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-5-mini
+          QUALIFICATION_THRESHOLD: "55"
+          AI_BATCH_LIMIT: "100"
+        run: python run_pipeline.py
