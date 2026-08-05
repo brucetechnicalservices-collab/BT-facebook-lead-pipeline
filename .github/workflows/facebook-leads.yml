@@ -2,13 +2,54 @@ name: BruceTech Facebook Leads
 
 on:
   workflow_dispatch:
+    inputs:
+      start_new_apify_run:
+        description: "Start a fresh Apify run instead of reading the last one"
+        type: boolean
+        default: false
+        required: false
 
   schedule:
     - cron: "30 6 * * *"
       timezone: "America/Toronto"
 
+# Two pipeline runs must never overlap: both write to the same Airtable base
+# and would double-process the queue. Queued runs wait rather than cancel, so
+# an in-flight run always finishes its Airtable writes.
+concurrency:
+  group: facebook-leads-pipeline
+  cancel-in-progress: false
+
 jobs:
+  test:
+    name: Compile and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Compile all Python sources
+        run: python -m compileall -q .
+
+      - name: Run tests
+        run: python -m pytest -q
+
   run-pipeline:
+    name: Run pipeline
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -27,18 +68,36 @@ jobs:
 
       - name: Run BruceTech lead pipeline
         env:
+          # Secrets. Never hard-code these values.
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           APIFY_TASK_ID: ${{ secrets.APIFY_TASK_ID }}
           AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+          # Model configuration.
           OPENAI_MODEL: "gpt-5-mini"
-          QUALIFICATION_THRESHOLD: "55"
-          AI_BATCH_LIMIT: "40"
           OPENAI_MAX_OUTPUT_TOKENS: "2500"
           OPENAI_MAX_ATTEMPTS: "3"
           OPENAI_RETRY_DELAY_SECONDS: "5"
+
+          # Qualification thresholds.
+          QUALIFICATION_THRESHOLD: "65"
+          MANUAL_REVIEW_THRESHOLD: "55"
+          HOT_LEAD_THRESHOLD: "80"
+          MAX_POST_AGE_DAYS: "45"
+
+          # Queue behaviour.
+          AI_BATCH_LIMIT: "40"
           MAX_POST_CHARS: "8000"
           AIRTABLE_FORMULA_WAIT_SECONDS: "15"
+          ENFORCE_PYTHON_PREFILTER: "true"
+          REQUIRE_AIRTABLE_PREQUALIFICATION: "false"
+
+          # Apify run mode.
+          APIFY_START_NEW_RUN: >-
+            ${{ github.event.inputs.start_new_apify_run || 'false' }}
+          APIFY_RUN_TIMEOUT_SECONDS: "900"
+          APIFY_RUN_POLL_SECONDS: "15"
         run: python run_pipeline.py
