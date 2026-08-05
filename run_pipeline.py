@@ -126,6 +126,11 @@ REQUIRE_AIRTABLE_PREQUALIFICATION = env_bool(
 #: Skip the AI call entirely for posts the deterministic prefilter rejects.
 ENFORCE_PYTHON_PREFILTER = env_bool("ENFORCE_PYTHON_PREFILTER", True)
 
+#: Read from Apify and Airtable and call the AI as normal, but make no
+#: Airtable writes. Use this to see how the new rules score real records
+#: before letting the pipeline modify the base.
+DRY_RUN = env_bool("DRY_RUN", False)
+
 
 # ---------------------------------------------------------------------------
 # Airtable field names
@@ -777,6 +782,19 @@ def create_new_posts_in_airtable(posts: list[dict[str, Any]]) -> list[str]:
         print("No new Facebook posts to create in Airtable.", flush=True)
         return []
 
+    if DRY_RUN:
+        print(
+            f"[DRY RUN] Would create {len(posts)} new Airtable records. "
+            f"Nothing written.",
+            flush=True,
+        )
+        for post in posts[:10]:
+            print(
+                f"[DRY RUN]   {normalize_facebook_url(post.get('url', ''))}",
+                flush=True,
+            )
+        return []
+
     created_record_ids: list[str] = []
     mapped = [{"fields": map_apify_to_airtable(post)} for post in posts]
     url = airtable_url()
@@ -1095,6 +1113,20 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
     if not updates:
         return
 
+    if DRY_RUN:
+        for update in updates:
+            fields = update.get("fields", {}) or {}
+            print(
+                f"[DRY RUN] Would update {update.get('id')}: "
+                f"tier={fields.get(FIELD_LEAD_TIER)} "
+                f"score={fields.get(FIELD_LEAD_SCORE)} "
+                f"qualified={fields.get(FIELD_QUALIFIED)} "
+                f"outreach={fields.get(FIELD_OUTREACH_READY)} "
+                f"dm={'yes' if fields.get(FIELD_SUGGESTED_DM) else 'no'}",
+                flush=True,
+            )
+        return
+
     url = airtable_url()
     headers = airtable_headers()
 
@@ -1141,6 +1173,14 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
 
 
 def mark_ai_error(record_id: str, error_message: str) -> None:
+    if DRY_RUN:
+        print(
+            f"[DRY RUN] Would mark {record_id} as Error: "
+            f"{error_message[:120]}",
+            flush=True,
+        )
+        return
+
     request_with_retry(
         "PATCH",
         airtable_url(),
@@ -1331,6 +1371,13 @@ def main() -> None:
         f"max post age={MAX_POST_AGE_DAYS}d.",
         flush=True,
     )
+
+    if DRY_RUN:
+        print(
+            "DRY RUN: Airtable will not be modified. Records will be read "
+            "and scored, and the intended writes printed.",
+            flush=True,
+        )
 
     # 1. Collect posts from Apify.
     apify_posts = collect_apify_posts()

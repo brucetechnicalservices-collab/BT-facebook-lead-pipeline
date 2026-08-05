@@ -301,3 +301,53 @@ def test_queue_formula_does_not_require_airtable_prequalification_by_default():
 
     assert "Prequalification" not in formula
     assert "AI Status" in formula
+
+
+# ---------------------------------------------------------------------------
+# Dry run
+# ---------------------------------------------------------------------------
+
+def test_dry_run_is_off_by_default():
+    assert rp.DRY_RUN is False
+
+
+def test_dry_run_makes_no_airtable_writes(monkeypatch, capsys):
+    """DRY_RUN must never issue an HTTP request to Airtable."""
+    monkeypatch.setattr(rp, "DRY_RUN", True)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("DRY_RUN must not make HTTP requests")
+
+    monkeypatch.setattr(rp, "request_with_retry", explode)
+
+    rp.update_airtable_records(
+        [{"id": "rec1", "fields": {rp.FIELD_LEAD_TIER: "Hot",
+                                   rp.FIELD_LEAD_SCORE: 90,
+                                   rp.FIELD_QUALIFIED: True}}]
+    )
+    rp.mark_ai_error("rec2", "boom")
+    created = rp.create_new_posts_in_airtable(
+        [{"url": "https://www.facebook.com/groups/1/posts/1"}]
+    )
+
+    assert created == []
+    output = capsys.readouterr().out
+    assert "[DRY RUN]" in output
+    assert "rec1" in output
+
+
+def test_dry_run_reports_the_intended_decision(monkeypatch, capsys):
+    monkeypatch.setattr(rp, "DRY_RUN", True)
+
+    rp.update_airtable_records(
+        [{"id": "rec1", "fields": {rp.FIELD_LEAD_TIER: "Manual Review",
+                                   rp.FIELD_LEAD_SCORE: 60,
+                                   rp.FIELD_QUALIFIED: False,
+                                   rp.FIELD_OUTREACH_READY: False,
+                                   rp.FIELD_SUGGESTED_DM: ""}}]
+    )
+
+    output = capsys.readouterr().out
+    assert "tier=Manual Review" in output
+    assert "score=60" in output
+    assert "dm=no" in output

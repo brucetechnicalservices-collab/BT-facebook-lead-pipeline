@@ -164,6 +164,7 @@ Configuration — safe to set in the workflow:
 | `AI_BATCH_LIMIT` | `20` | Max AI calls per run |
 | `MAX_POST_CHARS` | `8000` | Post text truncation |
 | `AIRTABLE_FORMULA_WAIT_SECONDS` | `15` | Pause after import |
+| `DRY_RUN` | `false` | Read and score, but make no Airtable writes |
 | `ENFORCE_PYTHON_PREFILTER` | `true` | Skip the AI for obvious rejects |
 | `REQUIRE_AIRTABLE_PREQUALIFICATION` | `false` | Also require the Airtable formula |
 | `APIFY_START_NEW_RUN` | `false` | Start a fresh Apify run and await it |
@@ -233,6 +234,59 @@ APIFY_START_NEW_RUN=true python run_pipeline.py
 
 Never commit real credentials. Use environment variables or a local `.env`
 file that is git-ignored.
+
+---
+
+## Testing against your real Airtable data
+
+`DRY_RUN=true` reads Apify and Airtable and calls the AI exactly as normal,
+but makes **no Airtable writes**. It prints the decision it would have
+written for each record:
+
+```
+[DRY RUN] Would update recABC123: tier=Qualified score=71 qualified=True outreach=True dm=yes
+[DRY RUN] Would update recDEF456: tier=Manual Review score=58 qualified=False outreach=False dm=no
+```
+
+A safe first pass over your existing base:
+
+```bash
+export AIRTABLE_BASE_ID=...        # your real base
+export AIRTABLE_TABLE_NAME=...
+export AIRTABLE_TOKEN=...
+export OPENAI_API_KEY=...
+export APIFY_TOKEN=...
+export APIFY_TASK_ID=...
+
+DRY_RUN=true AI_BATCH_LIMIT=5 python run_pipeline.py
+```
+
+`AI_BATCH_LIMIT=5` keeps the OpenAI spend to five posts.
+
+### Records already processed will be skipped
+
+The queue only picks up records whose `AI Status` is blank or `Pending`.
+Everything the old pipeline processed is marked `Processed` and will be
+ignored, so a dry run against an existing base may find nothing to do.
+
+To re-score records you have already seen, clear `AI Status` on a sample of
+them in the Airtable UI (select the cells and delete), then run again. Start
+with 5–10 rows that you already have an opinion about, so you can compare the
+new tier against your own judgement.
+
+Note that re-scoring costs one OpenAI call per record — the new rules need
+the structured signals, which cannot be derived from the old `Lead Score`.
+
+### When you are ready to write
+
+Duplicate the base first if you want a guaranteed-safe target
+(**Airtable → base menu → Duplicate base**), point `AIRTABLE_BASE_ID` at the
+copy, and drop `DRY_RUN`. Otherwise run against the real base with a small
+`AI_BATCH_LIMIT` and check the results before raising it.
+
+Remember that a real run **overwrites** `Qualified`, `Lead Score`,
+`Suggested DM`, `Rejection Reason`, and `AI Status` on every record it
+processes.
 
 ---
 
