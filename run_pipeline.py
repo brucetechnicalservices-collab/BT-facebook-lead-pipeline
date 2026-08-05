@@ -674,7 +674,16 @@ def list_airtable_records(
     formula: str | None = None,
     fields: list[str] | None = None,
     max_records: int | None = None,
+    sort_field: str | None = None,
+    sort_direction: str = "desc",
 ) -> list[dict[str, Any]]:
+    """
+    Page through Airtable records.
+
+    ``sort_field`` matters whenever ``max_records`` is set: without a sort,
+    Airtable returns records in the table's own order, so truncating gives an
+    arbitrary slice rather than the most relevant one.
+    """
     records: list[dict[str, Any]] = []
     offset: str | None = None
     url = airtable_url()
@@ -685,6 +694,10 @@ def list_airtable_records(
 
         if formula:
             params.append(("filterByFormula", formula))
+
+        if sort_field:
+            params.append(("sort[0][field]", sort_field))
+            params.append(("sort[0][direction]", sort_direction))
 
         if fields:
             for field_name in fields:
@@ -851,25 +864,86 @@ def build_ai_queue_formula() -> str:
     return "AND(" + ",".join(clauses) + ")"
 
 
-def fetch_ai_queue() -> list[dict[str, Any]]:
-    """Retrieve Airtable records that have never been processed by the AI."""
-    fields = [
-        FIELD_URL,
-        FIELD_TIME,
-        FIELD_USER_NAME,
-        FIELD_TEXT,
-        FIELD_GROUP_TITLE,
-        FIELD_PREQUALIFICATION,
-        FIELD_AI_STATUS,
-    ]
+AI_QUEUE_FIELDS = [
+    FIELD_URL,
+    FIELD_TIME,
+    FIELD_USER_NAME,
+    FIELD_TEXT,
+    FIELD_GROUP_TITLE,
+    FIELD_PREQUALIFICATION,
+    FIELD_AI_STATUS,
+]
 
-    # Fetch more than the batch limit so prioritisation has something to
-    # choose from; the limit is applied after sorting.
-    records = list_airtable_records(
-        formula=build_ai_queue_formula(),
-        fields=fields,
-        max_records=max(AI_BATCH_LIMIT * 5, AI_BATCH_LIMIT),
+
+def is_human_flagged(fields: dict[str, Any]) -> bool:
+    """Did a human mark this record 'Send to AI' in Airtable?"""
+    return str(
+        (fields or {}).get(FIELD_PREQUALIFICATION, "")
+    ).strip().lower() == "send to ai"
+
+
+def build_prequalified_queue_formula() -> str:
+    """Records a human explicitly flagged as 'Send to AI'."""
+    return (
+        "AND("
+        f"{{{FIELD_PREQUALIFICATION}}}='Send to AI',"
+        f"OR({{{FIELD_AI_STATUS}}}=BLANK(),{{{FIELD_AI_STATUS}}}='Pending'),"
+        f"LEN({{{FIELD_TEXT}}}&'')>0,"
+        f"LEN({{{FIELD_URL}}}&'')>0"
+        ")"
     )
+
+
+def fetch_ai_queue() -> list[dict[str, Any]]:
+    """
+    Retrieve Airtable records that have never been processed by the AI.
+
+    Fetched in two phases so a curated Prequalification selection is never
+    lost behind an arbitrary page of the backlog:
+
+    1. Every record flagged 'Send to AI' by a human.
+    2. The newest remaining unprocessed records, to top up the window.
+
+    Phase 2 is sorted server-side by post time. Without that sort, Airtable
+    returns records in table order, so truncating to a window produced an
+    arbitrary slice and the prioritisation below could only reorder that
+    slice.
+    """
+    prequalified = list_airtable_records(
+        formula=build_prequalified_queue_formula(),
+        fields=AI_QUEUE_FIELDS,
+    )
+
+    if prequalified:
+        print(
+            f"Found {len(prequalified)} records flagged 'Send to AI'.",
+            flush=True,
+        )
+
+    seen_ids = {record.get("id") for record in prequalified}
+    window = max(AI_BATCH_LIMIT * 5, AI_BATCH_LIMIT)
+    remaining = max(window - len(prequalified), 0)
+
+    backlog: list[dict[str, Any]] = []
+    if remaining and not REQUIRE_AIRTABLE_PREQUALIFICATION:
+        backlog = [
+            record
+            for record in list_airtable_records(
+                formula=build_ai_queue_formula(),
+                fields=AI_QUEUE_FIELDS,
+                max_records=remaining + len(prequalified),
+                sort_field=FIELD_TIME,
+                sort_direction="desc",
+            )
+            if record.get("id") not in seen_ids
+        ][:remaining]
+
+        print(
+            f"Topped up with {len(backlog)} newest unprocessed records.",
+            flush=True,
+        )
+
+    records = prequalified + backlog
 
     print(f"Found {len(records)} unprocessed Airtable records.", flush=True)
     return records
@@ -885,10 +959,15 @@ def prioritize_ai_queue(
     Order the queue and attach each record's prefilter result.
 
     Priority order:
-      1. Records imported during this run
-      2. Newest posts
-      3. Strongest deterministic prefilter score
-      4. Highest buying-intent signal
+      1. Records a human flagged 'Send to AI' in Airtable
+      2. Records imported during this run
+      3. Newest posts
+      4. Strongest deterministic prefilter score
+      5. Highest buying-intent signal
+
+    A human's explicit selection outranks everything else: if someone went
+    through the table and marked records, those are what the run should
+    spend its batch on.
     """
     scored: list[tuple[dict[str, Any], Any]] = []
 
@@ -906,12 +985,15 @@ def prioritize_ai_queue(
         record, prefilter = entry
         fields = record.get("fields", {}) or {}
 
+        prequalified = 1 if is_human_flagged(fields) else 0
+
         imported_now = 1 if record.get("id") in created_record_ids else 0
 
         timestamp = parse_post_timestamp(fields.get(FIELD_TIME))
         recency = timestamp.timestamp() if timestamp else 0.0
 
         return (
+            -prequalified,
             -imported_now,
             -recency,
             -prefilter.score,
@@ -1255,8 +1337,17 @@ def process_ai_queue(
         author = fields.get(FIELD_USER_NAME, "")
         post_url = fields.get(FIELD_URL, "")
 
+        # A human's explicit 'Send to AI' overrides the keyword prefilter.
+        # Someone reviewed this record; do not silently reject it on a
+        # keyword miss.
+        human_flagged = is_human_flagged(fields)
+
         # Deterministic prefilter: never spend a token on an obvious reject.
-        if ENFORCE_PYTHON_PREFILTER and not prefilter.passed:
+        if (
+            ENFORCE_PYTHON_PREFILTER
+            and not prefilter.passed
+            and not human_flagged
+        ):
             counts["prefiltered"] += 1
             counts["rejected"] += 1
             pending_updates.append(
