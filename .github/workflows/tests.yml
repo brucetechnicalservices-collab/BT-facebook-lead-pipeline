@@ -1,0 +1,48 @@
+name: Tests
+
+# Runs on every push and pull request so the qualification rules are gated
+# before merge.
+#
+# This is deliberately a separate workflow from facebook-leads.yml. That
+# workflow's run-pipeline job calls the live Apify, Airtable, and OpenAI
+# APIs, so it must never be triggered by a pull request.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# A newer commit supersedes an in-flight test run; cancelling is safe here
+# because these jobs have no side effects.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Compile and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Compile all Python sources
+        run: python -m compileall -q .
+
+      - name: Run tests
+        run: python -m pytest -q
