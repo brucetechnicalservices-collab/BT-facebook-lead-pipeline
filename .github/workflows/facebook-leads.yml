@@ -3,10 +3,20 @@ name: BruceTech Facebook Leads
 on:
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: "Dry run: score records but make no Airtable writes"
+        type: boolean
+        default: false
+        required: false
       start_new_apify_run:
         description: "Start a fresh Apify run instead of reading the last one"
         type: boolean
         default: false
+        required: false
+      ai_batch_limit:
+        description: "Max AI calls this run (lower this when testing)"
+        type: string
+        default: "40"
         required: false
 
   schedule:
@@ -89,7 +99,11 @@ jobs:
           MAX_POST_AGE_DAYS: "45"
 
           # Queue behaviour.
-          AI_BATCH_LIMIT: "40"
+          # Dry run makes no Airtable writes; use it to test a branch safely.
+          DRY_RUN: >-
+            ${{ github.event.inputs.dry_run || 'false' }}
+          AI_BATCH_LIMIT: >-
+            ${{ github.event.inputs.ai_batch_limit || '40' }}
           MAX_POST_CHARS: "8000"
           AIRTABLE_FORMULA_WAIT_SECONDS: "15"
           ENFORCE_PYTHON_PREFILTER: "true"
