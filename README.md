@@ -25,7 +25,7 @@ Airtable import (new posts only)
 Deterministic prefilter ─── intent + service keywords, length, post age
       │                     (obvious rejects never reach the AI)
       ▼
-Prioritisation ─── this run › newest › prefilter score › buying intent
+Prioritisation ─── Send to AI › this run › newest › prefilter › intent
       │
       ▼
 AI signal extraction ─── 19 structured signals, no score, no verdict
@@ -133,6 +133,37 @@ A lead is outreach-ready only when **all** of the following hold:
 There is **no fallback DM**. If the AI cannot write a specific message, the
 record stays qualified but is not outreach-ready. A `do_not_contact`
 recommendation is respected and never upgraded to `direct_message`.
+
+---
+
+## The AI queue
+
+Each run fetches candidates in two phases:
+
+1. **Every** record where `Prequalification = Send to AI` and `AI Status` is
+   blank or `Pending`.
+2. The newest remaining unprocessed records, sorted server-side by post
+   time, to fill the window (`AI_BATCH_LIMIT × 5`).
+
+Phase 1 exists so a curated selection is never lost behind an arbitrary page
+of the backlog. Phase 2 is sorted because truncating an unsorted Airtable
+query returns records in table order, not by relevance.
+
+### `Send to AI` overrides the prefilter
+
+A record you flag `Send to AI` sorts above everything else — including
+records imported in the current run — and **bypasses the keyword prefilter
+entirely**. If you have reviewed a record and marked it, it goes to the AI
+even if the keyword heuristics would have rejected it.
+
+Every other record that fails the prefilter is marked
+`AI Status = Processed`, `Lead Tier = Rejected` **without an AI call**, and
+is not evaluated again. That is intended behaviour: it keeps the backlog
+from growing and keeps token spend on plausible leads. It also means a
+borderline post can be rejected on keywords alone — flag it `Send to AI` if
+you want the model to decide instead.
+
+Set `ENFORCE_PYTHON_PREFILTER=false` to send everything to the AI.
 
 ---
 
@@ -323,9 +354,14 @@ The pipeline runs from GitHub Actions
 2. Create the five new Airtable fields listed above.
 3. Merge to `main`.
 
-The workflow runs daily at 06:30 America/Toronto and can be triggered
-manually with **Run workflow**, which offers a checkbox to start a fresh
-Apify run.
+> **The daily schedule is currently paused.** The `schedule:` block in
+> `.github/workflows/facebook-leads.yml` is commented out while the new
+> qualification rules are validated against the production base. Uncomment
+> the three lines to restore the 06:30 America/Toronto run.
+
+Until then the pipeline runs only via **Run workflow**, which offers three
+inputs: **Dry run** (score without writing), **Start new Apify run**, and
+**AI batch limit**.
 
 Two jobs run in sequence: `test` (compile + pytest) then `run-pipeline`. The
 pipeline only runs if the tests pass.

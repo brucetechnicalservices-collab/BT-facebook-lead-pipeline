@@ -351,3 +351,117 @@ def test_dry_run_reports_the_intended_decision(monkeypatch, capsys):
     assert "tier=Manual Review" in output
     assert "score=60" in output
     assert "dm=no" in output
+
+
+# ---------------------------------------------------------------------------
+# Human "Send to AI" selection
+# ---------------------------------------------------------------------------
+
+def flagged_record(record_id, *, text, days_old, flagged):
+    entry = record(record_id, text=text, days_old=days_old)
+    if flagged:
+        entry["fields"][rp.FIELD_PREQUALIFICATION] = "Send to AI"
+    return entry
+
+
+def test_is_human_flagged_matches_case_insensitively():
+    assert rp.is_human_flagged({rp.FIELD_PREQUALIFICATION: "Send to AI"})
+    assert rp.is_human_flagged({rp.FIELD_PREQUALIFICATION: "send to ai "})
+    assert not rp.is_human_flagged({rp.FIELD_PREQUALIFICATION: "Skip"})
+    assert not rp.is_human_flagged({})
+
+
+def test_human_flagged_records_are_processed_first():
+    """A curated selection outranks recency and prefilter score."""
+    ordered = rp.prioritize_ai_queue(
+        [
+            flagged_record("recNewStrong", text=STRONG_TEXT, days_old=1,
+                           flagged=False),
+            flagged_record("recOldWeak", text=WEAK_TEXT, days_old=90,
+                           flagged=True),
+        ],
+        set(),
+        now=NOW,
+    )
+
+    assert [r["id"] for r, _ in ordered] == ["recOldWeak", "recNewStrong"]
+
+
+def test_human_flagged_record_outranks_records_imported_this_run():
+    ordered = rp.prioritize_ai_queue(
+        [
+            flagged_record("recImported", text=STRONG_TEXT, days_old=1,
+                           flagged=False),
+            flagged_record("recFlagged", text=WEAK_TEXT, days_old=30,
+                           flagged=True),
+        ],
+        {"recImported"},
+        now=NOW,
+    )
+
+    assert [r["id"] for r, _ in ordered] == ["recFlagged", "recImported"]
+
+
+def test_prequalified_formula_requires_send_to_ai_and_unprocessed():
+    formula = rp.build_prequalified_queue_formula()
+
+    assert "Send to AI" in formula
+    assert "AI Status" in formula
+
+
+# ---------------------------------------------------------------------------
+# Airtable query construction
+# ---------------------------------------------------------------------------
+
+def test_list_airtable_records_sends_sort_params(monkeypatch):
+    """
+    A truncated fetch must be sorted server-side.
+
+    Without a sort, Airtable returns table order, so max_records yields an
+    arbitrary slice rather than the newest records.
+    """
+    captured = {}
+
+    class FakeResponse:
+        @staticmethod
+        def json():
+            return {"records": []}
+
+    def fake_request(method, url, *, headers=None, params=None, **kwargs):
+        captured["params"] = params
+        return FakeResponse()
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "appX")
+    monkeypatch.setenv("AIRTABLE_TABLE_NAME", "Leads")
+    monkeypatch.setenv("AIRTABLE_TOKEN", "tok")
+    monkeypatch.setattr(rp, "request_with_retry", fake_request)
+
+    rp.list_airtable_records(
+        formula="x", max_records=10, sort_field=rp.FIELD_TIME
+    )
+
+    params = dict(captured["params"])
+    assert params["sort[0][field]"] == rp.FIELD_TIME
+    assert params["sort[0][direction]"] == "desc"
+
+
+def test_list_airtable_records_omits_sort_when_not_requested(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        @staticmethod
+        def json():
+            return {"records": []}
+
+    def fake_request(method, url, *, headers=None, params=None, **kwargs):
+        captured["params"] = params
+        return FakeResponse()
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "appX")
+    monkeypatch.setenv("AIRTABLE_TABLE_NAME", "Leads")
+    monkeypatch.setenv("AIRTABLE_TOKEN", "tok")
+    monkeypatch.setattr(rp, "request_with_retry", fake_request)
+
+    rp.list_airtable_records(formula="x")
+
+    assert "sort[0][field]" not in dict(captured["params"])
