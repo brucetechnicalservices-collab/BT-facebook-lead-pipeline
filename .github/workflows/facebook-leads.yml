@@ -19,9 +19,18 @@ on:
         default: "40"
         required: false
 
-  schedule:
-    - cron: "30 6 * * *"
-      timezone: "America/Toronto"
+  # SCHEDULE PAUSED.
+  #
+  # The daily run is disabled while the new qualification rules are being
+  # validated against the production Airtable base. Trigger the pipeline
+  # manually with "Run workflow" until you are satisfied with the results
+  # (tick "Dry run" to score without writing).
+  #
+  # To re-enable, uncomment the three lines below.
+  #
+  # schedule:
+  #   - cron: "30 6 * * *"
+  #     timezone: "America/Toronto"
 
 # Two pipeline runs must never overlap: both write to the same Airtable base
 # and would double-process the queue. Queued runs wait rather than cancel, so
