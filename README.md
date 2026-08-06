@@ -28,7 +28,7 @@ Deterministic prefilter ─── intent + service keywords, length, post age
 Prioritisation ─── Send to AI › this run › newest › prefilter › intent
       │
       ▼
-AI signal extraction ─── 19 structured signals, no score, no verdict
+AI signal extraction ─── 21 structured signals, no score, no verdict
       │
       ▼
 Deterministic qualification (Python)
@@ -45,6 +45,7 @@ Airtable write-back
 | `qualification.py` | Scoring, tiers, hard rejections, prefilter. Pure logic |
 | `normalization.py` | URL canonicalisation, fingerprinting, deduplication |
 | `tests/` | Regression suite (no credentials required) |
+| `docs/APIFY_SCRAPERS.md` | Which Apify sources fit this pipeline, and why |
 
 `qualification.py` and `normalization.py` deliberately have no environment,
 network, or third-party dependencies, so they can be imported and tested in
@@ -83,6 +84,9 @@ Soft penalties (these reduce the score but never reject on their own):
 
 The total is clamped to 0–100.
 
+In **website analysis focus mode** one bounded bonus is added before the same
+clamp — see [Website analysis focus](#website-analysis-focus).
+
 ### Tiers
 
 | Tier | Score | Qualified | DM |
@@ -118,9 +122,12 @@ that trips any of these is Rejected.
 | `NO_SERVICE_MATCH` | No BruceTech service match |
 | `INAPPROPRIATE_OUTREACH` | Outreach would be unwelcome |
 | `STALE_POST` | Older than `MAX_POST_AGE_DAYS` |
+| `NO_WEBSITE_OPPORTUNITY` | Focus mode only: the post describes no website need |
 
 `STALE_POST` is computed in Python from the post timestamp and is never
-trusted from the model.
+trusted from the model. `NO_WEBSITE_OPPORTUNITY` is derived in Python too and
+is deliberately not offered to the model, so it can never appear in a run
+that is not in website analysis focus mode.
 
 ### Outreach eligibility
 
@@ -167,6 +174,66 @@ Set `ENFORCE_PYTHON_PREFILTER=false` to send everything to the AI.
 
 ---
 
+## Website analysis focus
+
+Tick **Website analysis** on **Run workflow** (or set
+`WEBSITE_FOCUS_MODE=true`) to point the whole run at website work for
+business owners and business pages. It is off by default; nothing below
+happens in a normal run.
+
+The five offers it hunts for, strongest first:
+
+| Offer | `website_opportunity` | Bonus |
+|---|---|---:|
+| Paying a monthly platform fee they resent (Shopify, Wix, Squarespace) — rebuild on WordPress and kill the recurring cost | `expensive_platform` | 12 |
+| Wants off their current platform | `platform_migration` | 11 |
+| Has customers but no website — often trading from a Facebook page alone | `no_website` | 11 |
+| Wants a site built | `new_website_build` | 10 |
+| Site is down, slow, erroring, or not mobile friendly | `broken_or_failing_website` | 9 |
+| Old, dated, or abandoned site | `outdated_website` | 8 |
+| Wants the existing site redesigned | `redesign_or_refresh` | 8 |
+| Wants to sell online | `ecommerce_store` | 7 |
+| Anything else website-shaped | `other_website_need`, `maintenance_or_updates`, `seo_or_visibility` | 5 · 5 · 4 |
+
+A further **+4** applies when `website_platform` is one of Shopify, Wix,
+Squarespace, BigCommerce, or Webflow — the business is already paying a
+monthly plan, so the conversion pitch is a number rather than an opinion.
+WordPress and WooCommerce get no bonus; there is no plan to replace.
+
+The combined bonus is capped at **14** and the total is still clamped to 100,
+so the 0–100 scale and every threshold are unchanged.
+
+Focus mode changes exactly three things:
+
+1. **The prefilter narrows.** Only website keywords count as a service match,
+   so managed IT, Microsoft 365, networking, and automation posts are
+   screened out before the AI. A website-opportunity phrase ("still paying
+   Shopify every month", "we only have a Facebook page") counts as buying
+   intent on its own, so a business describing its situation without asking
+   for anything still gets through.
+2. **Non-website posts are hard-rejected** as `NO_WEBSITE_OPPORTUNITY`,
+   however strong a lead they would otherwise be. A 100-point managed-IT lead
+   is Rejected in this mode.
+3. **Website leads sort first** in the queue, ahead of the general prefilter
+   score, so the batch is spent on them.
+
+Everything else is untouched: the model still decides nothing, hard
+rejections still beat any score, and `Send to AI` still overrides the
+prefilter.
+
+`website_opportunity` and `website_platform` are extracted and written to
+Airtable on **every** run, focus or not, so you can build a view of website
+opportunities from existing data before you ever tick the box.
+
+### Suggested use
+
+Run it as a themed pass rather than the default: tick **Website analysis**
+and **Dry run** together first to see what the current backlog holds, then
+run it for real with a small **AI batch limit**. Leave the box unticked for
+normal full-service runs.
+
+---
+
 ## Environment variables
 
 Secrets — set as GitHub Actions secrets, never committed:
@@ -197,6 +264,7 @@ Configuration — safe to set in the workflow:
 | `AIRTABLE_FORMULA_WAIT_SECONDS` | `15` | Pause after import |
 | `DRY_RUN` | `false` | Read and score, but make no Airtable writes |
 | `ENFORCE_PYTHON_PREFILTER` | `true` | Skip the AI for obvious rejects |
+| `WEBSITE_FOCUS_MODE` | `false` | Score website work only; reject everything else |
 | `REQUIRE_AIRTABLE_PREQUALIFICATION` | `false` | Also require the Airtable formula |
 | `APIFY_START_NEW_RUN` | `false` | Start a fresh Apify run and await it |
 | `APIFY_RUN_TIMEOUT_SECONDS` | `900` | Max wait for a fresh run |
@@ -217,7 +285,7 @@ Existing fields, unchanged:
 `Lead Score` · `Service Match` · `Lead Summary` · `Rejection Reason` ·
 `Suggested DM` · `Recommended channel` · `Evidence`
 
-**New fields — create these before deploying:**
+**Added fields — create these before deploying:**
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -226,6 +294,8 @@ Existing fields, unchanged:
 | `Outreach Ready` | Checkbox | Qualified **and** has a personalised DM |
 | `Disqualifiers` | Long text | Comma-separated hard rejection codes |
 | `Prefilter Score` | Number | Deterministic pre-AI score |
+| `Website Opportunity` | Single line text | Kind of website work the post points to |
+| `Website Platform` | Single line text | Platform the business is on today |
 
 If these fields do not exist, the pipeline detects the `UNKNOWN_FIELD_NAME`
 error on its first write, prints a warning, and continues writing the core
@@ -342,6 +412,9 @@ The suite needs no API keys, no network, and no Airtable base. It covers:
 - URL normalisation across host, scheme, tracking, and slash variants
 - duplicate detection by post ID, canonical URL, and text fingerprint
 - queue prioritisation ordering
+- website analysis focus: the `NO_WEBSITE_OPPORTUNITY` rejection, the capped
+  bonus, the narrowed prefilter, and the guarantee that a normal run is
+  byte-for-byte unaffected
 
 ---
 
@@ -351,7 +424,7 @@ The pipeline runs from GitHub Actions
 (`.github/workflows/facebook-leads.yml`).
 
 1. Add the six secrets under **Settings → Secrets and variables → Actions**.
-2. Create the five new Airtable fields listed above.
+2. Create the seven added Airtable fields listed above.
 3. Merge to `main`.
 
 > **The daily schedule is currently paused.** The `schedule:` block in
@@ -359,9 +432,9 @@ The pipeline runs from GitHub Actions
 > qualification rules are validated against the production base. Uncomment
 > the three lines to restore the 06:30 America/Toronto run.
 
-Until then the pipeline runs only via **Run workflow**, which offers three
-inputs: **Dry run** (score without writing), **Start new Apify run**, and
-**AI batch limit**.
+Until then the pipeline runs only via **Run workflow**, which offers four
+inputs: **Dry run** (score without writing), **Website analysis** (score
+website work only), **Start new Apify run**, and **AI batch limit**.
 
 Two jobs run in sequence: `test` (compile + pytest) then `run-pipeline`. The
 pipeline only runs if the tests pass.

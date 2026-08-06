@@ -2,7 +2,54 @@
 
 All notable changes to the BruceTech Facebook lead pipeline.
 
-## [Unreleased] — Deterministic qualification and the 65-point threshold
+## [Unreleased] — Website analysis focus
+
+Branch: `claude/website-analysis-workflow-checkbox-6pp075`
+
+Adds a **Website analysis** checkbox to **Run workflow**
+(`WEBSITE_FOCUS_MODE`) that scopes a run to website work for business owners
+and business pages. Off by default; a normal run is unchanged.
+
+### Added — two signals, extracted on every run
+
+- `website_opportunity` — what kind of website work the post points to:
+  `no_website`, `expensive_platform`, `platform_migration`,
+  `outdated_website`, `broken_or_failing_website`, `redesign_or_refresh`,
+  `new_website_build`, `ecommerce_store`, `seo_or_visibility`,
+  `maintenance_or_updates`, `other_website_need`, or `none`.
+- `website_platform` — the platform the business is on today, only when the
+  post says so.
+
+Both are written to the new Airtable fields `Website Opportunity` and
+`Website Platform`, so the data accumulates whether or not focus mode is on.
+Missing fields degrade through the existing `UNKNOWN_FIELD_NAME` fallback.
+
+### Added — focus mode
+
+When the box is ticked:
+
+- The prefilter accepts website keywords only, and treats a website-
+  opportunity phrase ("still paying Shopify monthly", "we only have a
+  Facebook page") as buying intent in its own right.
+- Posts with no website need are hard-rejected as `NO_WEBSITE_OPPORTUNITY`,
+  whatever they score. The code is derived in Python and is not offered to
+  the model, so it cannot appear outside focus mode.
+- A bonus of up to 12 points ranks the opportunity types, plus 4 when the
+  business is on a monthly-plan platform (Shopify, Wix, Squarespace,
+  BigCommerce, Webflow) — the Shopify-to-WordPress conversion. Capped at 14,
+  applied before the existing clamp, so the 0–100 scale and every threshold
+  are unchanged.
+- Website leads sort ahead of the general prefilter score in the queue.
+
+### Changed
+
+- The model instructions gain a focus-mode section describing the five
+  website offers. The base instructions, and the rule that the model decides
+  nothing, are unchanged.
+- `collect_hard_rejections()` now accepts only `KNOWN_DISQUALIFIER_CODES`
+  from the model rather than every reason in the table.
+
+## [Earlier] — Deterministic qualification and the 65-point threshold
 
 Branch: `agent/improve-lead-qualification`
 

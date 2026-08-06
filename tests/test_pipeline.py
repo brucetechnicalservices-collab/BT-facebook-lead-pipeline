@@ -293,6 +293,111 @@ def test_prefilter_rejection_update_is_marked_rejected():
 
 
 # ---------------------------------------------------------------------------
+# Website analysis focus
+# ---------------------------------------------------------------------------
+
+WEBSITE_TEXT = (
+    "Our shop is still on Shopify and the monthly fees keep going up. Is "
+    "there a cheaper way to run our online store without paying a "
+    "subscription every month?"
+)
+
+IT_TEXT = (
+    "Can anyone recommend an IT company? We need help migrating our team "
+    "email to Microsoft 365 and setting up backups for the office network "
+    "this month."
+)
+
+
+def test_website_focus_is_off_by_default():
+    assert rp.WEBSITE_FOCUS_MODE is False
+
+
+def test_focus_instructions_are_only_added_when_focus_is_on():
+    assert "WEBSITE ANALYSIS FOCUS" not in rp.build_system_instructions()
+
+    focused = rp.build_system_instructions(website_focus=True)
+
+    assert "WEBSITE ANALYSIS FOCUS" in focused
+    # The base rules must survive: the model still decides nothing.
+    assert "You do NOT decide" in focused
+    assert "Never write a generic template" in focused
+
+
+def test_focus_instructions_cover_every_website_offer():
+    focused = rp.build_system_instructions(website_focus=True).lower()
+
+    for phrase in (
+        "shopify",
+        "wordpress",
+        "redesign",
+        "facebook page alone",
+        "e-commerce",
+    ):
+        assert phrase in focused
+
+
+def test_schema_carries_the_website_signals():
+    for field_name in ("website_opportunity", "website_platform"):
+        assert field_name in rp.LEAD_SCHEMA["properties"]
+        assert field_name in rp.LEAD_SCHEMA["required"]
+
+
+def test_website_signals_are_written_to_airtable():
+    decision = evaluate_lead(
+        {
+            **BASE_SIGNALS,
+            "website_opportunity": "expensive_platform",
+            "website_platform": "shopify",
+        },
+        suggested_dm="A specific message about their store.",
+        recommended_channel="direct_message",
+        now=NOW,
+    )
+
+    payload = rp.map_decision_to_airtable(decision, BASE_SIGNALS)
+
+    assert payload[rp.FIELD_WEBSITE_OPPORTUNITY] == "expensive_platform"
+    assert payload[rp.FIELD_WEBSITE_PLATFORM] == "shopify"
+
+
+def test_website_fields_degrade_on_an_older_base():
+    stripped = rp._strip_extended_fields(
+        [{"id": "rec1", "fields": {rp.FIELD_QUALIFIED: True,
+                                   rp.FIELD_WEBSITE_OPPORTUNITY: "no_website"}}]
+    )
+
+    assert rp.FIELD_WEBSITE_OPPORTUNITY not in stripped[0]["fields"]
+    assert rp.FIELD_QUALIFIED in stripped[0]["fields"]
+
+
+def test_focus_mode_prefilters_out_a_non_website_post(monkeypatch):
+    monkeypatch.setattr(rp, "WEBSITE_FOCUS_MODE", True)
+
+    ordered = rp.prioritize_ai_queue(
+        [record("recIT", text=IT_TEXT, days_old=1)], set(), now=NOW
+    )
+    _, prefilter = ordered[0]
+
+    assert prefilter.passed is False
+
+
+def test_focus_mode_orders_website_posts_first(monkeypatch):
+    monkeypatch.setattr(rp, "WEBSITE_FOCUS_MODE", True)
+
+    ordered = rp.prioritize_ai_queue(
+        [
+            record("recIT", text=IT_TEXT, days_old=1),
+            record("recWeb", text=WEBSITE_TEXT, days_old=1),
+        ],
+        set(),
+        now=NOW,
+    )
+
+    assert [r["id"] for r, _ in ordered] == ["recWeb", "recIT"]
+
+
+# ---------------------------------------------------------------------------
 # Queue formula
 # ---------------------------------------------------------------------------
 

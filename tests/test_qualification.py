@@ -15,6 +15,8 @@ from qualification import (
     DEFAULT_MANUAL_REVIEW_THRESHOLD,
     DEFAULT_MAX_POST_AGE_DAYS,
     DEFAULT_QUALIFICATION_THRESHOLD,
+    KNOWN_DISQUALIFIER_CODES,
+    PLATFORM_CONVERSION_BONUS,
     REJECT_ALREADY_RESOLVED,
     REJECT_COMPETITOR_OR_AGENCY,
     REJECT_FREE_ONLY_REQUEST,
@@ -22,6 +24,7 @@ from qualification import (
     REJECT_JOB_SEEKER,
     REJECT_NO_BUSINESS_CONTEXT,
     REJECT_NO_SERVICE_MATCH,
+    REJECT_NO_WEBSITE_OPPORTUNITY,
     REJECT_PERSONAL_REQUEST,
     REJECT_PROMOTIONAL_POST,
     REJECT_PROVIDER_SELECTED,
@@ -32,9 +35,13 @@ from qualification import (
     TIER_MANUAL_REVIEW,
     TIER_QUALIFIED,
     TIER_REJECTED,
+    WEBSITE_FOCUS_MAX_BONUS,
     calculate_score,
     evaluate_lead,
     prefilter_post,
+    score_signals,
+    website_opportunity_type,
+    website_platform,
 )
 
 NOW = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
@@ -410,6 +417,257 @@ def test_prefilter_rejects_off_topic_post():
     )
 
     assert result.passed is False
+
+
+# ---------------------------------------------------------------------------
+# Website analysis focus
+# ---------------------------------------------------------------------------
+
+def test_focus_mode_rejects_a_post_with_no_website_need():
+    """A perfect managed-IT lead is not a website lead."""
+    decision = decide(
+        {
+            **SIGNALS_AT_100,
+            "service_categories": ["managed_it", "microsoft_365"],
+            "website_opportunity": "none",
+        },
+        website_focus=True,
+    )
+
+    assert decision.tier == TIER_REJECTED
+    assert decision.qualified is False
+    assert REJECT_NO_WEBSITE_OPPORTUNITY in decision.hard_rejection_codes
+
+
+def test_the_same_post_is_unaffected_outside_focus_mode():
+    decision = decide(
+        {
+            **SIGNALS_AT_100,
+            "service_categories": ["managed_it", "microsoft_365"],
+            "website_opportunity": "none",
+        }
+    )
+
+    assert REJECT_NO_WEBSITE_OPPORTUNITY not in decision.hard_rejection_codes
+    assert decision.qualified is True
+
+
+def test_focus_mode_keeps_a_website_service_match():
+    decision = decide(
+        {"service_categories": ["website_development"]},
+        website_focus=True,
+    )
+
+    assert REJECT_NO_WEBSITE_OPPORTUNITY not in decision.hard_rejection_codes
+
+
+def test_a_website_opportunity_alone_survives_focus_mode():
+    """The category may be generic if the opportunity is explicit."""
+    decision = decide(
+        {
+            "service_categories": ["business_process_consulting"],
+            "website_opportunity": "no_website",
+        },
+        website_focus=True,
+    )
+
+    assert REJECT_NO_WEBSITE_OPPORTUNITY not in decision.hard_rejection_codes
+
+
+def test_focus_mode_lifts_an_expensive_platform_lead():
+    """Shopify cost pain plus the platform itself is the strongest offer."""
+    base = decide({"website_opportunity": "none"}, website_focus=True)
+    lifted = decide(
+        {
+            "website_opportunity": "expensive_platform",
+            "website_platform": "shopify",
+        },
+        website_focus=True,
+    )
+
+    assert lifted.lead_score == min(
+        base.lead_score + WEBSITE_FOCUS_MAX_BONUS, 100
+    )
+    assert lifted.lead_score - base.lead_score == WEBSITE_FOCUS_MAX_BONUS
+    assert lifted.tier in (TIER_QUALIFIED, TIER_HOT)
+
+
+def test_the_focus_bonus_can_promote_a_manual_review_lead():
+    """The point of the bonus: a borderline website lead reaches a human."""
+    borderline = {"problem_specificity": "specific", "purchase_signal": "none"}
+
+    assert decide(borderline).tier == TIER_MANUAL_REVIEW
+
+    promoted = decide(
+        {**borderline, "website_opportunity": "outdated_website"},
+        website_focus=True,
+    )
+
+    assert promoted.tier == TIER_QUALIFIED
+    assert promoted.qualified is True
+
+
+def test_the_focus_bonus_is_capped():
+    breakdown = score_signals(
+        signals(
+            website_opportunity="expensive_platform",
+            website_platform="wix",
+        ),
+        website_focus=True,
+    )
+
+    assert breakdown["website_focus"] == WEBSITE_FOCUS_MAX_BONUS
+
+
+def test_no_focus_bonus_without_focus_mode():
+    assert calculate_score(
+        signals(
+            website_opportunity="expensive_platform",
+            website_platform="shopify",
+        )
+    ) == calculate_score(signals())
+
+
+def test_wordpress_gets_no_conversion_bonus():
+    """There is no monthly plan to replace on WordPress."""
+    hosted = calculate_score(
+        signals(
+            website_opportunity="redesign_or_refresh",
+            website_platform="squarespace",
+        ),
+        website_focus=True,
+    )
+    self_hosted = calculate_score(
+        signals(
+            website_opportunity="redesign_or_refresh",
+            website_platform="wordpress",
+        ),
+        website_focus=True,
+    )
+
+    assert hosted - self_hosted == PLATFORM_CONVERSION_BONUS
+
+
+def test_an_unknown_opportunity_value_is_treated_as_none():
+    assert website_opportunity_type({"website_opportunity": "nonsense"}) == "none"
+    assert website_platform({"website_platform": "nonsense"}) == "unknown"
+
+
+def test_the_model_cannot_raise_the_focus_rejection_itself():
+    """NO_WEBSITE_OPPORTUNITY is derived in Python, never accepted."""
+    decision = decide(
+        {"disqualifier_codes": [REJECT_NO_WEBSITE_OPPORTUNITY]},
+    )
+
+    assert REJECT_NO_WEBSITE_OPPORTUNITY not in decision.hard_rejection_codes
+    assert REJECT_NO_WEBSITE_OPPORTUNITY not in KNOWN_DISQUALIFIER_CODES
+
+
+def test_a_hard_rejection_still_beats_a_strong_website_lead():
+    decision = decide(
+        {
+            **SIGNALS_AT_100,
+            "website_opportunity": "expensive_platform",
+            "website_platform": "shopify",
+            "competitor_or_agency": True,
+        },
+        website_focus=True,
+    )
+
+    assert decision.tier == TIER_REJECTED
+    assert REJECT_COMPETITOR_OR_AGENCY in decision.hard_rejection_codes
+
+
+# ---------------------------------------------------------------------------
+# Website-focus prefilter
+# ---------------------------------------------------------------------------
+
+SHOPIFY_COST_POST = (
+    "We run a small furniture shop and our Shopify plan plus apps is costing "
+    "us almost $400 a month now. The monthly fees are getting hard to "
+    "justify. Is there a cheaper option that still handles our online store?"
+)
+
+NO_WEBSITE_POST = (
+    "We've been running our catering business off this Facebook page for "
+    "three years and we don't have a website at all. Customers keep asking "
+    "for one so they can see the menu and book. Where do we even start?"
+)
+
+MANAGED_IT_POST = (
+    "Can anyone recommend an IT company in Toronto? We need help migrating "
+    "our team's email to Microsoft 365 and setting up backups for our "
+    "office network before the end of the month."
+)
+
+
+def test_focus_prefilter_passes_a_platform_cost_post():
+    result = prefilter_post(
+        SHOPIFY_COST_POST,
+        post_time=(NOW - timedelta(days=1)).isoformat(),
+        now=NOW,
+        website_focus=True,
+    )
+
+    assert result.passed is True
+    assert result.website_score > 0
+
+
+def test_focus_prefilter_passes_a_business_with_no_website():
+    """No 'looking for' language, but the opportunity is unmistakable."""
+    result = prefilter_post(
+        NO_WEBSITE_POST,
+        post_time=(NOW - timedelta(days=1)).isoformat(),
+        now=NOW,
+        website_focus=True,
+    )
+
+    assert result.passed is True
+
+
+def test_focus_prefilter_rejects_a_managed_it_post():
+    result = prefilter_post(
+        MANAGED_IT_POST,
+        post_time=(NOW - timedelta(days=1)).isoformat(),
+        now=NOW,
+        website_focus=True,
+    )
+
+    assert result.passed is False
+    assert "No website keywords detected." in result.reasons
+
+
+def test_the_same_it_post_passes_without_focus_mode():
+    result = prefilter_post(
+        MANAGED_IT_POST,
+        post_time=(NOW - timedelta(days=1)).isoformat(),
+        now=NOW,
+    )
+
+    assert result.passed is True
+
+
+def test_focus_prefilter_still_rejects_promotional_website_posts():
+    result = prefilter_post(
+        "I offer website redesign and SEO services for small businesses. "
+        "DM me for a quote, limited time discount available! My services "
+        "include WordPress migration and hosting.",
+        post_time=(NOW - timedelta(days=1)).isoformat(),
+        now=NOW,
+        website_focus=True,
+    )
+
+    assert result.passed is False
+
+
+def test_website_score_is_zero_outside_focus_mode():
+    result = prefilter_post(
+        SHOPIFY_COST_POST,
+        post_time=(NOW - timedelta(days=1)).isoformat(),
+        now=NOW,
+    )
+
+    assert result.website_score == 0
 
 
 # ---------------------------------------------------------------------------

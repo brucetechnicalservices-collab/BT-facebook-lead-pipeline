@@ -76,6 +76,9 @@ REJECT_NO_SERVICE_MATCH = "NO_SERVICE_MATCH"
 REJECT_INAPPROPRIATE_OUTREACH = "INAPPROPRIATE_OUTREACH"
 REJECT_STALE_POST = "STALE_POST"
 
+#: Raised only when the run is in website analysis focus mode.
+REJECT_NO_WEBSITE_OPPORTUNITY = "NO_WEBSITE_OPPORTUNITY"
+
 HARD_REJECTION_REASONS: dict[str, str] = {
     REJECT_PERSONAL_REQUEST: (
         "Personal consumer request rather than a business need."
@@ -116,10 +119,21 @@ HARD_REJECTION_REASONS: dict[str, str] = {
     REJECT_STALE_POST: (
         "Post is older than the configured maximum age."
     ),
+    REJECT_NO_WEBSITE_OPPORTUNITY: (
+        "Website analysis focus: the post describes no website need."
+    ),
 }
 
+#: Rejections Python derives itself. The model is never offered these, so a
+#: focus-mode code can never leak into a run that is not in focus mode.
+DERIVED_ONLY_DISQUALIFIER_CODES = frozenset({REJECT_NO_WEBSITE_OPPORTUNITY})
+
 #: disqualifier_codes the model may return that map onto a hard rejection.
-KNOWN_DISQUALIFIER_CODES = tuple(HARD_REJECTION_REASONS.keys())
+KNOWN_DISQUALIFIER_CODES = tuple(
+    code
+    for code in HARD_REJECTION_REASONS
+    if code not in DERIVED_ONLY_DISQUALIFIER_CODES
+)
 
 # ---------------------------------------------------------------------------
 # Signal vocabularies and their score contributions
@@ -248,6 +262,98 @@ EMPTY_SERVICE_VALUES = frozenset({"", "none", "n/a", "na", "null"})
 
 
 # ---------------------------------------------------------------------------
+# Website analysis focus
+#
+# An optional mode that narrows the whole run to website work for business
+# owners and business pages: businesses paying a high monthly platform fee
+# who would be cheaper on WordPress, dated sites that need a redesign, broken
+# or failing sites, and businesses that clearly have customers but no site at
+# all.
+#
+# Focus mode changes three things and nothing else:
+#   1. the prefilter demands a website signal, not just any service keyword
+#   2. posts with no website need are hard-rejected (NO_WEBSITE_OPPORTUNITY)
+#   3. a bounded bonus lifts the strongest website opportunities
+#
+# The base 0-100 scale is unchanged; the bonus is added before the same clamp.
+# ---------------------------------------------------------------------------
+
+#: Service categories that count as website work in focus mode.
+WEBSITE_SERVICE_CATEGORIES = frozenset(
+    {
+        "website_development",
+        "ecommerce",
+        "seo",
+        "website_maintenance",
+    }
+)
+
+#: What kind of website opportunity the post represents. Reported by the AI,
+#: scored here.
+WEBSITE_OPPORTUNITY_TYPES = (
+    "none",
+    "no_website",
+    "expensive_platform",
+    "platform_migration",
+    "outdated_website",
+    "broken_or_failing_website",
+    "redesign_or_refresh",
+    "new_website_build",
+    "ecommerce_store",
+    "seo_or_visibility",
+    "maintenance_or_updates",
+    "other_website_need",
+)
+
+#: Bonus points per opportunity type. The highest values are the offers
+#: BruceTech converts best: replacing an expensive hosted plan, moving a
+#: business off its current platform, and putting a first site in front of a
+#: business that already has customers.
+WEBSITE_OPPORTUNITY_SCORES = {
+    "none": 0,
+    "seo_or_visibility": 4,
+    "maintenance_or_updates": 5,
+    "other_website_need": 5,
+    "ecommerce_store": 7,
+    "outdated_website": 8,
+    "redesign_or_refresh": 8,
+    "broken_or_failing_website": 9,
+    "new_website_build": 10,
+    "no_website": 11,
+    "platform_migration": 11,
+    "expensive_platform": 12,
+}
+
+#: The platform the business is on today, when the post says so.
+WEBSITE_PLATFORMS = (
+    "unknown",
+    "none",
+    "shopify",
+    "wix",
+    "squarespace",
+    "bigcommerce",
+    "webflow",
+    "wordpress",
+    "woocommerce",
+    "custom",
+    "other",
+)
+
+#: Platforms billed as a recurring monthly plan, where a WordPress or
+#: WooCommerce rebuild removes an ongoing cost. This is the Shopify-to-
+#: WordPress conversion offer.
+HIGH_MONTHLY_COST_PLATFORMS = frozenset(
+    {"shopify", "wix", "squarespace", "bigcommerce", "webflow"}
+)
+
+#: Extra points when the business is on one of those platforms.
+PLATFORM_CONVERSION_BONUS = 4
+
+#: Ceiling on the combined focus-mode bonus.
+WEBSITE_FOCUS_MAX_BONUS = 14
+
+
+# ---------------------------------------------------------------------------
 # Normalisation helpers
 # ---------------------------------------------------------------------------
 
@@ -307,6 +413,52 @@ def matched_service_categories(value: Any) -> list[str]:
                 categories.append(category)
 
     return categories
+
+
+def website_opportunity_type(signals: dict[str, Any]) -> str:
+    """Return the normalised website opportunity, or 'none'."""
+    opportunity = normalize_enum(
+        signals.get("website_opportunity"), default="none"
+    )
+    if opportunity not in WEBSITE_OPPORTUNITY_SCORES:
+        return "none"
+
+    return opportunity
+
+
+def website_platform(signals: dict[str, Any]) -> str:
+    """Return the normalised current platform, or 'unknown'."""
+    platform = normalize_enum(signals.get("website_platform"))
+    if platform not in WEBSITE_PLATFORMS:
+        return "unknown"
+
+    return platform
+
+
+def has_website_need(signals: dict[str, Any]) -> bool:
+    """
+    Does this post describe website work BruceTech could win?
+
+    True when the AI matched a website service category or named a website
+    opportunity. Focus mode rejects everything else.
+    """
+    categories = matched_service_categories(signals.get("service_categories"))
+    if any(category in WEBSITE_SERVICE_CATEGORIES for category in categories):
+        return True
+
+    return website_opportunity_type(signals) != "none"
+
+
+def website_focus_bonus(signals: dict[str, Any]) -> int:
+    """Bounded focus-mode bonus for the strength of the website opportunity."""
+    bonus = WEBSITE_OPPORTUNITY_SCORES.get(website_opportunity_type(signals), 0)
+
+    if website_platform(signals) in HIGH_MONTHLY_COST_PLATFORMS:
+        # Already paying a monthly platform fee: a WordPress rebuild is a
+        # concrete, quantifiable saving rather than a general pitch.
+        bonus += PLATFORM_CONVERSION_BONUS
+
+    return min(bonus, WEBSITE_FOCUS_MAX_BONUS)
 
 
 def parse_post_timestamp(value: Any) -> datetime | None:
@@ -384,6 +536,11 @@ class LeadDecision:
     recommended_channel: str = CHANNEL_DO_NOT_CONTACT
     score_breakdown: dict[str, int] = field(default_factory=dict)
 
+    #: Website analysis signals, carried through for reporting whether or not
+    #: focus mode is on.
+    website_opportunity: str = "none"
+    website_platform: str = "unknown"
+
     @property
     def is_rejected(self) -> bool:
         return self.tier == TIER_REJECTED
@@ -398,6 +555,7 @@ def collect_hard_rejections(
     *,
     age_days: float | None = None,
     max_post_age_days: int = DEFAULT_MAX_POST_AGE_DAYS,
+    website_focus: bool = False,
 ) -> list[str]:
     """
     Return every hard rejection code that applies to these signals.
@@ -443,10 +601,15 @@ def collect_hard_rejections(
     if not matched_service_categories(signals.get("service_categories")):
         add(REJECT_NO_SERVICE_MATCH)
 
+    # In website analysis focus mode the run is only interested in website
+    # work, so anything else is rejected however strong a lead it may be.
+    if website_focus and not has_website_need(signals):
+        add(REJECT_NO_WEBSITE_OPPORTUNITY)
+
     # Codes the model raised directly.
     for raw_code in signals.get("disqualifier_codes") or []:
         code = str(raw_code).strip().upper().replace(" ", "_")
-        if code in HARD_REJECTION_REASONS:
+        if code in KNOWN_DISQUALIFIER_CODES:
             add(code)
 
     # Staleness is computed in Python, never trusted from the model.
@@ -470,11 +633,17 @@ def describe_hard_rejections(codes: Sequence[str]) -> str:
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_signals(signals: dict[str, Any]) -> dict[str, int]:
+def score_signals(
+    signals: dict[str, Any],
+    *,
+    website_focus: bool = False,
+) -> dict[str, int]:
     """
     Convert structured AI signals into a per-component score breakdown.
 
-    The caller sums these; the total is clamped to 0-100.
+    The caller sums these; the total is clamped to 0-100. In website analysis
+    focus mode a bounded `website_focus` bonus is added so the strongest
+    website opportunities clear the threshold ahead of weaker ones.
     """
     categories = matched_service_categories(signals.get("service_categories"))
 
@@ -538,13 +707,20 @@ def score_signals(signals: dict[str, Any]) -> dict[str, int]:
     ) < LOW_CONFIDENCE_CUTOFF:
         penalty += PENALTY_LOW_CONFIDENCE
 
+    if website_focus:
+        breakdown["website_focus"] = website_focus_bonus(signals)
+
     breakdown["penalties"] = -penalty
     return breakdown
 
 
-def calculate_score(signals: dict[str, Any]) -> int:
+def calculate_score(
+    signals: dict[str, Any],
+    *,
+    website_focus: bool = False,
+) -> int:
     """Return the deterministic 0-100 lead score for these signals."""
-    breakdown = score_signals(signals)
+    breakdown = score_signals(signals, website_focus=website_focus)
     return max(0, min(sum(breakdown.values()), 100))
 
 
@@ -591,6 +767,7 @@ def evaluate_lead(
     manual_review_threshold: int = DEFAULT_MANUAL_REVIEW_THRESHOLD,
     hot_threshold: int = DEFAULT_HOT_THRESHOLD,
     max_post_age_days: int = DEFAULT_MAX_POST_AGE_DAYS,
+    website_focus: bool = False,
 ) -> LeadDecision:
     """
     Turn structured AI signals into the final, authoritative decision.
@@ -606,10 +783,11 @@ def evaluate_lead(
         signals,
         age_days=age_days,
         max_post_age_days=max_post_age_days,
+        website_focus=website_focus,
     )
     hard_rejected = bool(hard_codes)
 
-    breakdown = score_signals(signals)
+    breakdown = score_signals(signals, website_focus=website_focus)
     score = max(0, min(sum(breakdown.values()), 100))
 
     tier = resolve_tier(
@@ -675,6 +853,8 @@ def evaluate_lead(
         suggested_dm=dm,
         recommended_channel=channel,
         score_breakdown=breakdown,
+        website_opportunity=website_opportunity_type(signals),
+        website_platform=website_platform(signals),
     )
 
 
@@ -711,6 +891,39 @@ SERVICE_KEYWORDS = (
     "artificial intelligence", "software", "pos ", "point of sale",
 )
 
+#: Website-only service keywords. In focus mode these replace
+#: SERVICE_KEYWORDS, so an IT or automation post no longer passes the screen.
+WEBSITE_SERVICE_KEYWORDS = (
+    "website", "web site", "web page", "webpage", "landing page",
+    "wordpress", "woocommerce", "shopify", "wix", "squarespace",
+    "bigcommerce", "webflow", "godaddy", "web design", "web designer",
+    "web developer", "web development", "webmaster", "ecommerce",
+    "e-commerce", "online store", "online shop", "seo", "domain",
+    "hosting", "ssl", "page speed", "site speed", "mobile friendly",
+    "responsive", "booking system", "online booking", "checkout",
+    "shopping cart", "google business profile", "google my business",
+)
+
+#: Phrases that describe a website opportunity directly. In focus mode these
+#: count as buying intent on their own: "we're on Shopify paying $400 a
+#: month" is a lead even without the words "looking for".
+WEBSITE_OPPORTUNITY_KEYWORDS = (
+    "no website", "don't have a website", "dont have a website",
+    "do not have a website", "without a website", "need a website",
+    "want a website", "get a website", "new website", "first website",
+    "only have a facebook page", "just a facebook page",
+    "facebook page only", "only facebook",
+    "old website", "outdated website", "dated website", "website is old",
+    "redesign", "revamp", "refresh my site", "rebuild my site",
+    "site is down", "website is down", "site is slow", "website is slow",
+    "site keeps crashing", "not mobile friendly", "broken links",
+    "shopify fees", "shopify plan", "shopify subscription",
+    "monthly fee", "monthly fees", "monthly cost", "subscription cost",
+    "too expensive", "cheaper option", "cut costs", "save money",
+    "move off shopify", "leave shopify", "switch to wordpress",
+    "migrate to wordpress", "move to wordpress",
+)
+
 NEGATIVE_KEYWORDS = (
     "dm me", "pm me", "inbox me", "hire me", "i offer", "we offer",
     "my services", "our services", "for sale", "discount", "promo code",
@@ -733,6 +946,10 @@ class PrefilterResult:
     intent_score: int
     reasons: list[str] = field(default_factory=list)
 
+    #: How many website-opportunity phrases the post contained. Zero outside
+    #: focus mode is not meaningful; it is only scored when focus is on.
+    website_score: int = 0
+
 
 def prefilter_post(
     text: Any,
@@ -740,6 +957,7 @@ def prefilter_post(
     post_time: Any = None,
     now: datetime | None = None,
     max_post_age_days: int = DEFAULT_MAX_POST_AGE_DAYS,
+    website_focus: bool = False,
 ) -> PrefilterResult:
     """
     Cheaply screen a raw post before spending an AI call on it.
@@ -747,6 +965,11 @@ def prefilter_post(
     Returns a score used both to gate the AI call and to prioritise the
     queue. This is heuristic on purpose -- the authoritative decision is
     still made by evaluate_lead() on the AI's structured signals.
+
+    In website analysis focus mode the screen narrows to website work: only
+    website keywords count as a service match, and a website-opportunity
+    phrase ("still paying Shopify monthly", "we only have a Facebook page")
+    counts as buying intent by itself.
     """
     body = str(text or "").strip()
     lowered = body.lower()
@@ -773,24 +996,47 @@ def prefilter_post(
         )
 
     intent_hits = [word for word in INTENT_KEYWORDS if word in lowered]
-    service_hits = [word for word in SERVICE_KEYWORDS if word in lowered]
     negative_hits = [word for word in NEGATIVE_KEYWORDS if word in lowered]
+
+    website_hits = [
+        phrase for phrase in WEBSITE_OPPORTUNITY_KEYWORDS if phrase in lowered
+    ]
+
+    if website_focus:
+        service_hits = [
+            word for word in WEBSITE_SERVICE_KEYWORDS if word in lowered
+        ]
+    else:
+        service_hits = [word for word in SERVICE_KEYWORDS if word in lowered]
 
     intent_score = min(len(intent_hits) * 12, 48)
     service_score = min(len(service_hits) * 10, 40)
     length_score = 12 if len(body) >= 180 else 6
     penalty = min(len(negative_hits) * 20, 60)
+    website_score = min(len(website_hits) * 12, 36) if website_focus else 0
 
     score = max(
         0,
-        min(intent_score + service_score + length_score - penalty, 100),
+        min(
+            intent_score + service_score + length_score + website_score
+            - penalty,
+            100,
+        ),
     )
 
-    if not intent_hits:
+    # A website-opportunity phrase is a request in itself, so it satisfies the
+    # intent requirement in focus mode.
+    has_intent = bool(intent_hits) or (website_focus and bool(website_hits))
+
+    if not has_intent:
         reasons.append("No request or buying-intent language detected.")
 
     if not service_hits:
-        reasons.append("No BruceTech service keywords detected.")
+        reasons.append(
+            "No website keywords detected."
+            if website_focus
+            else "No BruceTech service keywords detected."
+        )
 
     if negative_hits:
         reasons.append(
@@ -800,11 +1046,12 @@ def prefilter_post(
 
     # Require at least one intent signal AND one service signal, and a score
     # that survived the negative keywords.
-    passed = bool(intent_hits) and bool(service_hits) and score >= 30
+    passed = has_intent and bool(service_hits) and score >= 30
 
     return PrefilterResult(
         passed=passed,
         score=score,
         intent_score=intent_score,
         reasons=reasons,
+        website_score=website_score,
     )

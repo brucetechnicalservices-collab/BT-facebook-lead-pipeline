@@ -8,6 +8,11 @@ on:
         type: boolean
         default: false
         required: false
+      website_focus:
+        description: "Website analysis: score website work only (Shopify/Wix cost conversions, redesigns, fixes, businesses with no site)"
+        type: boolean
+        default: false
+        required: false
       start_new_apify_run:
         description: "Start a fresh Apify run instead of reading the last one"
         type: boolean
@@ -113,6 +118,10 @@ jobs:
             ${{ github.event.inputs.dry_run || 'false' }}
           AI_BATCH_LIMIT: >-
             ${{ github.event.inputs.ai_batch_limit || '40' }}
+          # Website analysis focus. When ticked, the run scores website work
+          # only and rejects everything else as NO_WEBSITE_OPPORTUNITY.
+          WEBSITE_FOCUS_MODE: >-
+            ${{ github.event.inputs.website_focus || 'false' }}
           MAX_POST_CHARS: "8000"
           AIRTABLE_FORMULA_WAIT_SECONDS: "15"
           ENFORCE_PYTHON_PREFILTER: "true"

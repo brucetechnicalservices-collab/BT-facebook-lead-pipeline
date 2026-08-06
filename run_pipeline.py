@@ -40,6 +40,8 @@ from qualification import (
     KNOWN_DISQUALIFIER_CODES,
     SERVICE_CATEGORIES,
     TIER_MANUAL_REVIEW,
+    WEBSITE_OPPORTUNITY_TYPES,
+    WEBSITE_PLATFORMS,
     LeadDecision,
     evaluate_lead,
     parse_post_timestamp,
@@ -126,6 +128,12 @@ REQUIRE_AIRTABLE_PREQUALIFICATION = env_bool(
 #: Skip the AI call entirely for posts the deterministic prefilter rejects.
 ENFORCE_PYTHON_PREFILTER = env_bool("ENFORCE_PYTHON_PREFILTER", True)
 
+#: Website analysis focus. Narrows the entire run to website work for
+#: business owners and business pages: expensive Shopify/Wix plans that would
+#: be cheaper on WordPress, dated sites needing a redesign, broken sites, and
+#: businesses with customers but no website. Everything else is rejected.
+WEBSITE_FOCUS_MODE = env_bool("WEBSITE_FOCUS_MODE", False)
+
 #: Read from Apify and Airtable and call the AI as normal, but make no
 #: Airtable writes. Use this to see how the new rules score real records
 #: before letting the pipeline modify the base.
@@ -167,12 +175,19 @@ FIELD_OUTREACH_READY = "Outreach Ready"
 FIELD_DISQUALIFIERS = "Disqualifiers"
 FIELD_PREFILTER_SCORE = "Prefilter Score"
 
+# Website analysis fields. Written on every run so the data is there when you
+# switch focus mode on.
+FIELD_WEBSITE_OPPORTUNITY = "Website Opportunity"
+FIELD_WEBSITE_PLATFORM = "Website Platform"
+
 EXTENDED_FIELDS = (
     FIELD_LEAD_TIER,
     FIELD_MANUAL_REVIEW,
     FIELD_OUTREACH_READY,
     FIELD_DISQUALIFIERS,
     FIELD_PREFILTER_SCORE,
+    FIELD_WEBSITE_OPPORTUNITY,
+    FIELD_WEBSITE_PLATFORM,
 )
 
 
@@ -294,6 +309,27 @@ urgency and business_impact - only when the post supports them.
 
 location - Toronto/GTA, Ontario, Canada, other, or unknown.
 
+website_opportunity - the kind of website work the post points to, or "none"
+  when the post is not about a website at all:
+  no_website                = a business with customers but no website, often
+                              running on a Facebook page alone
+  expensive_platform        = paying a monthly plan (Shopify, Wix, Squarespace)
+                              they consider too costly
+  platform_migration        = wants to move off their current platform
+  outdated_website          = the site is old, dated, or unmaintained
+  broken_or_failing_website = down, slow, erroring, or not mobile friendly
+  redesign_or_refresh       = wants the existing site redesigned
+  new_website_build         = wants a site built
+  ecommerce_store           = wants to sell online
+  seo_or_visibility         = cannot be found, ranking or traffic problems
+  maintenance_or_updates    = ongoing edits, updates, or support
+  other_website_need        = a website need none of the above describes
+
+website_platform - the platform the business is on today, only when the post
+  actually says so. Use "none" when they state they have no website and
+  "unknown" when it is not mentioned. Never infer a platform from the type of
+  business.
+
 resolved_status - "resolved" when the author says the problem is solved or
   thanks people for answers; "likely_resolved" when it reads that way but is
   not explicit.
@@ -351,6 +387,50 @@ Always return every field.
 """.strip()
 
 
+# Appended to the instructions only when the run is in website analysis focus
+# mode. It changes what the model pays attention to; it still does not decide
+# anything. Python applies the focus-mode rules.
+WEBSITE_FOCUS_INSTRUCTIONS = """
+
+WEBSITE ANALYSIS FOCUS
+
+This run is scoped to website work only. The reader is a business owner or
+the person running a business page.
+
+BruceTech's website offers, in the order they matter for this run:
+
+1. Replacing an expensive hosted plan. Businesses on Shopify, Wix, or
+   Squarespace pay a monthly fee forever. BruceTech rebuilds the same store
+   or site on WordPress or WooCommerce so the recurring cost drops sharply.
+   Any mention of platform fees, plan costs, or transaction fees matters.
+2. Redesigning old websites. Sites that look dated, were built years ago, or
+   were abandoned by whoever made them.
+3. Fixing existing websites. Down, slow, erroring, insecure, unable to be
+   edited, not mobile friendly, broken forms, checkout, or booking.
+4. Building a first website for a business that already has customers.
+   Businesses trading through a Facebook page alone, by phone, or by DM are
+   exactly this case.
+5. Any other website need: e-commerce, SEO and visibility, hosting, domains,
+   maintenance, speed, or ongoing edits.
+
+Set website_opportunity and website_platform carefully -- in this run they
+drive the outcome. Report "none" when the post is not about a website; that
+is a correct answer and the post will be rejected without penalty to you.
+
+Report only what the post says. Do not assume a business has a bad website,
+an expensive plan, or no website because the post does not mention one, and
+never claim to have looked at their site.
+""".rstrip()
+
+
+def build_system_instructions(*, website_focus: bool = False) -> str:
+    """Return the model instructions for this run."""
+    if website_focus:
+        return SYSTEM_INSTRUCTIONS + WEBSITE_FOCUS_INSTRUCTIONS
+
+    return SYSTEM_INSTRUCTIONS
+
+
 def _enum(values: tuple[str, ...]) -> dict[str, Any]:
     return {"type": "string", "enum": list(values)}
 
@@ -392,6 +472,8 @@ LEAD_SCHEMA: dict[str, Any] = {
         "location": _enum(
             ("unknown", "other", "canada", "ontario", "toronto_gta")
         ),
+        "website_opportunity": _enum(WEBSITE_OPPORTUNITY_TYPES),
+        "website_platform": _enum(WEBSITE_PLATFORMS),
         "resolved_status": _enum(
             ("unresolved", "likely_resolved", "resolved")
         ),
@@ -431,6 +513,8 @@ LEAD_SCHEMA: dict[str, Any] = {
         "urgency",
         "business_impact",
         "location",
+        "website_opportunity",
+        "website_platform",
         "resolved_status",
         "provider_already_selected",
         "personal_request",
@@ -962,8 +1046,9 @@ def prioritize_ai_queue(
       1. Records a human flagged 'Send to AI' in Airtable
       2. Records imported during this run
       3. Newest posts
-      4. Strongest deterministic prefilter score
-      5. Highest buying-intent signal
+      4. Strongest website-opportunity signal (focus mode only)
+      5. Strongest deterministic prefilter score
+      6. Highest buying-intent signal
 
     A human's explicit selection outranks everything else: if someone went
     through the table and marked records, those are what the run should
@@ -978,6 +1063,7 @@ def prioritize_ai_queue(
             post_time=fields.get(FIELD_TIME),
             now=now,
             max_post_age_days=MAX_POST_AGE_DAYS,
+            website_focus=WEBSITE_FOCUS_MODE,
         )
         scored.append((record, prefilter))
 
@@ -996,6 +1082,8 @@ def prioritize_ai_queue(
             -prequalified,
             -imported_now,
             -recency,
+            # Always 0 outside website focus mode, so ordering is unchanged.
+            -prefilter.website_score,
             -prefilter.score,
             -prefilter.intent_score,
         )
@@ -1042,7 +1130,9 @@ POST URL:
 
             response = client.responses.create(
                 model=OPENAI_MODEL,
-                instructions=SYSTEM_INSTRUCTIONS,
+                instructions=build_system_instructions(
+                    website_focus=WEBSITE_FOCUS_MODE
+                ),
                 input=post_input,
                 reasoning={"effort": "low"},
                 text={
@@ -1119,6 +1209,7 @@ def qualify_post(
         manual_review_threshold=MANUAL_REVIEW_THRESHOLD,
         hot_threshold=HOT_LEAD_THRESHOLD,
         max_post_age_days=MAX_POST_AGE_DAYS,
+        website_focus=WEBSITE_FOCUS_MODE,
     )
 
     return decision, signals
@@ -1156,6 +1247,8 @@ def map_decision_to_airtable(
         FIELD_MANUAL_REVIEW: bool(decision.manual_review),
         FIELD_OUTREACH_READY: bool(decision.outreach_ready),
         FIELD_DISQUALIFIERS: ", ".join(decision.hard_rejection_codes) or "",
+        FIELD_WEBSITE_OPPORTUNITY: decision.website_opportunity,
+        FIELD_WEBSITE_PLATFORM: decision.website_platform,
     }
 
     if prefilter_score is not None:
@@ -1391,12 +1484,20 @@ def process_ai_queue(
                 }
             )
 
+            website_note = (
+                f"Website={decision.website_opportunity}"
+                f"/{decision.website_platform} "
+                if WEBSITE_FOCUS_MODE
+                else ""
+            )
+
             print(
                 f"[{index}/{len(prioritized)}] "
                 f"Score={decision.lead_score} "
                 f"Tier={decision.tier} "
                 f"Qualified={decision.qualified} "
                 f"Outreach={decision.outreach_ready} "
+                f"{website_note}"
                 f"Author={author!r} URL={post_url}",
                 flush=True,
             )
@@ -1462,6 +1563,15 @@ def main() -> None:
         f"max post age={MAX_POST_AGE_DAYS}d.",
         flush=True,
     )
+
+    if WEBSITE_FOCUS_MODE:
+        print(
+            "WEBSITE ANALYSIS FOCUS: this run scores website work only "
+            "(platform cost conversions, redesigns, fixes, and businesses "
+            "with no website). Posts with no website need are rejected as "
+            "NO_WEBSITE_OPPORTUNITY.",
+            flush=True,
+        )
 
     if DRY_RUN:
         print(
