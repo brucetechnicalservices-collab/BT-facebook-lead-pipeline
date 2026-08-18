@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
+import intent
+
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
@@ -32,7 +34,19 @@ DEFAULT_MANUAL_REVIEW_THRESHOLD = 55
 DEFAULT_HOT_THRESHOLD = 80
 
 #: Posts older than this are hard-rejected regardless of score.
-DEFAULT_MAX_POST_AGE_DAYS = 45
+#:
+#: Lowered from 45 to 5. The scraper runs on roughly a 3-day window, and a
+#: Facebook request older than a work week has almost always been answered
+#: already. Override with MAX_POST_AGE_DAYS when working a backlog.
+DEFAULT_MAX_POST_AGE_DAYS = 5
+
+#: Minimum classification_confidence before automatic outreach is allowed.
+DEFAULT_MIN_OUTREACH_CONFIDENCE = 0.55
+
+#: BUSINESS_PAIN leads must clear this score before automatic outreach.
+#: Someone describing a problem has not asked for a provider, so the bar is
+#: higher than the plain qualification threshold.
+DEFAULT_BUSINESS_PAIN_OUTREACH_SCORE = 70
 
 # ---------------------------------------------------------------------------
 # Tiers
@@ -76,6 +90,16 @@ REJECT_NO_SERVICE_MATCH = "NO_SERVICE_MATCH"
 REJECT_INAPPROPRIATE_OUTREACH = "INAPPROPRIATE_OUTREACH"
 REJECT_STALE_POST = "STALE_POST"
 
+# Added by the intent release. These are decided in Python from the
+# deterministic intent classifier and pipeline configuration, never by the
+# model, so they are not offered to it in the JSON schema.
+REJECT_NO_BUYING_INTENT = "NO_BUYING_INTENT"
+REJECT_FUNDING_REQUEST = "FUNDING_OR_FINANCE_REQUEST"
+REJECT_HIRING_UNRELATED = "HIRING_UNRELATED"
+REJECT_SUPPRESSED_AUTHOR = "SUPPRESSED_AUTHOR"
+REJECT_DISALLOWED_GROUP = "DISALLOWED_GROUP"
+REJECT_HUMAN_REJECTED = "HUMAN_REJECTED"
+
 HARD_REJECTION_REASONS: dict[str, str] = {
     REJECT_PERSONAL_REQUEST: (
         "Personal consumer request rather than a business need."
@@ -116,10 +140,49 @@ HARD_REJECTION_REASONS: dict[str, str] = {
     REJECT_STALE_POST: (
         "Post is older than the configured maximum age."
     ),
+    REJECT_NO_BUYING_INTENT: (
+        "General advice or unrelated discussion, not a request BruceTech "
+        "can serve."
+    ),
+    REJECT_FUNDING_REQUEST: (
+        "Financing, funding, or credit request with no BruceTech service "
+        "need."
+    ),
+    REJECT_HIRING_UNRELATED: (
+        "Hiring request unrelated to any BruceTech service."
+    ),
+    REJECT_SUPPRESSED_AUTHOR: (
+        "Author is on the suppression list."
+    ),
+    REJECT_DISALLOWED_GROUP: (
+        "Post came from a group excluded from outreach."
+    ),
+    REJECT_HUMAN_REJECTED: (
+        "A human reviewer rejected this record."
+    ),
 }
 
+#: Codes decided in Python. The model is never asked about these, so they are
+#: excluded from the JSON schema enum below.
+PYTHON_ONLY_DISQUALIFIER_CODES = (
+    REJECT_STALE_POST,
+    REJECT_NO_BUYING_INTENT,
+    REJECT_FUNDING_REQUEST,
+    REJECT_HIRING_UNRELATED,
+    REJECT_SUPPRESSED_AUTHOR,
+    REJECT_DISALLOWED_GROUP,
+    REJECT_HUMAN_REJECTED,
+)
+
 #: disqualifier_codes the model may return that map onto a hard rejection.
-KNOWN_DISQUALIFIER_CODES = tuple(HARD_REJECTION_REASONS.keys())
+KNOWN_DISQUALIFIER_CODES = tuple(
+    code
+    for code in HARD_REJECTION_REASONS
+    if code not in PYTHON_ONLY_DISQUALIFIER_CODES
+)
+
+#: Every code the pipeline can emit, model-reported or Python-decided.
+ALL_DISQUALIFIER_CODES = tuple(HARD_REJECTION_REASONS.keys())
 
 # ---------------------------------------------------------------------------
 # Signal vocabularies and their score contributions
@@ -398,11 +461,18 @@ def collect_hard_rejections(
     *,
     age_days: float | None = None,
     max_post_age_days: int = DEFAULT_MAX_POST_AGE_DAYS,
+    intent_type: str | None = None,
+    post_text: Any = None,
+    extra_codes: Sequence[str] = (),
 ) -> list[str]:
     """
     Return every hard rejection code that applies to these signals.
 
     Order is stable so the primary reason is deterministic.
+
+    ``intent_type`` and ``extra_codes`` carry the Python-side decisions --
+    deterministic intent, author suppression, group exclusion, a human
+    rejection -- that the model is never asked about.
     """
     codes: list[str] = []
 
@@ -453,7 +523,44 @@ def collect_hard_rejections(
     if age_days is not None and age_days > max_post_age_days:
         add(REJECT_STALE_POST)
 
+    # Deterministic intent. A post the classifier read as general business
+    # advice or as unrelated chatter is never a BruceTech lead, however
+    # generously the model scored it. This is the anti-solution-hopping rule.
+    if intent_type is not None and intent_type not in intent.OUTREACH_INTENTS:
+        if intent_type == intent.INTENT_TOOL_RESEARCH:
+            # Research is not a rejection -- it is a human decision. Scoring
+            # continues; outreach is blocked further down in evaluate_lead().
+            pass
+        else:
+            add(intent_disqualifier_code(intent_type, post_text))
+
+    for raw_code in extra_codes or ():
+        code = str(raw_code).strip().upper().replace(" ", "_")
+        if code in HARD_REJECTION_REASONS:
+            add(code)
+
     return codes
+
+
+def intent_disqualifier_code(
+    intent_type: str,
+    text: Any = None,
+) -> str:
+    """
+    Pick the most specific rejection code for a non-serviceable intent.
+
+    Financing and staffing questions get their own codes so the Airtable
+    ``Disqualifiers`` column shows *why* a post was dropped rather than a
+    catch-all.
+    """
+    if intent_type == intent.INTENT_GENERAL_ADVICE:
+        subtype = intent.general_advice_subtype(text)
+        if subtype == "FUNDING":
+            return REJECT_FUNDING_REQUEST
+        if subtype == "HIRING":
+            return REJECT_HIRING_UNRELATED
+
+    return REJECT_NO_BUYING_INTENT
 
 
 def describe_hard_rejections(codes: Sequence[str]) -> str:
@@ -591,12 +698,22 @@ def evaluate_lead(
     manual_review_threshold: int = DEFAULT_MANUAL_REVIEW_THRESHOLD,
     hot_threshold: int = DEFAULT_HOT_THRESHOLD,
     max_post_age_days: int = DEFAULT_MAX_POST_AGE_DAYS,
+    intent_type: str | None = None,
+    post_text: Any = None,
+    min_outreach_confidence: float = DEFAULT_MIN_OUTREACH_CONFIDENCE,
+    business_pain_min_score: int = DEFAULT_BUSINESS_PAIN_OUTREACH_SCORE,
+    extra_disqualifiers: Sequence[str] = (),
 ) -> LeadDecision:
     """
     Turn structured AI signals into the final, authoritative decision.
 
     The model never decides qualification. It supplies observations; this
     function applies the rules.
+
+    ``intent_type`` is the deterministic classification from ``intent``. When
+    supplied it can veto a lead outright (general advice, unrelated) and it
+    gates outreach: only provider requests, implementation requests, and
+    strong business pain may ever produce an automatic DM.
     """
     signals = signals or {}
 
@@ -606,6 +723,9 @@ def evaluate_lead(
         signals,
         age_days=age_days,
         max_post_age_days=max_post_age_days,
+        intent_type=intent_type,
+        post_text=post_text,
+        extra_codes=extra_disqualifiers,
     )
     hard_rejected = bool(hard_codes)
 
@@ -633,9 +753,35 @@ def evaluate_lead(
     dm = str(suggested_dm or "").strip()
 
     if qualified:
+        # Qualified means "strong commercial fit". Outreach Ready is a
+        # stricter, separate question: is contacting this person right now
+        # appropriate, evidenced, and wanted?
+        #
         # A do_not_contact recommendation is never upgraded to an outreach
         # channel. If the model judged outreach inappropriate, that stands.
-        outreach_ready = bool(dm) and channel in OUTREACH_CHANNELS
+        confidence = normalize_confidence(
+            signals.get("classification_confidence")
+        )
+
+        intent_allows_outreach = (
+            intent_type is None or intent_type in intent.OUTREACH_INTENTS
+        )
+
+        # Business pain is an inference, not a request. Someone describing a
+        # problem has not asked for a provider, so they need a higher score
+        # before a cold DM is justified.
+        pain_score_ok = (
+            intent_type != intent.INTENT_BUSINESS_PAIN
+            or score >= business_pain_min_score
+        )
+
+        outreach_ready = (
+            bool(dm)
+            and channel in OUTREACH_CHANNELS
+            and confidence >= min_outreach_confidence
+            and intent_allows_outreach
+            and pain_score_ok
+        )
 
         if not outreach_ready:
             # There is deliberately no generic fallback DM. A lead without a
@@ -681,47 +827,83 @@ def evaluate_lead(
 # ---------------------------------------------------------------------------
 # Deterministic prefilter
 #
-# Runs before any AI call so obviously unusable posts never cost a token.
-# This replaces sole reliance on the undocumented Airtable Prequalification
-# formula.
+# Runs before any AI call so obviously unusable posts never cost a token, and
+# produces the Prefilter Score used to order the AI queue.
+#
+# This replaces sole reliance on the Airtable Prequalification formula.
+# Formula values calculate asynchronously and cannot be unit-tested, so Python
+# repeats the check independently. The two must agree in spirit: a post needs
+# a request signal AND a service signal AND no promotion signal.
 # ---------------------------------------------------------------------------
 
 MIN_PREFILTER_TEXT_LENGTH = 40
 
-INTENT_KEYWORDS = (
-    "recommend", "recommendation", "looking for", "need help", "need a",
-    "need an", "anyone know", "any suggestions", "suggestions for",
-    "who can", "can anyone", "help with", "advice on", "advice about",
-    "hire", "quote", "pricing", "how much", "budget for", "looking to",
-    "we need", "i need", "struggling with", "issues with", "problem with",
-    "not working", "broken", "switch from", "migrate", "integrate",
-    "automate", "set up", "setup", "build a", "redesign", "fix my",
-    "fix our",
+#: A post must reach this Prefilter Score to be worth an AI call.
+DEFAULT_PREFILTER_PASS_SCORE = 30
+
+# --- Prefilter Score components -------------------------------------------
+#
+# The score is a deterministic 0-100 *prioritisation* number. It is not the
+# Lead Score: it is computed from the raw post alone, before the model has
+# seen anything, and its only jobs are to gate the AI call and to sort the
+# queue. Every component below is documented in README.md.
+
+#: Base points by intent type. This dominates the score on purpose -- what
+#: the author is asking for matters more than how they phrased it.
+INTENT_BASE_SCORES: dict[str, int] = {
+    intent.INTENT_PROVIDER_REQUEST: 35,
+    intent.INTENT_IMPLEMENTATION_REQUEST: 32,
+    intent.INTENT_BUSINESS_PAIN: 22,
+    intent.INTENT_TOOL_RESEARCH: 10,
+    intent.INTENT_GENERAL_ADVICE: 0,
+    intent.INTENT_UNRELATED: 0,
+}
+
+#: Service match. A strong term is worth more than a corroborated weak one.
+PREFILTER_STRONG_SERVICE_SCORE = 18
+PREFILTER_SERVICE_PER_EXTRA_CATEGORY = 4
+PREFILTER_SERVICE_MAX_SCORE = 26
+PREFILTER_WEAK_SERVICE_SCORE = 8
+
+#: Freshness. Fresh posts win; the author is still reading replies.
+PREFILTER_AGE_SCORES: tuple[tuple[float, int], ...] = (
+    (1.0, 18),   # under 24 hours
+    (3.0, 12),   # 1-3 days
+    (5.0, 6),    # 3-5 days
+)
+#: Older than the last band above but still within MAX_POST_AGE_DAYS.
+PREFILTER_AGE_WITHIN_MAX_SCORE = 2
+#: No usable timestamp: neither rewarded nor punished.
+PREFILTER_AGE_UNKNOWN_SCORE = 4
+
+#: Commercial context ("I own", "our clients", trade nouns).
+PREFILTER_COMMERCIAL_SCORES: tuple[tuple[int, int], ...] = (
+    (2, 10),     # two or more phrases
+    (1, 6),      # one phrase
 )
 
-SERVICE_KEYWORDS = (
-    "website", "web site", "wordpress", "shopify", "woocommerce",
-    "landing page", "ecommerce", "e-commerce", "seo", "domain",
-    "hosting", "booking system", "payment", "stripe",
-    "it support", "managed it", "microsoft 365", "office 365", "outlook",
-    "sharepoint", "onedrive", "teams", "email migration", "network",
-    "wifi", "wi-fi", "vpn", "backup", "cybersecurity", "security",
-    "crm", "airtable", "zapier", "make.com", "automation", "automate",
-    "workflow", "integration", "api", "chatbot", "ai ",
-    "artificial intelligence", "software", "pos ", "point of sale",
+#: Length, as a rough proxy for how much the author explained.
+PREFILTER_LENGTH_SCORES: tuple[tuple[int, int], ...] = (
+    (400, 8),
+    (180, 6),
+    (80, 3),
 )
 
-NEGATIVE_KEYWORDS = (
-    "dm me", "pm me", "inbox me", "hire me", "i offer", "we offer",
-    "my services", "our services", "for sale", "discount", "promo code",
-    "limited time", "sign up now", "click the link", "affiliate",
-    "looking for work", "looking for a job", "job seeker", "cv",
-    "resume attached", "available for hire", "open to work",
-    "free of charge", "for free", "no budget", "student project",
-    "school project", "assignment", "homework", "thesis",
-    "found someone", "sorted now", "issue resolved", "already fixed",
-    "thanks everyone", "no longer needed",
+#: Comment competition. A busy thread means the author already has options.
+PREFILTER_COMMENT_SCORES: tuple[tuple[int, int], ...] = (
+    (5, 8),      # 0-5 comments: high visibility
+    (20, 4),     # 6-20: normal
+    (50, 0),     # 21-50: competitive
 )
+#: More than the last band above.
+PREFILTER_COMMENT_HEAVY_PENALTY = -6
+
+#: Negative language penalties.
+PREFILTER_PROMOTIONAL_PENALTY = 45
+PREFILTER_JOB_SEEKER_PENALTY = 40
+PREFILTER_RESOLVED_PENALTY = 35
+PREFILTER_FREE_ONLY_PENALTY = 25
+PREFILTER_NO_SERVICE_PENALTY = 20
 
 
 @dataclass
@@ -732,6 +914,44 @@ class PrefilterResult:
     score: int
     intent_score: int
     reasons: list[str] = field(default_factory=list)
+    intent_type: str = intent.INTENT_UNRELATED
+    intent_label: str = "Unrelated"
+    service_matched: bool = False
+    service_categories: list[str] = field(default_factory=list)
+    promotional: bool = False
+    breakdown: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def is_provider_request(self) -> bool:
+        return self.intent_type == intent.INTENT_PROVIDER_REQUEST
+
+    @property
+    def allows_outreach(self) -> bool:
+        return self.intent_type in intent.OUTREACH_INTENTS
+
+
+def _banded_score(
+    value: float,
+    bands: tuple[tuple[float, int], ...],
+    default: int,
+) -> int:
+    """Return the score for the first band whose ceiling ``value`` is within."""
+    for ceiling, points in bands:
+        if value <= ceiling:
+            return points
+    return default
+
+
+def _descending_banded_score(
+    value: int,
+    bands: tuple[tuple[int, int], ...],
+    default: int = 0,
+) -> int:
+    """Return the score for the first band whose floor ``value`` reaches."""
+    for floor, points in bands:
+        if value >= floor:
+            return points
+    return default
 
 
 def prefilter_post(
@@ -740,16 +960,33 @@ def prefilter_post(
     post_time: Any = None,
     now: datetime | None = None,
     max_post_age_days: int = DEFAULT_MAX_POST_AGE_DAYS,
+    comment_count: Any = None,
+    pass_score: int = DEFAULT_PREFILTER_PASS_SCORE,
+    allow_tool_research: bool = True,
 ) -> PrefilterResult:
     """
     Cheaply screen a raw post before spending an AI call on it.
 
-    Returns a score used both to gate the AI call and to prioritise the
-    queue. This is heuristic on purpose -- the authoritative decision is
-    still made by evaluate_lead() on the AI's structured signals.
+    A post passes only when **all** of these hold:
+
+    1. It is long enough to evaluate.
+    2. It is not older than ``max_post_age_days``.
+    3. It credibly matches a BruceTech service (``intent.match_services``).
+    4. It is not self-promotion, job seeking, or an already-resolved request.
+    5. Its intent is one BruceTech can serve -- provider request,
+       implementation request, business pain, or (when
+       ``allow_tool_research``) tool research.
+    6. Its Prefilter Score reaches ``pass_score``.
+
+    Requiring 3 *and* 5 is what stops solution hopping. "I need a virtual
+    assistant" is a real provider request with no BruceTech service behind it,
+    and "how do I get financing" is a real business problem that BruceTech
+    does not solve. Both fail here without costing a token.
+
+    The authoritative decision is still made by ``evaluate_lead`` on the
+    model's structured signals; this only decides who gets asked.
     """
     body = str(text or "").strip()
-    lowered = body.lower()
     reasons: list[str] = []
 
     if len(body) < MIN_PREFILTER_TEXT_LENGTH:
@@ -772,39 +1009,134 @@ def prefilter_post(
             ],
         )
 
-    intent_hits = [word for word in INTENT_KEYWORDS if word in lowered]
-    service_hits = [word for word in SERVICE_KEYWORDS if word in lowered]
-    negative_hits = [word for word in NEGATIVE_KEYWORDS if word in lowered]
+    intent_result = intent.classify_intent(body)
+    services = intent.match_services(body)
+    negatives = intent.detect_negative_signals(body)
+    commercial = intent.commercial_context_terms(body)
 
-    intent_score = min(len(intent_hits) * 12, 48)
-    service_score = min(len(service_hits) * 10, 40)
-    length_score = 12 if len(body) >= 180 else 6
-    penalty = min(len(negative_hits) * 20, 60)
+    intent_score = INTENT_BASE_SCORES.get(intent_result.intent_type, 0)
 
-    score = max(
-        0,
-        min(intent_score + service_score + length_score - penalty, 100),
-    )
+    if services.strong:
+        service_score = min(
+            PREFILTER_STRONG_SERVICE_SCORE
+            + (len(services.categories) - 1)
+            * PREFILTER_SERVICE_PER_EXTRA_CATEGORY,
+            PREFILTER_SERVICE_MAX_SCORE,
+        )
+    elif services.matched:
+        service_score = PREFILTER_WEAK_SERVICE_SCORE
+    else:
+        service_score = 0
 
-    if not intent_hits:
-        reasons.append("No request or buying-intent language detected.")
-
-    if not service_hits:
-        reasons.append("No BruceTech service keywords detected.")
-
-    if negative_hits:
-        reasons.append(
-            "Contains promotional, job-seeking, or resolved-request language: "
-            + ", ".join(sorted(negative_hits)[:5])
+    if age_days is None:
+        age_score = PREFILTER_AGE_UNKNOWN_SCORE
+    else:
+        age_score = _banded_score(
+            age_days, PREFILTER_AGE_SCORES, PREFILTER_AGE_WITHIN_MAX_SCORE
         )
 
-    # Require at least one intent signal AND one service signal, and a score
-    # that survived the negative keywords.
-    passed = bool(intent_hits) and bool(service_hits) and score >= 30
+    commercial_score = _descending_banded_score(
+        len(commercial), PREFILTER_COMMERCIAL_SCORES
+    )
+    length_score = _descending_banded_score(
+        len(body), PREFILTER_LENGTH_SCORES
+    )
+
+    try:
+        comments = int(comment_count) if comment_count is not None else 0
+    except (TypeError, ValueError):
+        comments = 0
+
+    comment_score = _banded_score(
+        max(comments, 0),
+        PREFILTER_COMMENT_SCORES,
+        PREFILTER_COMMENT_HEAVY_PENALTY,
+    )
+
+    penalty = 0
+    if negatives.promotional:
+        penalty += PREFILTER_PROMOTIONAL_PENALTY
+    if negatives.job_seeking:
+        penalty += PREFILTER_JOB_SEEKER_PENALTY
+    if negatives.resolved:
+        penalty += PREFILTER_RESOLVED_PENALTY
+    if negatives.free_only:
+        penalty += PREFILTER_FREE_ONLY_PENALTY
+    if not services.matched:
+        penalty += PREFILTER_NO_SERVICE_PENALTY
+
+    breakdown = {
+        "intent": intent_score,
+        "service_match": service_score,
+        "freshness": age_score,
+        "commercial_context": commercial_score,
+        "length": length_score,
+        "competition": comment_score,
+        "penalties": -penalty,
+    }
+
+    score = max(0, min(sum(breakdown.values()), 100))
+
+    # Reasons explain a rejection to a human reading Airtable, so they are
+    # only worth recording when something is actually wrong.
+    if not services.matched:
+        reasons.append("No credible BruceTech service match.")
+
+    if intent_result.intent_type == intent.INTENT_GENERAL_ADVICE:
+        reasons.append(
+            "General business advice question rather than a request "
+            "BruceTech can serve."
+        )
+    elif intent_result.intent_type == intent.INTENT_UNRELATED:
+        reasons.append("No request, problem, or buying intent detected.")
+    elif (
+        intent_result.intent_type == intent.INTENT_TOOL_RESEARCH
+        and not allow_tool_research
+    ):
+        reasons.append(
+            "Tool research rather than a request for an implementer."
+        )
+
+    if negatives.promotional:
+        reasons.append(
+            "Self-promotional language: "
+            + ", ".join(sorted(set(negatives.promotional))[:5])
+        )
+    if negatives.job_seeking:
+        reasons.append("Job-seeking language.")
+    if negatives.resolved:
+        reasons.append("Request appears already resolved.")
+    if negatives.free_only:
+        reasons.append("Asking for free work only.")
+
+    allowed_intents = set(intent.AI_ELIGIBLE_INTENTS)
+    if not allow_tool_research:
+        allowed_intents.discard(intent.INTENT_TOOL_RESEARCH)
+
+    passed = (
+        services.matched
+        and intent_result.intent_type in allowed_intents
+        and not negatives.promotional
+        and not negatives.job_seeking
+        and not negatives.resolved
+        and score >= pass_score
+    )
+
+    if not passed and not reasons:
+        reasons.append(
+            f"Prefilter score {score} is below the {pass_score}-point "
+            f"minimum."
+        )
 
     return PrefilterResult(
         passed=passed,
         score=score,
         intent_score=intent_score,
         reasons=reasons,
+        intent_type=intent_result.intent_type,
+        intent_label=intent_result.label,
+        service_matched=services.matched,
+        service_categories=list(services.categories),
+        promotional=bool(negatives.promotional),
+        breakdown=breakdown,
     )
