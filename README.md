@@ -3,52 +3,84 @@
 Scrapes public Facebook group posts via Apify, deduplicates and imports them
 into Airtable, then qualifies them for BruceTech outreach.
 
-The defining rule of this pipeline: **the AI does not decide who is a lead.**
-It extracts structured observations about a post. Python applies the scoring
-and qualification rules deterministically, so the same post always produces
-the same decision and every rule is unit-testable.
+Two rules define this pipeline.
+
+**The AI does not decide who is a lead.** It extracts structured observations
+about a post. Python applies the scoring and qualification rules
+deterministically, so the same post always produces the same decision and
+every rule is unit-testable.
+
+**No solution hopping.** A business owner having a problem is not the same
+thing as a BruceTech sales opportunity. The pipeline asks whether the author
+expressed a need that *directly* maps to something BruceTech provides — not
+whether BruceTech could theoretically offer an alternative. "I need a virtual
+assistant" is a real request for a provider BruceTech is not. It is rejected.
 
 ---
 
 ## Architecture
 
 ```
-Apify task run
+Apify task
       │
       ▼
-Deduplication ─── post ID · canonical URL · text fingerprint · author
+Resolve ONE exact run ───────────► Facebook Post Scraper Runs
+  run ID · dataset ID · cost              (upsert by Apify Run ID)
+      │                                            │
+      ▼                                            │
+That run's dataset — and no other                  │
+      │                                            │
+      ▼                                            │
+Deduplication ─ post ID · canonical URL · fingerprint · author
+      │                                            │
+      ▼                                            ▼
+Airtable import ─────────── Apify Run ID + Scraper Run link
       │
       ▼
-Airtable import (new posts only)
-      │
+Deterministic intent classification (Python)
+      │   Provider · Implementation · Business Pain
+      │   Tool Research · General Advice · Unrelated
       ▼
-Deterministic prefilter ─── intent + service keywords, length, post age
-      │                     (obvious rejects never reach the AI)
+Word-boundary service matching (Python)
+      │   strong term · weak term + context · no match
       ▼
-Prioritisation ─── Send to AI › this run › newest › prefilter › intent
-      │
+Prefilter Score ─── gates the AI call, orders the queue
+      │             (general advice and unrelated stop here, for free)
       ▼
-AI signal extraction ─── 19 structured signals, no score, no verdict
+Prioritised AI queue ─── Send to AI › this run › provider ›
+      │                  implementation › score › fresh › quiet
+      ▼
+AI signal extraction ─── 24 structured signals, no score, no verdict
       │
       ▼
 Deterministic qualification (Python)
-      │  score → tier → hard rejections → Qualified → outreach eligibility
+      │  score → tier → hard rejections → Qualified → Outreach Ready
       ▼
-Airtable write-back
+Airtable write-back ─── + Qualification Version
+      │
+      ▼
+Facebook Group Performance ─── scraped → AI candidates → qualified →
+                               outreach → contacted → replied →
+                               meeting → proposal → won
 ```
 
 ### Files
 
 | File | Purpose |
 |---|---|
-| `run_pipeline.py` | Orchestration, Apify, Airtable, OpenAI, prioritisation |
+| `run_pipeline.py` | Orchestration, Airtable, OpenAI, queue, write safety |
 | `qualification.py` | Scoring, tiers, hard rejections, prefilter. Pure logic |
+| `intent.py` | Intent classification and service matching. Pure logic |
+| `apify_runs.py` | Exact Apify run resolution and dataset retrieval |
+| `scraper_runs.py` | Idempotent scraper-run logging in Airtable |
+| `group_performance.py` | Per-group operational metrics |
 | `normalization.py` | URL canonicalisation, fingerprinting, deduplication |
 | `tests/` | Regression suite (no credentials required) |
 
-`qualification.py` and `normalization.py` deliberately have no environment,
-network, or third-party dependencies, so they can be imported and tested in
-isolation.
+`qualification.py`, `intent.py`, and `normalization.py` deliberately have no
+environment, network, or third-party dependencies. `apify_runs.py`,
+`scraper_runs.py`, and `group_performance.py` take injected callables for every
+external call, so all six are testable in isolation.
 
 ---
 
@@ -118,21 +150,137 @@ that trips any of these is Rejected.
 | `NO_SERVICE_MATCH` | No BruceTech service match |
 | `INAPPROPRIATE_OUTREACH` | Outreach would be unwelcome |
 | `STALE_POST` | Older than `MAX_POST_AGE_DAYS` |
+| `NO_BUYING_INTENT` | Intent is General Advice or Unrelated |
+| `FUNDING_OR_FINANCE_REQUEST` | Financing / credit question with no service need |
+| `HIRING_UNRELATED` | Staffing question unrelated to BruceTech |
+| `SUPPRESSED_AUTHOR` | Author is in `SUPPRESSED_AUTHORS` |
+| `DISALLOWED_GROUP` | Group is in `DISALLOWED_GROUPS` |
+| `HUMAN_REJECTED` | A human set `Human Decision = Reject` |
 
-`STALE_POST` is computed in Python from the post timestamp and is never
-trusted from the model.
+The last seven are decided in Python and are **never offered to the model** —
+they are absent from the JSON schema enum. `STALE_POST` in particular is
+computed from the post timestamp and never trusted from the model.
 
-### Outreach eligibility
+### Qualified vs Outreach Ready
 
-A lead is outreach-ready only when **all** of the following hold:
+These answer different questions and are not interchangeable.
+
+**Qualified** means *strong commercial and service fit*. It is a property of
+the opportunity.
+
+**Outreach Ready** means *it is appropriate to contact this person now*. It is
+strictly narrower, and requires **all** of:
 
 1. Tier is Hot or Qualified
-2. The AI wrote a specific, personalised DM
-3. `recommended_channel` is not `do_not_contact`
+2. No hard rejection applies
+3. The AI wrote a specific, personalised DM
+4. `recommended_channel` is not `do_not_contact`
+5. `classification_confidence` ≥ `MIN_OUTREACH_CONFIDENCE` (default `0.55`)
+6. Intent is Provider Request, Implementation Request, or Business Pain
+7. For Business Pain only: score ≥ `BUSINESS_PAIN_OUTREACH_MIN_SCORE`
+   (default `70`)
+
+Rule 6 is what stops a research question becoming a sales DM. Rule 7 exists
+because business pain is *inferred* — the author described a problem but never
+asked for a provider — so the bar for a cold message is higher than for
+someone who explicitly asked to hire.
+
+| Intent | Can be Qualified | Can be Outreach Ready |
+|---|---|---|
+| Provider Request | ✅ | ✅ |
+| Implementation Request | ✅ | ✅ |
+| Business Pain | ✅ | ✅ at score ≥ 70 |
+| Tool Research | ✅ | ❌ — Manual Review |
+| General Advice | ❌ | ❌ — hard rejected |
+| Unrelated | ❌ | ❌ — hard rejected |
 
 There is **no fallback DM**. If the AI cannot write a specific message, the
-record stays qualified but is not outreach-ready. A `do_not_contact`
-recommendation is respected and never upgraded to `direct_message`.
+record stays qualified but is not outreach-ready, and `Suggested DM` is blank.
+A `do_not_contact` recommendation is respected and never upgraded.
+
+---
+
+## Intent classification
+
+Every post is classified in Python before any AI call. Intent and service
+match are independent axes, and the prefilter requires **both**.
+
+| Intent | Examples | Reaches AI | Outreach |
+|---|---|---|---|
+| **Provider Request** | "looking for someone", "can anyone recommend a developer", "looking to hire" | ✅ | ✅ |
+| **Implementation Request** | "need help setting this up", "need our website rebuilt", "need payments integrated" | ✅ | ✅ |
+| **Business Pain** | "missing calls", "still using pen and paper", "answering texts all evening" | ✅ | ✅ at score ≥ 70 |
+| **Tool Research** | "what CRM do you use", "has anyone tried X", "which booking platform" | ✅ | ❌ |
+| **General Advice** | "how do I get financing", "should I hire an employee", "what supplier" | ❌ | ❌ |
+| **Unrelated** | no credible BruceTech connection | ❌ | ❌ |
+
+Classification runs in that order and the first match wins. Provider outranks
+implementation, so "looking for someone to set up our CRM" is a hiring request
+that happens to name a product. Tool research outranks business pain, so
+"what CRM does everyone use, I keep missing calls?" is research.
+
+### Service matching
+
+Terms are matched with **word-boundary-anchored regex**, never substrings.
+
+```python
+"api" in "working capital"                  # True  — the old bug
+intent.compile_term("api").search("...")    # None  — the fix
+```
+
+Two tiers:
+
+- **Strong terms** are unambiguous — `wordpress`, `crm`, `api`, `microsoft 365`,
+  `gohighlevel`, `pen and paper`. One hit is a service match.
+- **Weak terms** are real BruceTech vocabulary that also appears in ordinary
+  business talk — `network`, `security`, `payment`, `software`, `system`. A
+  weak term matches only with corroboration: **two distinct weak categories**,
+  or **one weak term plus technical context** ("set up", "broken", "migrate").
+
+So "our office network keeps dropping" is a managed IT lead, while "trying to
+grow my network" and "is a security deposit normal?" are not.
+
+---
+
+## Prefilter Score
+
+A deterministic 0–100 **prioritisation** number computed from the raw post
+before the model sees anything. It is not the Lead Score. Its only jobs are to
+gate the AI call and order the queue.
+
+| Component | Points |
+|---|---|
+| Intent — Provider Request | 35 |
+| Intent — Implementation Request | 32 |
+| Intent — Business Pain | 22 |
+| Intent — Tool Research | 10 |
+| Intent — General Advice / Unrelated | 0 |
+| Service — strong term | 18, +4 per extra category, capped at 26 |
+| Service — corroborated weak term | 8 |
+| Freshness — under 24 h | 18 |
+| Freshness — 1–3 days | 12 |
+| Freshness — 3–5 days | 6 |
+| Freshness — within max age but older | 2 |
+| Freshness — no usable timestamp | 4 |
+| Commercial context — 2+ phrases | 10 |
+| Commercial context — 1 phrase | 6 |
+| Length — ≥ 400 / ≥ 180 / ≥ 80 chars | 8 / 6 / 3 |
+| Competition — 0–5 comments | +8 |
+| Competition — 6–20 comments | +4 |
+| Competition — 21–50 comments | 0 |
+| Competition — 51+ comments | −6 |
+| Penalty — promotional | −45 |
+| Penalty — job seeking | −40 |
+| Penalty — already resolved | −35 |
+| Penalty — free work only | −25 |
+| Penalty — no service match | −20 |
+
+Clamped to 0–100. A post passes the prefilter only when it has a service
+match, an AI-eligible intent, no promotional / job-seeking / resolved
+language, and a score of at least `PREFILTER_PASS_SCORE` (default `30`).
+
+Comment volume is a **prioritisation** signal, not a rejection. A strong lead
+in a busy thread still reaches the model; it just sorts lower.
 
 ---
 
@@ -148,6 +296,32 @@ Each run fetches candidates in two phases:
 Phase 1 exists so a curated selection is never lost behind an arbitrary page
 of the backlog. Phase 2 is sorted because truncating an unsorted Airtable
 query returns records in table order, not by relevance.
+
+With `RETRY_AI_ERRORS` enabled (the default), records whose last AI attempt
+failed are re-queued too — see [AI errors](#ai-errors-and-recovery).
+
+### Queue order
+
+1. Records a human flagged `Send to AI`
+2. Records imported during this run
+3. Provider requests
+4. Implementation requests
+5. Highest Prefilter Score
+6. Newest post time
+7. Least comment competition
+
+Intent outranks recency deliberately. A three-day-old "looking for someone to
+rebuild our site" is worth more than a fresh vague grumble, and the previous
+recency-first ordering let a stale backlog consume the whole `AI_BATCH_LIMIT`
+before the day's real leads were reached.
+
+### Records the queue skips entirely
+
+- **Already in the sales funnel.** Any record whose `Outreach Status` is
+  anything other than blank or `Not Contacted` is skipped, so a
+  classification run can never overwrite a recorded sales outcome.
+- **Retry budget spent.** A record that has failed `AI_ERROR_MAX_ATTEMPTS`
+  times is retired from the queue.
 
 ### `Send to AI` overrides the prefilter
 
@@ -177,65 +351,235 @@ Secrets — set as GitHub Actions secrets, never committed:
 | `APIFY_TASK_ID` | Apify task to read or run |
 | `AIRTABLE_TOKEN` | Airtable personal access token |
 | `AIRTABLE_BASE_ID` | Airtable base ID |
-| `AIRTABLE_TABLE_NAME` | Airtable table name |
+| `AIRTABLE_TABLE_NAME` | Raw Signals table name |
 | `OPENAI_API_KEY` | OpenAI API key |
 
-Configuration — safe to set in the workflow:
+Qualification:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `QUALIFICATION_THRESHOLD` | `65` | Minimum score to qualify |
 | `MANUAL_REVIEW_THRESHOLD` | `55` | Minimum score for manual review |
 | `HOT_LEAD_THRESHOLD` | `80` | Minimum score for the Hot tier |
-| `MAX_POST_AGE_DAYS` | `45` | Posts older than this are rejected |
+| `MAX_POST_AGE_DAYS` | `5` | Posts older than this are rejected |
+| `QUALIFICATION_VERSION` | `facebook-v2` | Stamped on every evaluated record |
+
+Prefilter and outreach:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENFORCE_PYTHON_PREFILTER` | `true` | Skip the AI for obvious rejects |
+| `PREFILTER_PASS_SCORE` | `30` | Minimum Prefilter Score to reach the AI |
+| `ALLOW_TOOL_RESEARCH_TO_AI` | `true` | Send research posts to the AI (Manual Review only) |
+| `MIN_OUTREACH_CONFIDENCE` | `0.55` | Confidence floor for automatic outreach |
+| `BUSINESS_PAIN_OUTREACH_MIN_SCORE` | `70` | Score bar for business-pain outreach |
+| `SUPPRESSED_AUTHORS` | *(empty)* | Comma-separated author names to never contact |
+| `DISALLOWED_GROUPS` | *(empty)* | Comma-separated group titles to exclude |
+| `REQUIRE_AIRTABLE_PREQUALIFICATION` | `false` | Also require the Airtable formula |
+
+Apify run attribution:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RUN_APIFY_TASK` | `false` | Start a fresh task run and await that exact run |
+| `APIFY_RUN_ID` | *(empty)* | Import from one exact run. Overrides `RUN_APIFY_TASK` |
+| `APIFY_RUN_TIMEOUT_SECONDS` | `900` | Max wait for a run to finish |
+| `APIFY_POLL_INTERVAL_SECONDS` | `15` | Poll interval while waiting |
+| `LOG_SCRAPER_RUNS` | `true` | Upsert the Facebook Post Scraper Runs record |
+| `AIRTABLE_SCRAPER_RUNS_TABLE` | `Facebook Post Scraper Runs` | Run log table name |
+
+`APIFY_START_NEW_RUN` and `APIFY_RUN_POLL_SECONDS` remain accepted as aliases
+for `RUN_APIFY_TASK` and `APIFY_POLL_INTERVAL_SECONDS`.
+
+AI processing and recovery:
+
+| Variable | Default | Purpose |
+|---|---|---|
 | `OPENAI_MODEL` | `gpt-5-mini` | Model used for signal extraction |
 | `OPENAI_MAX_OUTPUT_TOKENS` | `2500` | Output token ceiling |
-| `OPENAI_MAX_ATTEMPTS` | `3` | Retries per post |
+| `OPENAI_MAX_ATTEMPTS` | `3` | Retries per post, within one run |
 | `OPENAI_RETRY_DELAY_SECONDS` | `5` | Base retry delay |
 | `AI_BATCH_LIMIT` | `20` | Max AI calls per run |
 | `MAX_POST_CHARS` | `8000` | Post text truncation |
+| `RETRY_AI_ERRORS` | `true` | Re-queue records whose last attempt failed |
+| `AI_ERROR_MAX_ATTEMPTS` | `3` | Total attempts per record, across runs |
+
+Reporting and safety:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `UPDATE_GROUP_PERFORMANCE` | `true` | Refresh group metrics after each run |
+| `AIRTABLE_GROUP_PERFORMANCE_TABLE` | `Facebook Group Performance` | Metrics table name |
 | `AIRTABLE_FORMULA_WAIT_SECONDS` | `15` | Pause after import |
-| `DRY_RUN` | `false` | Read and score, but make no Airtable writes |
-| `ENFORCE_PYTHON_PREFILTER` | `true` | Skip the AI for obvious rejects |
-| `REQUIRE_AIRTABLE_PREQUALIFICATION` | `false` | Also require the Airtable formula |
-| `APIFY_START_NEW_RUN` | `false` | Start a fresh Apify run and await it |
-| `APIFY_RUN_TIMEOUT_SECONDS` | `900` | Max wait for a fresh run |
-| `APIFY_RUN_POLL_SECONDS` | `15` | Poll interval while waiting |
+| `DRY_RUN` | `false` | Read and score, but write nothing and start no paid run |
 
 All are read lazily. Importing `run_pipeline` requires no credentials, which
 is what lets the test suite run in CI without secrets.
 
 ---
 
+## Apify run attribution
+
+Every imported post is tied to exactly one Apify run.
+
+The pipeline resolves a **run object** before touching any dataset, then reads
+that run's own `defaultDatasetId`. It never uses the
+`/runs/last/dataset/items` shortcut, which returns items with no run identity
+attached — the source of the old attribution bug, where a concurrent manual
+Apify run could silently substitute its posts.
+
+Three modes:
+
+| Mode | Trigger | Behaviour |
+|---|---|---|
+| **Pinned** | `APIFY_RUN_ID` set | Use exactly that run. Waits if it is still going; fails if it did not succeed |
+| **Start** | `RUN_APIFY_TASK=true` | Start the task, then poll *that run's ID* to a terminal state |
+| **Resolve** | default | Fetch the task's last successful run **as a run object** |
+
+The resolved run is upserted into **Facebook Post Scraper Runs**, keyed on
+`Apify Run ID`, so re-running against the same scrape never creates a
+duplicate log. Every Raw Signal imported from it is written with `Apify Run ID`
+and a `Scraper Run` linked record.
+
+Cost and Run Input are written **only when Apify actually supplies them**.
+`usageTotalUsd` is returned only to the token that owns the run, and some
+actors store no `INPUT` record; in either case the column is left untouched
+rather than filled with a guess.
+
+---
+
+## AI errors and recovery
+
+A record that fails is not lost forever, and does not loop forever either.
+
+- **Within one run**, `OPENAI_MAX_ATTEMPTS` retries with a growing delay.
+- **Across runs**, a record marked `Error` is re-queued while
+  `RETRY_AI_ERRORS` is true, up to `AI_ERROR_MAX_ATTEMPTS` total attempts.
+- **Transient failures** — timeouts, rate limits, 5xx, connection resets —
+  consume one attempt.
+- **Permanent failures** — a malformed record, an impossible schema state —
+  consume the whole budget at once so they never come back.
+
+The attempt count is stored as JSON in `AI Output`, and only on records that
+actually failed. Real model output is never replaced by exception text, and a
+failure never blanks `Lead Score`, `Qualified`, or `Suggested DM`. The live
+schema has no dedicated attempt field; see `docs/PIPELINE_AUDIT.md` for the
+limitation this creates.
+
+---
+
+## Human decisions and sales outcomes
+
+The pipeline **reads** these fields and never writes them:
+
+| Field | Effect on the pipeline |
+|---|---|
+| `Human Decision` | `Reject` adds the `HUMAN_REJECTED` disqualifier and blocks outreach |
+| `Outreach Status` | Anything past `Not Contacted` makes the record skip classification entirely |
+| `Last Contacted` | Read only |
+| `Contacted` (legacy checkbox) | Read only; counted as contacted when `Outreach Status` is empty |
+
+`run_pipeline.strip_read_only_fields` is applied to every Airtable payload
+before it is sent, so a formula field or a human-owned field cannot be written
+even by a coding mistake.
+
+---
+
+## Facebook Group Performance
+
+Refreshed after each run from Raw Signals, which are the source of truth for
+operational counts.
+
+**Never written:** `Tier`, `Status`, `Revenue`, `Notes`. Those are human
+strategy and sales data. A group's Tier influences scraper planning only — it
+can never make a bad post qualify, and a new group can never suppress a strong
+provider request. Post-level evidence is always primary.
+
+| Metric | Definition |
+|---|---|
+| Posts Scraped | Unique Raw Signals for the group |
+| AI Candidates | Records with non-blank `Evidence` (only written from model output) |
+| System Qualified | `Qualified = true` |
+| Provider Requests | Intent recomputed in Python from the post text |
+| Outreach Ready | `Outreach Ready = true` |
+| Contacted | `Outreach Status` past `Not Contacted`, or legacy `Contacted` when the status is blank |
+| Replies | Replied, Meeting Booked, Proposal Sent, Won, Lost |
+| Meetings | Meeting Booked, Proposal Sent, Won |
+| Proposals | Proposal Sent, Won |
+| Won | Won |
+| Last Run | Latest `Run Date` across linked scraper runs |
+
+`Lost` counts as contacted and replied but **not** as a meeting or proposal:
+a deal can be lost at any stage, so inferring a meeting from it would inflate
+the funnel.
+
+Records with no `Scraper Run` link — everything imported before run
+attribution existed — simply contribute nothing to `Last Run`. Historical
+links are never fabricated. Groups with activity but no performance record are
+reported in the log, not auto-created.
+
+---
+
 ## Airtable fields
 
-Existing fields, unchanged:
+Base: **Bruce Tech**. Tables: `Facebook Raw Signals`,
+`Facebook Post Scraper Runs`, `Facebook Group Performance`.
+
+### Facebook Raw Signals
+
+Source fields, written on import:
 
 `Url` · `Facebook url` · `Time` · `User ID` · `User name` · `Text` ·
 `Group title` · `Input Url` · `Likes count` · `Comments count` ·
-`Shares count` · `Prequalification` · `AI Status` · `Qualified` ·
-`Lead Score` · `Service Match` · `Lead Summary` · `Rejection Reason` ·
-`Suggested DM` · `Recommended channel` · `Evidence`
+`Shares count` · `Apify Run ID` · `Scraper Run`
 
-**New fields — create these before deploying:**
+Qualification fields, written after processing:
 
-| Field | Type | Purpose |
-|---|---|---|
-| `Lead Tier` | Single line text | Hot / Qualified / Manual Review / Rejected |
-| `Manual Review` | Checkbox | Needs a human decision |
-| `Outreach Ready` | Checkbox | Qualified **and** has a personalised DM |
-| `Disqualifiers` | Long text | Comma-separated hard rejection codes |
-| `Prefilter Score` | Number | Deterministic pre-AI score |
+`AI Status` · `Qualified` · `Lead Score` · `Service Match` · `Lead Summary` ·
+`Rejection Reason` · `Suggested DM` · `AI Output` · `Recommended channel` ·
+`Evidence` · `Lead Tier` · `Manual Review` · `Outreach Ready` ·
+`Disqualifiers` · `Prefilter Score` · `Qualification Version`
 
-If these fields do not exist, the pipeline detects the `UNKNOWN_FIELD_NAME`
-error on its first write, prints a warning, and continues writing the core
-fields only. Tiering and manual-review views will not work until they are
-created.
+**Read only — never written by the pipeline:**
 
-> **Update your Airtable views.** An "Outreach Ready" view should now filter
-> on `Outreach Ready = checked` rather than on `Qualified` alone, because
-> qualified leads without a personalised DM are intentionally not
-> outreach-ready.
+| Field | Why |
+|---|---|
+| `Request Signal` · `Service Signal` · `Promotion Signal` · `Prequalification` | Airtable formulas |
+| `Provider Intent Signal` · `Research Intent Signal` · `Intent Type` | Airtable formulas |
+| `Human Decision` · `Outreach Status` · `Last Contacted` · `Contacted` | Human-owned |
+
+Because `Intent Type` is a formula, the Python intent classification is
+recorded inside the `AI Output` JSON blob rather than in its own column.
+
+### Facebook Post Scraper Runs
+
+`Run Name` · `Run Input` · `Results` · `Cost` · `Duration` · `Run Date` ·
+`Apify Run ID` · `Dataset URL`
+
+`Apify Run ID` is the idempotency key — the same Apify run is never logged
+twice.
+
+### Facebook Group Performance
+
+`Group Name` · `Group URL` · `Posts Scraped` · `AI Candidates` ·
+`System Qualified` · `Provider Requests` · `Outreach Ready` · `Contacted` ·
+`Replies` · `Meetings` · `Proposals` · `Won` · `Last Run`
+
+`Tier`, `Status`, `Revenue`, and `Notes` are human-owned and never written.
+
+### Schema validation
+
+Before any production run the pipeline reads the Airtable metadata API and
+checks that every required Raw Signals field exists. A missing field **fails
+the run with a message naming it**, before any record is modified.
+
+If the token lacks the `schema.bases:read` scope the check is skipped with a
+note, and the write path falls back to writing only the core fields with a
+warning. The pipeline never creates, renames, or deletes an Airtable field.
+
+> **Outreach Ready views.** Filter on `Outreach Ready = checked`, not on
+> `Qualified`. Qualified leads without a personalised message, and research
+> posts, are intentionally not outreach-ready.
 
 ---
 
@@ -257,10 +601,16 @@ python run_pipeline.py
 ```
 
 To start a fresh Apify run and use that exact run's dataset instead of the
-last completed one:
+last successful one:
 
 ```bash
-APIFY_START_NEW_RUN=true python run_pipeline.py
+RUN_APIFY_TASK=true python run_pipeline.py
+```
+
+To re-import one specific run — useful for reproducing a bad import:
+
+```bash
+APIFY_RUN_ID=<apify run id> python run_pipeline.py
 ```
 
 Never commit real credentials. Use environment variables or a local `.env`
@@ -271,8 +621,9 @@ file that is git-ignored.
 ## Testing against your real Airtable data
 
 `DRY_RUN=true` reads Apify and Airtable and calls the AI exactly as normal,
-but makes **no Airtable writes**. It prints the decision it would have
-written for each record:
+but makes **no Airtable writes** and **starts no paid Apify run** — with
+`RUN_APIFY_TASK=true` it reads the last successful run instead. It prints the
+decision it would have written for each record:
 
 ```
 [DRY RUN] Would update recABC123: tier=Qualified score=71 qualified=True outreach=True dm=yes
@@ -330,17 +681,32 @@ python -m compileall -q .    # compilation check
 python -m pytest -q          # full suite
 ```
 
-The suite needs no API keys, no network, and no Airtable base. It covers:
+The suite needs no API keys, no network, and no Airtable base. No test starts
+a paid Apify run, writes to Airtable, or makes an OpenAI request — every
+external call is mocked.
+
+It covers:
 
 - the 65-point threshold, including the 64 / 65 boundary
-- every hard rejection condition
-- hard rejections overriding a perfect score
+- every hard rejection condition, and hard rejections overriding a perfect score
 - tier boundaries and the Qualified-only-for-Hot/Qualified rule
-- manual-review records having no DM and `Qualified = false`
-- the absence of any fallback DM
-- `do_not_contact` never being upgraded
-- URL normalisation across host, scheme, tracking, and slash variants
-- duplicate detection by post ID, canonical URL, and text fingerprint
+- the absence of any fallback DM, and `do_not_contact` never being upgraded
+- **`"working capital"` never matching `api`**, and `api` still matching
+  "integrating an API"
+- short tokens (`pos`, `seo`, `ai`) never matching inside longer words
+- intent classification across all six types, including the five production
+  fixtures in `tests/fixtures.py`
+- service match required before AI eligibility; promotional and job-seeking
+  posts never reaching the AI
+- exact Apify run attribution, including that a concurrent run cannot
+  substitute its dataset
+- scraper-run upsert by `Apify Run ID`, and no duplicate log for the same run
+- every imported Raw Signal receiving `Apify Run ID` and a `Scraper Run` link
+- group performance counts, and `Tier` / `Status` / `Revenue` / `Notes` never
+  appearing in a payload
+- `Human Decision` and `Outreach Status` never being written
+- bounded AI error retries, transient vs permanent
+- URL normalisation and duplicate detection
 - queue prioritisation ordering
 
 ---
@@ -351,22 +717,38 @@ The pipeline runs from GitHub Actions
 (`.github/workflows/facebook-leads.yml`).
 
 1. Add the six secrets under **Settings → Secrets and variables → Actions**.
-2. Create the five new Airtable fields listed above.
-3. Merge to `main`.
+2. Merge to `main`.
 
-> **The daily schedule is currently paused.** The `schedule:` block in
-> `.github/workflows/facebook-leads.yml` is commented out while the new
-> qualification rules are validated against the production base. Uncomment
-> the three lines to restore the 06:30 America/Toronto run.
+> **The daily schedule is currently paused.** The `schedule:` block is
+> commented out. Uncomment the three lines to restore the 06:30
+> America/Toronto run.
 
-Until then the pipeline runs only via **Run workflow**, which offers three
-inputs: **Dry run** (score without writing), **Start new Apify run**, and
-**AI batch limit**.
+Until then the pipeline runs only via **Run workflow**, which offers four
+inputs: **Dry run**, **Start new Apify run**, **AI batch limit**, and
+**Apify run ID**.
 
 Two jobs run in sequence: `test` (compile + pytest) then `run-pipeline`. The
 pipeline only runs if the tests pass.
 
 A `concurrency` group named `facebook-leads-pipeline` guarantees two runs
 never overlap. `cancel-in-progress` is deliberately `false` so an in-flight
-run is allowed to finish its Airtable writes rather than being killed
-mid-batch.
+run finishes its Airtable writes rather than being killed mid-batch.
+
+---
+
+## Expect fewer leads
+
+This release rejects substantially more than its predecessor, on purpose. The
+goal is high-intent leads per AI call, not AI calls per scraper run.
+
+Five changes each reduce volume:
+
+1. General advice and unrelated posts are hard-rejected on intent
+2. Service matching is word-boundary strict, so the old false positives are gone
+3. `MAX_POST_AGE_DAYS` dropped from 45 to 5
+4. Outreach needs `classification_confidence` ≥ 0.55
+5. Business-pain leads need a score of 70, not 65, before automatic outreach
+
+Records carrying `Qualification Version = facebook-v2` are the ones scored
+under these rules. Historical records keep their legacy scores and are never
+mass-reprocessed, so the two populations stay comparable.

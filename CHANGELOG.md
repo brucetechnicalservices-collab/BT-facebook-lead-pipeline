@@ -2,6 +2,210 @@
 
 All notable changes to the BruceTech Facebook lead pipeline.
 
+## [Unreleased] — Intent classification, run attribution, and precision
+
+Branch: `agent/facebook-pipeline-v2-intent-attribution`
+Qualification version: `facebook-v2`
+
+This release does two things: it stops the pipeline treating "a business owner
+has a problem" as "a BruceTech sales opportunity", and it makes every imported
+post traceable to the exact Apify run that produced it.
+
+The previous release's deterministic qualification work is preserved intact —
+the 65-point threshold, the scoring weights, the tiers, the hard rejections,
+and all 125 of its tests are unchanged.
+
+### Fixed — `"working capital"` registered as an API integration lead
+
+The prefilter matched service keywords by substring:
+
+```python
+>>> "api" in "working capital"
+True
+```
+
+An excavation-financing post therefore recorded a BruceTech service match and
+was sent to the model. The same flaw affected `pos`, `seo`, `ai`, and every
+other short token in the list.
+
+Every service term is now compiled to a word-boundary-anchored regex in
+`intent.compile_term`, so `api` matches "integrating an API" and never
+"capital". Plural matching is preserved via an optional trailing `s`.
+
+The live Airtable `Service Signal` formula was fixed the same way. Python does
+not rely on that fix: formula values calculate asynchronously and cannot be
+unit-tested, so both layers enforce the rule independently.
+
+### Fixed — the pipeline could import another Apify run's posts
+
+`/actor-tasks/{id}/runs/last/dataset/items` returns items with no run identity
+attached. When a manual Apify run finished between the scheduled scrape and
+this read, the pipeline imported that run's posts while believing it had read
+its own — and recorded no run ID either way.
+
+`apify_runs.resolve_run` now resolves exactly one **run object** before any
+dataset is touched, and reads that run's own `defaultDatasetId`. Three modes:
+pinned (`APIFY_RUN_ID`), start-and-poll (`RUN_APIFY_TASK=true`), or resolve the
+last successful run as an object. The `runs/last/dataset/items` shortcut is
+gone from the codebase and a test asserts it.
+
+The Apify token also moved from a `?token=` query parameter to an
+`Authorization` header, so it can no longer appear in a logged URL or an
+exception message.
+
+### Added — deterministic intent classification (`intent.py`)
+
+Six types: `PROVIDER_REQUEST`, `IMPLEMENTATION_REQUEST`, `BUSINESS_PAIN`,
+`TOOL_RESEARCH`, `GENERAL_ADVICE`, `UNRELATED`.
+
+Intent and service match are independent axes and the prefilter requires
+**both**, which is what blocks solution hopping. "Looking for a reliable
+virtual assistant" is a genuine provider request that matches no BruceTech
+service, so it is rejected without an AI call.
+
+General advice and unrelated posts never reach the model. Tool research may
+reach Manual Review but can never produce automatic outreach.
+
+### Added — two-tier service matching
+
+- **Strong terms** (`wordpress`, `crm`, `api`, `gohighlevel`, `pen and paper`)
+  establish a match on their own.
+- **Weak terms** (`network`, `security`, `payment`, `software`, `system`) need
+  corroboration: two distinct weak categories, or one weak term plus technical
+  context.
+
+"Our office network keeps dropping" is a managed IT lead. "Trying to grow my
+network" and "is a security deposit normal?" are not.
+
+### Added — exact run attribution in Airtable
+
+- One record per Apify run in **Facebook Post Scraper Runs**, upserted on
+  `Apify Run ID` so the same run is never logged twice.
+- Every imported Raw Signal is written with `Apify Run ID` and a `Scraper Run`
+  linked record.
+- `Cost`, `Run Input`, `Duration`, and `Dataset URL` are written **only when
+  Apify supplies them**. A missing value is omitted from the payload rather
+  than written as zero, so a blank cell means "not reported" and any existing
+  manual value survives.
+
+### Added — Facebook Group Performance aggregation
+
+Operational counts recomputed from Raw Signals after each run: Posts Scraped,
+AI Candidates, System Qualified, Provider Requests, Outreach Ready, Contacted,
+Replies, Meetings, Proposals, Won, Last Run.
+
+`Tier`, `Status`, `Revenue`, and `Notes` are human-owned and never written —
+enforced by an assertion in `GroupMetrics.to_fields`, not just by convention.
+
+The legacy `Contacted` checkbox is preserved and counted only when
+`Outreach Status` is empty, so migrated records are not double-counted.
+
+`Lost` counts as contacted and replied but not as a meeting or proposal: a
+deal can be lost at any stage.
+
+### Added — Outreach Ready is now strictly narrower than Qualified
+
+Qualified means strong commercial fit. Outreach Ready additionally requires a
+personalised DM, a contactable channel, `classification_confidence` ≥
+`MIN_OUTREACH_CONFIDENCE` (0.55), an outreach-eligible intent, and — for
+business pain specifically — a score of at least
+`BUSINESS_PAIN_OUTREACH_MIN_SCORE` (70).
+
+Business pain is inferred rather than requested, so it carries a higher bar
+than someone who explicitly asked to hire.
+
+### Added — six Python-only hard rejection codes
+
+`NO_BUYING_INTENT`, `FUNDING_OR_FINANCE_REQUEST`, `HIRING_UNRELATED`,
+`SUPPRESSED_AUTHOR`, `DISALLOWED_GROUP`, `HUMAN_REJECTED`.
+
+These are decided in Python and deliberately excluded from the model's JSON
+schema enum. `STALE_POST` was moved to the same category — it was previously
+offered to the model despite being computed in Python.
+
+### Added — bounded AI error recovery
+
+A transient failure (timeout, rate limit, 5xx, connection reset) consumes one
+attempt and the record is re-queued on a later run. A permanent failure
+consumes the whole budget at once. After `AI_ERROR_MAX_ATTEMPTS` the record is
+retired from the queue.
+
+The attempt count lives in `AI Output` as JSON, and only on records that
+actually failed. A failure never blanks `Lead Score`, `Qualified`, or
+`Suggested DM`.
+
+### Added — `Qualification Version`
+
+Every record this release evaluates is stamped `facebook-v2`. Historical
+records are never mass-reprocessed and keep their legacy scores, so the two
+populations stay comparable.
+
+### Added — Airtable write safety
+
+- `strip_read_only_fields` is applied to every payload before it is sent, so
+  formula fields and human-owned fields cannot be written even by mistake.
+- `Human Decision` and `Outreach Status` are read and respected, never
+  written. A record past `Not Contacted` skips classification entirely.
+- A metadata-API preflight fails the run with the missing field names before
+  any record is modified. It is skipped with a note when the token lacks the
+  `schema.bases:read` scope. No Airtable field is ever created, renamed, or
+  deleted.
+
+### Added — `AI Output` is now populated
+
+Previously declared in the schema but never written. It now holds the model's
+raw signals plus the Python assessment — intent type, prefilter score and
+breakdown, score breakdown. The deterministic intent lives here because
+Airtable's `Intent Type` column is a formula and cannot be written to.
+
+### Changed — queue ordering favours intent over recency
+
+New order: human-flagged → imported this run → provider request →
+implementation request → Prefilter Score → newest → least comment competition.
+
+Recency previously outranked everything below it, which let a stale backlog of
+weak posts consume the whole `AI_BATCH_LIMIT` before the day's real leads were
+reached.
+
+### Changed — `MAX_POST_AGE_DAYS` default 45 → 5
+
+The scraper works a roughly 3-day window, and a Facebook request older than a
+work week has usually been answered. Override via the workflow env when
+deliberately working a backlog.
+
+### Changed — Prefilter Score is documented and intent-driven
+
+A 0–100 prioritisation number with every component published in README.md:
+intent base, service match, freshness band, commercial context, length,
+comment competition, and named penalties. It gates the AI call and orders the
+queue; it is not the Lead Score.
+
+### Changed — anti-solution-hopping instructions to the model
+
+The system prompt now names the failure explicitly, with worked examples for
+the virtual-assistant, financing, CRM-research, and GoHighLevel cases, and
+forbids inventing business details, urgency, budget, location, or service
+requirements.
+
+### Tests
+
+125 → **308 passing**. New files: `tests/test_intent.py` (65),
+`tests/test_attribution.py` (24), `tests/test_group_performance.py` (30),
+`tests/test_pipeline_v2.py` (64), and `tests/fixtures.py` holding the five
+sanitised production fixtures.
+
+All 125 pre-existing tests pass unmodified. No test starts a paid Apify run,
+writes to Airtable, or makes an OpenAI request.
+
+### Not verified live
+
+No live Apify, Airtable, or OpenAI call was made from this branch — the
+session had no credentials and no network access to those hosts. Everything is
+covered by mocked tests against recorded payload shapes. See
+`docs/PIPELINE_AUDIT.md` §9 for the full list and the remaining limitations.
+
+---
+
 ## [Unreleased] — Deterministic qualification and the 65-point threshold
 
 Branch: `agent/improve-lead-qualification`
