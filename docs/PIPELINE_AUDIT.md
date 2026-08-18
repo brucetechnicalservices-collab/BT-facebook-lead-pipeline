@@ -274,6 +274,61 @@ Facebook Group Performance ─── scraped → candidates → qualified →
 
 ---
 
+## 10. Pre-merge production readiness review
+
+Four defects were found by review against running code and fixed on this
+branch before merge.
+
+| # | Defect | Impact | Fix |
+|---|---|---|---|
+| 1 | A human's `Send to AI` bypassed the prefilter but was then vetoed by the same intent heuristic at decision time | An OpenAI call was paid for and the human's reviewed selection was silently discarded — a record scoring 97 came back `Rejected` on `NO_BUYING_INTENT` | `human_override` on `evaluate_lead` suppresses the **intent veto only**; every other hard rejection and all outreach gating still apply |
+| 2 | `prefilter_post` early returns (too short, stale) reported the dataclass default `UNRELATED` without classifying | Factually wrong intent diagnostics written into Airtable `AI Output` for every short or stale post | Classify before the early returns; the rejection payload now records the real intent and service match |
+| 3 | The schema preflight validated 12 of the 29 fields the pipeline writes | A missing `AI Output` passed preflight then failed mid-batch with `UNKNOWN_FIELD_NAME`, silently breaking retry tracking | `REQUIRED_RAW_SIGNAL_FIELDS` now covers every writable field, asserted by a test that derives the write set from the code |
+| 4 | The Raw Signals read-only guard was applied to Facebook Group Performance | `Contacted` is a read-only checkbox on Raw Signals and a computed **count** on Group Performance, so the metric was stripped on every run and never written | `strip_read_only_fields` takes a per-table protected set; each writer passes the set that is correct for its table |
+
+Defect 4 is the one worth remembering: **column names are not unique across
+the base.** Any future shared write helper must take its protected set per
+table rather than inheriting a default.
+
+### Retry storage isolation
+
+The cross-run attempt counter moved into `ai_retry.RetryStore`, which owns the
+single decision of where the count lives. Behaviour is unchanged for this
+release — the count still rides in the `AI Output` JSON blob. Adding a
+dedicated field later is configuration, not code:
+
+```python
+RETRY_STORE = ai_retry.RetryStore(
+    output_field="AI Output",
+    attempts_field="AI Attempts",   # set AIRTABLE_AI_ATTEMPTS_FIELD
+)
+```
+
+With the dedicated field set, the count is read from and written to it and
+`AI Output` keeps only human-readable diagnostics. Nothing in the
+qualification architecture reads retry state, so scoring, tiers, hard
+rejections, and outreach rules are untouched by the migration.
+
+### Classifier recall, re-measured
+
+Ten realistic business-pain phrasings were run through the classifier. Seven
+were correctly identified. Three fell to `UNRELATED`:
+
+- "Our plumbing business misses calls constantly" — no service match either,
+  so it is a miss, not a wrong rejection
+- "we track every job in a spreadsheet" — no service match
+- "Our office network keeps dropping and nobody can print" — **does** have a
+  service match, and is a genuine managed-IT opportunity
+
+The third is a recall gap: `BUSINESS_PAIN` patterns cover "keeps breaking /
+crashing / going down" but not "keeps dropping". It is prefiltered out for
+free rather than wrongly rejected after an AI call, so the failure direction
+is safe, and defect 1's fix means a human who flags it now gets a real
+decision. Widening the pain vocabulary was deliberately left out of this
+review as a feature change rather than a defect fix.
+
+---
+
 ## 9. Remaining limitations
 
 Honest list. None of these block the release; all are recorded so they are not

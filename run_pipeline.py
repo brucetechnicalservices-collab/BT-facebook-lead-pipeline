@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 import requests
 
+import ai_retry
 import apify_runs
 import group_performance
 import intent
@@ -303,6 +304,11 @@ READ_ONLY_FIELDS = frozenset(
     }
 )
 
+#: Facebook Post Scraper Runs has no formula or human-owned columns, and
+#: shares no column names with Raw Signals. Declared explicitly so the guard
+#: is a deliberate choice per table rather than an inherited default.
+SCRAPER_RUNS_PROTECTED_FIELDS: frozenset[str] = frozenset()
+
 EXTENDED_FIELDS = (
     FIELD_LEAD_TIER,
     FIELD_MANUAL_REVIEW,
@@ -314,20 +320,45 @@ EXTENDED_FIELDS = (
     FIELD_SCRAPER_RUN,
 )
 
-#: Fields the pipeline cannot run correctly without.
+#: Every Raw Signals field the pipeline writes.
+#:
+#: The preflight validates this whole set, not a subset. A field missing from
+#: here but present in a payload fails mid-batch with UNKNOWN_FIELD_NAME
+#: instead of failing clearly before anything is modified -- and AI Output in
+#: particular now carries the cross-run retry counter, so losing it silently
+#: breaks error recovery.
 REQUIRED_RAW_SIGNAL_FIELDS = (
+    # Written on import.
     FIELD_URL,
-    FIELD_TEXT,
+    FIELD_FACEBOOK_URL,
     FIELD_TIME,
+    FIELD_USER_ID,
+    FIELD_USER_NAME,
+    FIELD_TEXT,
+    FIELD_GROUP_TITLE,
+    FIELD_INPUT_URL,
+    FIELD_LIKES,
+    FIELD_COMMENTS,
+    FIELD_SHARES,
+    FIELD_APIFY_RUN_ID,
+    FIELD_SCRAPER_RUN,
+    # Written after qualification.
     FIELD_AI_STATUS,
     FIELD_QUALIFIED,
     FIELD_LEAD_SCORE,
+    FIELD_SERVICE_MATCH,
+    FIELD_LEAD_SUMMARY,
+    FIELD_REJECTION_REASON,
+    FIELD_SUGGESTED_DM,
+    FIELD_RECOMMENDED_CHANNEL,
+    FIELD_EVIDENCE,
+    FIELD_AI_OUTPUT,
     FIELD_LEAD_TIER,
+    FIELD_MANUAL_REVIEW,
     FIELD_OUTREACH_READY,
+    FIELD_DISQUALIFIERS,
     FIELD_PREFILTER_SCORE,
     FIELD_QUALIFICATION_VERSION,
-    FIELD_APIFY_RUN_ID,
-    FIELD_SCRAPER_RUN,
 )
 
 #: Airtable table names. Only AIRTABLE_TABLE_NAME is a required secret; the
@@ -357,15 +388,24 @@ def airtable_url() -> str:
     return airtable_table_url(require_env("AIRTABLE_TABLE_NAME"))
 
 
-def strip_read_only_fields(fields: dict[str, Any]) -> dict[str, Any]:
+def strip_read_only_fields(
+    fields: dict[str, Any],
+    protected: frozenset[str] = READ_ONLY_FIELDS,
+) -> dict[str, Any]:
     """
     Remove fields the pipeline must never write.
 
     Airtable rejects formula writes with an error, but it would happily
     overwrite Human Decision or Outreach Status. This is the last line of
     defence before any PATCH or POST leaves the process.
+
+    ``protected`` is per-table and must be passed explicitly for anything
+    other than Facebook Raw Signals. Column names are not unique across the
+    base: "Contacted" is a read-only checkbox on Raw Signals and a computed
+    count on Facebook Group Performance, so applying the Raw Signals set to
+    the group table would silently drop a metric the pipeline owns.
     """
-    removed = sorted(set(fields) & READ_ONLY_FIELDS)
+    removed = sorted(set(fields) & protected)
 
     if removed:
         print(
@@ -376,7 +416,7 @@ def strip_read_only_fields(fields: dict[str, Any]) -> dict[str, Any]:
         )
 
     return {
-        key: value for key, value in fields.items() if key not in READ_ONLY_FIELDS
+        key: value for key, value in fields.items() if key not in protected
     }
 
 
@@ -885,6 +925,8 @@ def list_group_performance_records(**kwargs: Any) -> list[dict[str, Any]]:
 def create_table_records(
     url: str,
     records: list[dict[str, Any]],
+    *,
+    protected: frozenset[str] = READ_ONLY_FIELDS,
 ) -> list[dict[str, Any]]:
     """Create records in any table, ten at a time, and return what Airtable made."""
     created: list[dict[str, Any]] = []
@@ -892,7 +934,12 @@ def create_table_records(
 
     for batch in chunks(records, 10):
         payload = [
-            {**record, "fields": strip_read_only_fields(record.get("fields", {}))}
+            {
+                **record,
+                "fields": strip_read_only_fields(
+                    record.get("fields", {}), protected
+                ),
+            }
             for record in batch
         ]
 
@@ -911,13 +958,20 @@ def create_table_records(
 def update_table_records(
     url: str,
     updates: list[dict[str, Any]],
+    *,
+    protected: frozenset[str] = READ_ONLY_FIELDS,
 ) -> None:
     """Patch records in any table, ten at a time."""
     headers = airtable_headers()
 
     for batch in chunks(updates, 10):
         payload = [
-            {**update, "fields": strip_read_only_fields(update.get("fields", {}))}
+            {
+                **update,
+                "fields": strip_read_only_fields(
+                    update.get("fields", {}), protected
+                ),
+            }
             for update in batch
         ]
 
@@ -1173,42 +1227,31 @@ def has_active_outreach(fields: dict[str, Any]) -> bool:
     return status in ACTIVE_OUTREACH_STATUSES
 
 
+#: Where the cross-run AI attempt count is stored.
+#:
+#: Airtable has no AI Attempts field today, so the count rides in the AI
+#: Output JSON blob. Set AIRTABLE_AI_ATTEMPTS_FIELD once a numeric field
+#: exists and the store switches to it -- no other code changes, and nothing
+#: in the qualification architecture is affected either way.
+RETRY_STORE = ai_retry.RetryStore(
+    output_field=FIELD_AI_OUTPUT,
+    attempts_field=env_str("AIRTABLE_AI_ATTEMPTS_FIELD", ""),
+    error_status=AI_STATUS_ERROR,
+)
+
+
 def ai_attempts_so_far(fields: dict[str, Any]) -> int:
-    """
-    How many AI attempts this record has already used, across runs.
-
-    The live schema has no dedicated attempt counter, so the count is stored
-    in the AI Output long-text field as JSON alongside the error. When AI
-    Output holds anything else -- legacy text, real model output -- the count
-    reads as zero and the record gets a fresh budget. That is the intended
-    fallback; see docs/PIPELINE_AUDIT.md for the limitation.
-    """
-    raw = (fields or {}).get(FIELD_AI_OUTPUT)
-    if not raw:
-        return 0
-
-    try:
-        parsed = json.loads(str(raw))
-    except (ValueError, TypeError):
-        return 0
-
-    if not isinstance(parsed, dict):
-        return 0
-
-    try:
-        return max(int(parsed.get("attempts", 0)), 0)
-    except (TypeError, ValueError):
-        return 0
+    """How many AI attempts this record has already used, across runs."""
+    return RETRY_STORE.read_attempts(fields)
 
 
 def is_retry_exhausted(fields: dict[str, Any]) -> bool:
     """Has this record used up its cross-run AI attempt budget?"""
-    status = str((fields or {}).get(FIELD_AI_STATUS, "") or "").strip()
-
-    if status != AI_STATUS_ERROR:
-        return False
-
-    return ai_attempts_so_far(fields) >= AI_ERROR_MAX_ATTEMPTS
+    return RETRY_STORE.is_exhausted(
+        fields,
+        max_attempts=AI_ERROR_MAX_ATTEMPTS,
+        status_field=FIELD_AI_STATUS,
+    )
 
 
 def is_human_flagged(fields: dict[str, Any]) -> bool:
@@ -1484,6 +1527,7 @@ def qualify_post(
     *,
     prefilter: PrefilterResult | None = None,
     now: datetime | None = None,
+    human_override: bool = False,
 ) -> tuple[LeadDecision, dict[str, Any]]:
     """
     Extract signals with the AI, then decide deterministically in Python.
@@ -1513,6 +1557,7 @@ def qualify_post(
         min_outreach_confidence=MIN_OUTREACH_CONFIDENCE,
         business_pain_min_score=BUSINESS_PAIN_OUTREACH_MIN_SCORE,
         extra_disqualifiers=collect_policy_disqualifiers(fields),
+        human_override=human_override,
     )
 
     return decision, signals
@@ -1690,24 +1735,9 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
         time.sleep(0.25)
 
 
-#: Exception text fragments that indicate a transient failure worth retrying.
-TRANSIENT_ERROR_MARKERS = (
-    "timeout", "timed out", "rate limit", "429", "500", "502", "503", "504",
-    "connection", "temporarily", "overloaded", "unavailable", "network",
-)
-
-
-def is_transient_error(error: BaseException) -> bool:
-    """
-    Decide whether an AI failure is worth another attempt later.
-
-    Transient: timeouts, rate limits, 5xx, connection resets. Permanent:
-    a malformed record, an impossible schema state, a rejected prompt. A
-    permanent failure burns the whole budget at once so it never comes back.
-    """
-    text = f"{type(error).__name__}: {error}".lower()
-
-    return any(marker in text for marker in TRANSIENT_ERROR_MARKERS)
+#: Re-exported so callers and tests have one import site for retry policy.
+TRANSIENT_ERROR_MARKERS = ai_retry.TRANSIENT_ERROR_MARKERS
+is_transient_error = ai_retry.is_transient_error
 
 
 def build_error_payload(
@@ -1716,25 +1746,14 @@ def build_error_payload(
     attempts: int,
     transient: bool,
 ) -> dict[str, Any]:
-    """
-    Build the Airtable payload for a failed record.
-
-    The attempt count is stored in AI Output as JSON because the live schema
-    has no dedicated error or attempt field. Only failed records get this
-    treatment; real model output is never replaced by exception text.
-    """
-    diagnostics = {
-        "qualification_version": QUALIFICATION_VERSION,
-        "attempts": attempts,
-        "transient": transient,
-        "last_error": error_message[:1000],
-        "last_error_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    return {
-        FIELD_AI_STATUS: AI_STATUS_ERROR,
-        FIELD_AI_OUTPUT: json.dumps(diagnostics, indent=2, sort_keys=True),
-    }
+    """Build the Airtable payload for a failed record."""
+    return RETRY_STORE.build_failure_fields(
+        error_message,
+        attempts=attempts,
+        transient=transient,
+        status_field=FIELD_AI_STATUS,
+        version=QUALIFICATION_VERSION,
+    )
 
 
 def mark_ai_error(
@@ -1977,7 +1996,10 @@ def process_ai_queue(
         try:
             summary.ai_processed += 1
             decision, signals = qualify_post(
-                fields, prefilter=prefilter, now=now
+                fields,
+                prefilter=prefilter,
+                now=now,
+                human_override=human_flagged,
             )
 
             if decision.tier == "Hot":
@@ -2031,10 +2053,10 @@ def process_ai_queue(
 
             # A permanent failure consumes the whole budget immediately, so
             # it is never retried. A transient one gets another go next run.
-            attempts = (
-                ai_attempts_so_far(fields) + 1
-                if transient
-                else AI_ERROR_MAX_ATTEMPTS
+            attempts = RETRY_STORE.next_attempt_count(
+                fields,
+                transient=transient,
+                max_attempts=AI_ERROR_MAX_ATTEMPTS,
             )
 
             print(
@@ -2142,8 +2164,13 @@ def log_scraper_run(
         return scraper_runs.upsert_scraper_run(
             run,
             lister=list_scraper_run_records,
-            creator=lambda records: create_table_records(table_url, records),
-            updater=lambda updates: update_table_records(table_url, updates),
+            # Scraper Runs shares no column names with Raw Signals.
+            creator=lambda records: create_table_records(
+                table_url, records, protected=SCRAPER_RUNS_PROTECTED_FIELDS
+            ),
+            updater=lambda updates: update_table_records(
+                table_url, updates, protected=SCRAPER_RUNS_PROTECTED_FIELDS
+            ),
             run_input=fetch_apify_run_input(run),
             dry_run=DRY_RUN,
         )
@@ -2207,7 +2234,9 @@ def refresh_group_performance() -> None:
             raw_signal_lister=list_airtable_records,
             performance_lister=list_group_performance_records,
             performance_updater=lambda updates: update_table_records(
-                performance_url, updates
+                performance_url,
+                updates,
+                protected=group_performance.NEVER_WRITE_FIELDS,
             ),
             fields=RAW_SIGNAL_FIELD_NAMES,
             run_dates=scraper_run_dates(),

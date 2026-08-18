@@ -464,6 +464,7 @@ def collect_hard_rejections(
     intent_type: str | None = None,
     post_text: Any = None,
     extra_codes: Sequence[str] = (),
+    human_override: bool = False,
 ) -> list[str]:
     """
     Return every hard rejection code that applies to these signals.
@@ -473,6 +474,12 @@ def collect_hard_rejections(
     ``intent_type`` and ``extra_codes`` carry the Python-side decisions --
     deterministic intent, author suppression, group exclusion, a human
     rejection -- that the model is never asked about.
+
+    ``human_override`` suppresses the *intent* veto only. A record someone
+    reviewed and flagged "Send to AI" bypasses the keyword prefilter; without
+    this, the same heuristic they overrode would reject the result anyway,
+    after the AI call had already been paid for. Every other hard rejection
+    still applies, and outreach remains gated in evaluate_lead().
     """
     codes: list[str] = []
 
@@ -526,7 +533,11 @@ def collect_hard_rejections(
     # Deterministic intent. A post the classifier read as general business
     # advice or as unrelated chatter is never a BruceTech lead, however
     # generously the model scored it. This is the anti-solution-hopping rule.
-    if intent_type is not None and intent_type not in intent.OUTREACH_INTENTS:
+    if (
+        intent_type is not None
+        and not human_override
+        and intent_type not in intent.OUTREACH_INTENTS
+    ):
         if intent_type == intent.INTENT_TOOL_RESEARCH:
             # Research is not a rejection -- it is a human decision. Scoring
             # continues; outreach is blocked further down in evaluate_lead().
@@ -703,6 +714,7 @@ def evaluate_lead(
     min_outreach_confidence: float = DEFAULT_MIN_OUTREACH_CONFIDENCE,
     business_pain_min_score: int = DEFAULT_BUSINESS_PAIN_OUTREACH_SCORE,
     extra_disqualifiers: Sequence[str] = (),
+    human_override: bool = False,
 ) -> LeadDecision:
     """
     Turn structured AI signals into the final, authoritative decision.
@@ -714,6 +726,11 @@ def evaluate_lead(
     supplied it can veto a lead outright (general advice, unrelated) and it
     gates outreach: only provider requests, implementation requests, and
     strong business pain may ever produce an automatic DM.
+
+    ``human_override`` marks a record a person flagged "Send to AI". It lifts
+    the intent veto so their review is not undone by the heuristic they
+    overrode, but it does not lift outreach gating -- a human is already in
+    the loop and will see the result.
     """
     signals = signals or {}
 
@@ -726,6 +743,7 @@ def evaluate_lead(
         intent_type=intent_type,
         post_text=post_text,
         extra_codes=extra_disqualifiers,
+        human_override=human_override,
     )
     hard_rejected = bool(hard_codes)
 
@@ -989,28 +1007,35 @@ def prefilter_post(
     body = str(text or "").strip()
     reasons: list[str] = []
 
-    if len(body) < MIN_PREFILTER_TEXT_LENGTH:
+    # Classify before the early returns. A rejected post still has its
+    # assessment written to Airtable for a human to read, and reporting the
+    # dataclass default there would label every short or stale post
+    # "UNRELATED" regardless of what it actually said.
+    intent_result = intent.classify_intent(body)
+    services = intent.match_services(body)
+
+    def rejected(reason: str) -> PrefilterResult:
         return PrefilterResult(
             passed=False,
             score=0,
             intent_score=0,
-            reasons=["Post text is too short to evaluate."],
+            reasons=[reason],
+            intent_type=intent_result.intent_type,
+            intent_label=intent_result.label,
+            service_matched=services.matched,
+            service_categories=list(services.categories),
         )
+
+    if len(body) < MIN_PREFILTER_TEXT_LENGTH:
+        return rejected("Post text is too short to evaluate.")
 
     age_days = post_age_in_days(post_time, now=now) if post_time else None
     if age_days is not None and age_days > max_post_age_days:
-        return PrefilterResult(
-            passed=False,
-            score=0,
-            intent_score=0,
-            reasons=[
-                f"Post is {age_days:.0f} days old, older than the "
-                f"{max_post_age_days}-day maximum."
-            ],
+        return rejected(
+            f"Post is {age_days:.0f} days old, older than the "
+            f"{max_post_age_days}-day maximum."
         )
 
-    intent_result = intent.classify_intent(body)
-    services = intent.match_services(body)
     negatives = intent.detect_negative_signals(body)
     commercial = intent.commercial_context_terms(body)
 
