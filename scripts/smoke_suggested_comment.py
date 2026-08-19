@@ -17,7 +17,7 @@ production code path from run_pipeline.qualify_post.
 
 USAGE
     cd /path/to/BT-facebook-lead-pipeline
-    OPENAI_API_KEY=sk-... python /path/to/suggested_comment_smoke_test.py
+    OPENAI_API_KEY=sk-... python scripts/smoke_suggested_comment.py
 
 Cost: 5 gpt-5-mini calls.
 """
@@ -32,8 +32,11 @@ from datetime import datetime, timedelta, timezone
 REPO = os.environ.get("BT_REPO", os.getcwd())
 sys.path.insert(0, REPO)
 
-if not os.environ.get("OPENAI_API_KEY"):
-    sys.exit("OPENAI_API_KEY is not set. This test makes real model calls.")
+# NOTE: the OPENAI_API_KEY guard lives inside main(), not here. A module-level
+# sys.exit() fires during pytest collection and takes the whole test job down
+# with it, which is exactly what happened on the first attempt at this run.
+# The filename also deliberately avoids test_*.py and *_test.py so pytest does
+# not collect this file at all.
 
 # Production defaults already match the workflow (threshold 65, manual review
 # 55, hot 80, max age 5, confidence 0.55, business pain 70, gpt-5-mini), so
@@ -92,6 +95,9 @@ def yn(value: bool) -> str:
 
 
 def main() -> None:
+    if not os.environ.get("OPENAI_API_KEY"):
+        sys.exit("OPENAI_API_KEY is not set. This test makes real model calls.")
+
     calls = 0
 
     for name, author, text in POSTS:

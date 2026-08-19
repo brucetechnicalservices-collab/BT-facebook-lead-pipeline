@@ -134,4 +134,4 @@ jobs:
           MAX_POST_CHARS: "8000"
           ENFORCE_PYTHON_PREFILTER: "true"
           PREFILTER_PASS_SCORE: "30"
-        run: python scripts/suggested_comment_smoke_test.py
+        run: python scripts/smoke_suggested_comment.py
