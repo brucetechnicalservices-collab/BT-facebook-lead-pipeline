@@ -21,6 +21,7 @@ from qualification import (
     REJECT_FUNDING_REQUEST,
     REJECT_HIRING_UNRELATED,
     REJECT_NO_BUYING_INTENT,
+    TIER_MANUAL_REVIEW,
     TIER_REJECTED,
     evaluate_lead,
     prefilter_post,
@@ -483,11 +484,21 @@ def test_unrelated_intent_gets_the_generic_code():
     assert REJECT_NO_BUYING_INTENT in decision.hard_rejection_codes
 
 
-def test_tool_research_qualifies_but_is_never_outreach_ready():
-    """Requirement 15 and section 11: research goes to a human, not a DM."""
+def test_tool_research_goes_to_manual_review_not_to_qualified():
+    """
+    Requirement 15 and section 11: research goes to a human, not a DM.
+
+    Updated 2026-08-19. This test previously asserted ``qualified is True``,
+    which produced a live Airtable row reading "Qualified, do_not_contact,
+    blank DM" -- a contradiction for the salesperson reading it. Research is
+    now capped at Manual Review however well the model scores it.
+    """
     decision = decide(intent_type=intent.INTENT_TOOL_RESEARCH)
 
-    assert decision.qualified is True
+    assert decision.lead_score >= 80
+    assert decision.tier == TIER_MANUAL_REVIEW
+    assert decision.qualified is False
+    assert decision.manual_review is True
     assert decision.outreach_ready is False
     assert decision.suggested_dm == ""
 
@@ -544,9 +555,16 @@ def test_low_confidence_blocks_outreach_but_not_qualification():
 
 
 def test_outreach_ready_is_strictly_narrower_than_qualified():
-    """Section 11: the two are not the same question."""
+    """
+    Section 11: the two are not the same question.
+
+    Shown with a qualified provider request the model declined to contact.
+    Tool research no longer demonstrates this, because it is no longer
+    qualified at all.
+    """
     decision = decide(
-        intent_type=intent.INTENT_TOOL_RESEARCH,
+        intent_type=intent.INTENT_PROVIDER_REQUEST,
+        recommended_channel="do_not_contact",
     )
 
     assert decision.qualified is True

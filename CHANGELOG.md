@@ -15,6 +15,64 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Added — Suggested Comment for Outreach Ready leads
+
+Every Outreach Ready lead now gets a short public Facebook comment alongside
+the private DM, from the **same** model response. There is no second OpenAI
+call: `suggested_comment` was added to the existing structured schema.
+
+The comment is not the pitch. It acknowledges one specific detail from the
+post, runs 12 to 35 words, carries no link, no pricing, and no mention of
+BruceTech, and ends by offering to send a DM with the closing varied across
+leads. BruceTech opens the DM, so "DM me" is avoided unless it genuinely reads
+better for that post.
+
+`Suggested Comment` (`fldFYDjbtu6gLPT1B`) is wired through the field
+constants, the writable set, `EXTENDED_FIELDS`, the schema preflight, the
+decision payload, and the pre-AI rejection payload. It is AI-owned output like
+`Suggested DM`, not a protected human field, and is regenerated under exactly
+the same conditions.
+
+**Both fields obey one gate.** `Outreach Ready = false` blanks both, without
+exception: tool research, manual review, rejected, stale, promotional,
+`do_not_contact`, and every hard rejection. Copy the model wrote anyway is
+kept in `AI Output` under `outreach_copy` for diagnostics, alongside a
+`written` flag recording whether it reached Airtable.
+
+### Added — no em dashes in outreach copy, enforced twice
+
+No outreach copy this pipeline writes may contain an em dash (`—`). The
+model instructions ban it with examples, and
+`normalization.sanitize_outreach_copy` guarantees it before the Airtable
+write, because an instruction is a request and this is an invariant.
+
+Every em dash becomes `", "`. A comma is used uniformly rather than guessing
+between a comma and a period per sentence: guessing wrong the other way
+produces a fragment ("That setup can work well. Especially if…"), which reads
+worse than a comma splice.
+
+The sanitiser does not rewrite good copy. It touches nothing but the dash and
+the whitespace around it, so URLs, hyphens, and number ranges survive intact.
+A spaced en dash is normalised as a sentence break; a tight one is a range
+(`Mon–Fri`) and is left alone.
+
+### Fixed — TOOL_RESEARCH could become Qualified on score alone
+
+A live Blue Collar record, a pool contractor comparing Pool Studio, Vip3D and
+JobTread, scored 76 and was written to Airtable as `Qualified` while
+simultaneously being `do_not_contact` with a blank DM. That row contradicts
+itself for whoever reads it.
+
+`TOOL_RESEARCH` is now capped at `Manual Review`. Someone comparing products
+has not asked for an implementer, however well the model scores the post. A
+clean research record is written as Manual Review, not qualified, not outreach
+ready, blank DM, blank comment, `do_not_contact`.
+
+Hard rejections still win: `TOOL_RESEARCH` plus `PROMOTIONAL_POST` is
+`Rejected`, not Manual Review. Nothing changes for `PROVIDER_REQUEST`,
+`IMPLEMENTATION_REQUEST`, or `BUSINESS_PAIN`. No score, weight, or threshold
+moved, and the model's full analysis is preserved in `AI Output`.
+
 ### Fixed — a spend limit was rationing free deterministic evaluation
 
 Found by the Blue Collar Millionaire live run, Apify run `BnHEoWoDCZDPnM8iY`

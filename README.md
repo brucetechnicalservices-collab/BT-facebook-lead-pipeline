@@ -174,6 +174,89 @@ can be lifted by a human — they are the heuristic guesses a reviewer can see
 are wrong by reading the post. Every other code in this table is in
 `NON_OVERRIDABLE_HARD_REJECTIONS` and stands regardless of who approved what.
 
+### Tool research is a human decision
+
+`TOOL_RESEARCH` is capped at **Manual Review** and can never become Qualified
+or Hot on score alone. Someone comparing products has not asked for an
+implementer, however well the model scores the post.
+
+A clean research record, with no hard rejection, is written as:
+
+| Field | Value |
+| --- | --- |
+| `Lead Tier` | `Manual Review` |
+| `Qualified` | false |
+| `Manual Review` | true |
+| `Outreach Ready` | false |
+| `Suggested DM` | blank |
+| `Suggested Comment` | blank |
+| `Recommended channel` | `do_not_contact` |
+
+Hard rejections still win: `TOOL_RESEARCH` plus `PROMOTIONAL_POST` is
+`Rejected`, not Manual Review. Nothing changes for `PROVIDER_REQUEST`,
+`IMPLEMENTATION_REQUEST`, or `BUSINESS_PAIN`, and the score, weights, and
+thresholds are untouched. The model's full analysis is preserved in
+`AI Output`.
+
+> **Fixed 2026-08-19.** A live record scored 76 and was written as `Qualified`
+> while simultaneously being `do_not_contact` with a blank DM, which is a
+> contradiction for whoever reads that row.
+
+### Outreach copy: the DM and the comment
+
+An Outreach Ready lead gets two pieces of copy from **one** model response:
+
+| | Suggested DM | Suggested Comment |
+| --- | --- | --- |
+| Audience | Private | Public, on the post |
+| Length | Under 80 words | 12 to 35 words, max 2 sentences |
+| Mentions BruceTech | Yes | Never |
+| Links / pricing | brucetech.ca | Never |
+| Pitch | Soft pitch allowed | No pitch |
+| Purpose | The actual outreach | Bridge the post into a DM |
+
+The comment acknowledges one specific detail from the post and offers to send
+a DM, with the closing varied across leads:
+
+> "Sounds like you're past the research stage and need someone to actually get
+> the setup working. I'll shoot you a quick DM with a couple thoughts."
+
+BruceTech opens the DM, so "DM me" is avoided unless it genuinely reads better
+for that post.
+
+**Both fields obey one gate.** If `Outreach Ready` is false, both are blank in
+Airtable, without exception: tool research, manual review, rejected, stale,
+promotional, `do_not_contact`, and every hard rejection. The model may still
+have written copy; it stays in `AI Output` for diagnostics and never reaches
+the sales columns.
+
+`Suggested Comment` is AI-owned output like `Suggested DM`, not a protected
+human field, and is regenerated under exactly the same conditions.
+
+### No em dashes, ever
+
+No outreach copy this pipeline writes may contain an em dash (`—`). It is
+enforced twice:
+
+1. The model instructions ban it, with examples.
+2. `normalization.sanitize_outreach_copy` guarantees it before the Airtable
+   write, because an instruction is a request and this is an invariant.
+
+Every em dash becomes `", "`:
+
+| Model wrote | Airtable gets |
+| --- | --- |
+| `Hi Matt — I saw your post.` | `Hi Matt, I saw your post.` |
+| `Works well — especially with a CRM.` | `Works well, especially with a CRM.` |
+
+A comma is used uniformly rather than guessing between a comma and a period
+per sentence: guessing wrong the other way produces a fragment ("That setup
+can work well. Especially if…"), which reads worse than a comma splice.
+
+The sanitiser does not rewrite good copy. It touches nothing but the dash and
+the whitespace around it, so URLs, hyphens (`well-structured`), and number
+ranges (`Mon–Fri`) survive untouched.
+
 ### Qualified vs Outreach Ready
 
 These answer different questions and are not interchangeable.
@@ -690,7 +773,8 @@ Source fields, written on import:
 Qualification fields, written after processing:
 
 `AI Status` · `Qualified` · `Lead Score` · `Service Match` · `Lead Summary` ·
-`Rejection Reason` · `Suggested DM` · `AI Output` · `Recommended channel` ·
+`Rejection Reason` · `Suggested DM` · `Suggested Comment` · `AI Output` ·
+`Recommended channel` ·
 `Evidence` · `Lead Tier` · `Manual Review` · `Outreach Ready` ·
 `Disqualifiers` · `Prefilter Score` · `Qualification Version`
 

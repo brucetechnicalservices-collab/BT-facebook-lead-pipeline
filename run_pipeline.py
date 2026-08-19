@@ -274,6 +274,9 @@ FIELD_SERVICE_MATCH = "Service Match"
 FIELD_LEAD_SUMMARY = "Lead Summary"
 FIELD_REJECTION_REASON = "Rejection Reason"
 FIELD_SUGGESTED_DM = "Suggested DM"
+#: Short public Facebook comment that bridges the post into a DM. AI-owned
+#: output, written under exactly the same outreach gate as Suggested DM.
+FIELD_SUGGESTED_COMMENT = "Suggested Comment"
 FIELD_RECOMMENDED_CHANNEL = "Recommended channel"
 FIELD_EVIDENCE = "Evidence"
 
@@ -333,6 +336,7 @@ READ_ONLY_FIELDS = frozenset(
 SCRAPER_RUNS_PROTECTED_FIELDS: frozenset[str] = frozenset()
 
 EXTENDED_FIELDS = (
+    FIELD_SUGGESTED_COMMENT,
     FIELD_LEAD_TIER,
     FIELD_MANUAL_REVIEW,
     FIELD_OUTREACH_READY,
@@ -342,6 +346,15 @@ EXTENDED_FIELDS = (
     FIELD_APIFY_RUN_ID,
     FIELD_SCRAPER_RUN,
 )
+
+#: Airtable field IDs for fields where the ID is known and worth pinning.
+#:
+#: The preflight matches on name, which is what an operator sees. An ID match
+#: is accepted as a fallback so renaming a column in Airtable does not fail a
+#: run for a field that is demonstrably still there.
+KNOWN_FIELD_IDS: dict[str, str] = {
+    FIELD_SUGGESTED_COMMENT: "fldFYDjbtu6gLPT1B",
+}
 
 #: Every Raw Signals field the pipeline writes.
 #:
@@ -373,6 +386,7 @@ REQUIRED_RAW_SIGNAL_FIELDS = (
     FIELD_LEAD_SUMMARY,
     FIELD_REJECTION_REASON,
     FIELD_SUGGESTED_DM,
+    FIELD_SUGGESTED_COMMENT,
     FIELD_RECOMMENDED_CHANNEL,
     FIELD_EVIDENCE,
     FIELD_AI_OUTPUT,
@@ -623,16 +637,57 @@ evidence - short quotes or specifics from the post supporting your signals.
 
 service_match - a short human-readable label, or "None".
 
-suggested_dm - only write one when the post genuinely supports a specific,
-  personalised message:
+NEVER USE AN EM DASH
+
+Do not use the em dash character "—" anywhere in suggested_dm or
+suggested_comment. Use a comma, a period, a colon, a semicolon, parentheses,
+or two separate sentences instead. A standard hyphen inside a compound word
+("well-structured") is fine.
+
+  BAD:  "Hi Matt — I saw your post about lead generation."
+  GOOD: "Hi Matt, I saw your post about lead generation."
+
+  BAD:  "That setup can work well — especially with a CRM."
+  GOOD: "That setup can work well, especially with a CRM."
+
+  BAD:  "You have the operations side figured out — acquisition is next."
+  GOOD: "You have the operations side figured out. Acquisition is next."
+
+This applies to every message you write, without exception.
+
+suggested_dm - the PRIVATE message. Only write one when the post genuinely
+  supports a specific, personalised message:
   - under 80 words, natural, no marketing voice
   - reference only details actually present in the post
   - include brucetech.ca naturally
   - end with one simple question
   - never mention scraping, monitoring, tracking, or AI analysis
   - never claim BruceTech reviewed their website or systems
+  - no em dash
   If you cannot write a genuinely specific message, return an empty string.
   Never write a generic template. A blank DM is correct and expected.
+
+suggested_comment - the PUBLIC Facebook comment, written to bridge the
+  conversation from the post into a private DM. This is not the pitch; it is
+  the reason someone would welcome the DM.
+  - 12 to 35 words, at most two short sentences
+  - acknowledge one specific detail, problem, or request from the post
+  - warm, natural, and human, like a real comment in a group
+  - useful enough that it does not read as spam
+  - end by offering to send a DM, and vary the wording across posts:
+      "I'll send you a quick DM with a couple ideas."
+      "I'll shoot you a quick DM with a few thoughts."
+      "I'll send you a DM with how I'd approach this."
+      "I'll message you directly with a couple options."
+  - BruceTech opens the DM. Avoid "DM me" unless it is genuinely more
+    natural for that specific post.
+  - never include a URL, a link, brucetech.ca, a phone number, or pricing
+  - never explain the whole solution publicly
+  - never use generic filler: "Great post", "Thanks for sharing",
+    "We can help"
+  - no em dash
+  Write one only when you also wrote a suggested_dm. If the DM is blank,
+  return an empty string here too.
 
 recommended_channel - do_not_contact whenever outreach would be unwelcome,
   intrusive, or unsupported by the post. This is respected as-is and is
@@ -708,6 +763,7 @@ LEAD_SCHEMA: dict[str, Any] = {
         "lead_summary": {"type": "string"},
         "evidence": {"type": "string"},
         "suggested_dm": {"type": "string"},
+        "suggested_comment": {"type": "string"},
         "recommended_channel": _enum(
             ("direct_message", "public_reply_then_dm", "do_not_contact")
         ),
@@ -736,6 +792,7 @@ LEAD_SCHEMA: dict[str, Any] = {
         "lead_summary",
         "evidence",
         "suggested_dm",
+        "suggested_comment",
         "recommended_channel",
     ],
     "additionalProperties": False,
@@ -1692,6 +1749,8 @@ def qualify_post(
     decision = evaluate_lead(
         signals,
         suggested_dm=signals.get("suggested_dm", ""),
+        # Same model response, same evidence. There is no second call.
+        suggested_comment=signals.get("suggested_comment", ""),
         recommended_channel=signals.get(
             "recommended_channel", "do_not_contact"
         ),
@@ -1734,6 +1793,15 @@ def build_ai_output(
         "lead_score": decision.lead_score,
         "tier": decision.tier,
         "score_breakdown": decision.score_breakdown,
+        # The model's raw copy, kept for diagnostics whatever the gate
+        # decided. "written" records what actually reached Airtable, so a
+        # blank sales field can be told apart from a model that wrote
+        # nothing.
+        "outreach_copy": {
+            "written": decision.outreach_ready,
+            "suggested_dm": decision.suggested_dm,
+            "suggested_comment": decision.suggested_comment,
+        },
         "signals": signals,
     }
 
@@ -1776,6 +1844,7 @@ def map_decision_to_airtable(
         FIELD_LEAD_SUMMARY: summary,
         FIELD_REJECTION_REASON: decision.rejection_reason or "None",
         FIELD_SUGGESTED_DM: decision.suggested_dm,
+        FIELD_SUGGESTED_COMMENT: decision.suggested_comment,
         FIELD_RECOMMENDED_CHANNEL: decision.recommended_channel,
         FIELD_EVIDENCE: str(signals.get("evidence", "") or ""),
         FIELD_LEAD_TIER: decision.tier,
@@ -1832,7 +1901,9 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
                 f"score={fields.get(FIELD_LEAD_SCORE)} "
                 f"qualified={fields.get(FIELD_QUALIFIED)} "
                 f"outreach={fields.get(FIELD_OUTREACH_READY)} "
-                f"dm={'yes' if fields.get(FIELD_SUGGESTED_DM) else 'no'}",
+                f"dm={'yes' if fields.get(FIELD_SUGGESTED_DM) else 'no'} "
+                f"comment="
+                f"{'yes' if fields.get(FIELD_SUGGESTED_COMMENT) else 'no'}",
                 flush=True,
             )
         return
@@ -1983,6 +2054,7 @@ def build_prefilter_rejection_update(
             FIELD_SERVICE_MATCH: "None",
             FIELD_REJECTION_REASON: reason[:500],
             FIELD_SUGGESTED_DM: "",
+            FIELD_SUGGESTED_COMMENT: "",
             FIELD_RECOMMENDED_CHANNEL: "do_not_contact",
             FIELD_LEAD_TIER: TIER_REJECTED,
             FIELD_MANUAL_REVIEW: False,
@@ -2358,8 +2430,16 @@ def validate_airtable_schema() -> None:
             f"Check AIRTABLE_TABLE_NAME."
         )
 
-    present = {str(field.get("name", "")).strip() for field in table.get("fields", [])}
-    missing = [name for name in REQUIRED_RAW_SIGNAL_FIELDS if name not in present]
+    fields = table.get("fields", [])
+    present = {str(field.get("name", "")).strip() for field in fields}
+    present_ids = {str(field.get("id", "")).strip() for field in fields}
+
+    missing = [
+        name
+        for name in REQUIRED_RAW_SIGNAL_FIELDS
+        if name not in present
+        and KNOWN_FIELD_IDS.get(name, "") not in present_ids
+    ]
 
     if missing:
         raise RuntimeError(

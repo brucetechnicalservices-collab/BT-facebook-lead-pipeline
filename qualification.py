@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
 import intent
+from normalization import sanitize_outreach_copy
 
 # ---------------------------------------------------------------------------
 # Thresholds
@@ -502,6 +503,10 @@ class LeadDecision:
     outreach_ready: bool = False
     rejection_reason: str = "None"
     suggested_dm: str = ""
+    #: The short public Facebook comment that bridges into the DM. Subject to
+    #: exactly the same outreach gate as suggested_dm: blank unless
+    #: outreach_ready.
+    suggested_comment: str = ""
     recommended_channel: str = CHANNEL_DO_NOT_CONTACT
     score_breakdown: dict[str, int] = field(default_factory=dict)
 
@@ -763,6 +768,7 @@ def evaluate_lead(
     signals: dict[str, Any],
     *,
     suggested_dm: str = "",
+    suggested_comment: str = "",
     recommended_channel: str = CHANNEL_DO_NOT_CONTACT,
     post_time: Any = None,
     now: datetime | None = None,
@@ -824,6 +830,24 @@ def evaluate_lead(
         hot_threshold=hot_threshold,
     )
 
+    # Tool research is a human decision, never an automatic qualification.
+    #
+    # Someone comparing products has not asked for an implementer, however
+    # well the model scores the post. A live Blue Collar record scored 76 and
+    # was written to Airtable as Qualified while simultaneously being
+    # do_not_contact with a blank DM, which is a self-contradictory row for a
+    # salesperson to read.
+    #
+    # This caps the tier at Manual Review. It does not touch the score, the
+    # weights, or any threshold: the model's analysis is preserved intact in
+    # AI Output, and a hard rejection still overrides everything below.
+    if (
+        intent_type == intent.INTENT_TOOL_RESEARCH
+        and not hard_rejected
+        and tier in QUALIFYING_TIERS
+    ):
+        tier = TIER_MANUAL_REVIEW
+
     qualified = tier in QUALIFYING_TIERS
     manual_review = tier == TIER_MANUAL_REVIEW
 
@@ -834,7 +858,10 @@ def evaluate_lead(
     if channel not in OUTREACH_CHANNELS:
         channel = CHANNEL_DO_NOT_CONTACT
 
-    dm = str(suggested_dm or "").strip()
+    # Every piece of outreach copy is sanitised on the way in, so no banned
+    # character can reach Airtable even if the model ignores its instructions.
+    dm = sanitize_outreach_copy(suggested_dm)
+    comment = sanitize_outreach_copy(suggested_comment)
 
     if qualified:
         # Qualified means "strong commercial fit". Outreach Ready is a
@@ -871,6 +898,7 @@ def evaluate_lead(
             # There is deliberately no generic fallback DM. A lead without a
             # personalised message is not outreach-ready.
             dm = ""
+            comment = ""
             channel = CHANNEL_DO_NOT_CONTACT
 
         rejection_reason = "None"
@@ -878,6 +906,7 @@ def evaluate_lead(
     else:
         outreach_ready = False
         dm = ""
+        comment = ""
         channel = CHANNEL_DO_NOT_CONTACT
 
         if hard_rejected:
@@ -903,6 +932,7 @@ def evaluate_lead(
         outreach_ready=outreach_ready,
         rejection_reason=rejection_reason,
         suggested_dm=dm,
+        suggested_comment=comment,
         recommended_channel=channel,
         score_breakdown=breakdown,
     )

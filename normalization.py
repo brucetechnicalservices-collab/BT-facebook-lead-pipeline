@@ -122,6 +122,97 @@ def _strip_tracking_params(query: str) -> str:
     return urlencode(kept)
 
 
+# ---------------------------------------------------------------------------
+# Outreach copy sanitisation
+#
+# Everything BruceTech says publicly or in a DM passes through here before it
+# reaches Airtable. The model is instructed never to use em dashes; this is
+# what guarantees it, because an instruction is a request and this is an
+# invariant.
+#
+# The sanitiser is deliberately minimal. It enforces formatting invariants the
+# model occasionally violates, and does not rewrite good copy: no truncation,
+# no rephrasing, no touching URLs.
+# ---------------------------------------------------------------------------
+
+#: The em dash and the horizontal bar, which renders identically to it. Both
+#: are banned outright in outreach copy.
+EM_DASH_CHARACTERS = ("\u2014", "\u2015")
+
+#: The en dash is banned only when spaced, which is the sentence-break usage.
+#: A tight en dash is a range ("9\u20135", "Mon\u2013Fri") and is left alone,
+#: because turning it into a comma would corrupt the meaning.
+EN_DASH = "\u2013"
+
+_EM_DASH_RE = re.compile(r"\s*[\u2014\u2015]\s*")
+_SPACED_EN_DASH_RE = re.compile(r"\s+\u2013\s+")
+
+#: A dash following sentence punctuation is redundant rather than a joiner.
+_PUNCT_THEN_COMMA_RE = re.compile(r"([,.;:!?])\s*,\s+")
+
+_REPEATED_SPACE_RE = re.compile(r"[ \t]{2,}")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"[ \t]+([,.;:!?])")
+
+#: Two dashes in a row leave two commas in a row.
+_REPEATED_COMMA_RE = re.compile(r",(?:\s*,)+")
+#: A dash opening or closing the text leaves a dangling comma.
+_EDGE_COMMA_RE = re.compile(r"^[\s,]+|[\s,]+$")
+
+
+def contains_em_dash(text: Any) -> bool:
+    """Does this text contain a banned dash character?"""
+    body = str(text or "")
+
+    if any(dash in body for dash in EM_DASH_CHARACTERS):
+        return True
+
+    return bool(_SPACED_EN_DASH_RE.search(body))
+
+
+def sanitize_outreach_copy(text: Any) -> str:
+    """
+    Enforce BruceTech's outreach formatting invariants on generated copy.
+
+    One invariant today: no em dashes, ever, in anything the pipeline writes
+    as outreach. Every em dash becomes ", ":
+
+        "Hi Matt - I saw your post."        ->  "Hi Matt, I saw your post."
+        "works well-especially with a CRM"  ->  "works well, especially with a CRM"
+
+    A comma is used uniformly rather than picking between "," and "." per
+    sentence. Guessing wrong in the other direction produces a fragment
+    ("That setup can work well. Especially if...") or a lowercase sentence
+    start, both of which read worse than a comma splice, and a deterministic
+    rule is worth more here than a clever one.
+
+    Whitespace is tidied so a replacement cannot leave a double space, a space
+    before punctuation, or a comma stacked on existing punctuation. Nothing
+    else is altered: URLs, wording, length, hyphens, and every other character
+    survive untouched.
+
+    Returns an empty string for empty input, so a blank stays blank.
+    """
+    body = str(text or "")
+    if not body.strip():
+        return ""
+
+    body = _EM_DASH_RE.sub(", ", body)
+    body = _SPACED_EN_DASH_RE.sub(", ", body)
+
+    # "well., especially" -> "well, especially"
+    body = _PUNCT_THEN_COMMA_RE.sub(r"\1 ", body)
+
+    body = _REPEATED_COMMA_RE.sub(",", body)
+    body = _REPEATED_SPACE_RE.sub(" ", body)
+    body = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", body)
+
+    # A dash at the very start or end of the copy leaves a dangling comma,
+    # which is worse than the dash was. Degenerate input, tidy output.
+    body = _EDGE_COMMA_RE.sub("", body)
+
+    return body.strip()
+
+
 def normalize_facebook_url(url: Any) -> str:
     """
     Return a canonical form of a Facebook URL.
