@@ -15,6 +15,68 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Fixed — a spend limit was rationing free deterministic evaluation
+
+Found by the Blue Collar Millionaire live run, Apify run `BnHEoWoDCZDPnM8iY`
+(dataset `MiUEsgX1KSeiGuUyH`, 50 posts) on 2026-08-19. Attribution and
+scraper-run linkage were correct on all 50. Only **25** received deterministic
+Python evaluation, and one of the 25 left unevaluated was a strong lead.
+
+`fetch_ai_queue` sized its window as `AI_BATCH_LIMIT * 5`. The run set
+`AI_BATCH_LIMIT=5`, so the window was 25. A limit that exists to cap OpenAI
+spend was silently rationing evaluation, which costs nothing but regex.
+
+The architecture is now explicit:
+
+```
+every current-run record
+    → deterministic Python evaluation   (free, unbounded for this run)
+    → eligible candidates sorted by intent and score
+    → AI_BATCH_LIMIT caps OPENAI CALLS ONLY
+```
+
+`PREFILTER_SCAN_LIMIT` (default 200) is a new, separate setting that bounds
+the *backlog* read. The current run's own imports are fetched by record ID in
+chunks and evaluated in full however many there are, so neither the scan limit
+nor an Airtable page boundary nor result ordering can hide one.
+
+`AI_BATCH_LIMIT` is unchanged in meaning and still caps calls at 5 when set
+to 5 — now over a queue of 50 rather than a queue of 25.
+
+### Fixed — four Blue Collar misclassifications
+
+**Deliberation was not an implementation request.** An electrical contractor
+"looking at ways to systemize my customer and job intake" who was "considering
+setting up some workflows and forms" through Microsoft 365 — naming
+`microsoft_365`, `workflow_automation`, and `crm` — classified as `UNRELATED`
+with `NO_BUYING_INTENT`. Every implementation pattern required a decision
+already made. `IMPLEMENTATION_EXPLORATION_PATTERNS` now recognise deliberation,
+gated on operator context and checked after every explicit intent so research
+stays research. Isolated "forms", "workflow", or "system" are never enough.
+
+**An owner who could not sell had no intent.** A surface-restoration startup
+whose founders were "not in a position to properly market and sell" and were
+"leaning towards paid lead generation" had no intent at all.
+`GROWTH_PAIN_PATTERNS` classify this as `BUSINESS_PAIN`, but only alongside
+adjacent-growth evidence *and* operator context — all three, or nothing.
+
+**Business telephony did not exist.** A telephony denial-of-service attack
+against a RingCentral IVR matched no BruceTech service. A new
+`business_telephony` category covers RingCentral, 8x8, Dialpad, Nextiva,
+Vonage, VoIP, SIP trunking, PBX, IVR, auto attendants, and call routing, with
+IT-incident language (spoofing, denial of service, "under attack", "keep
+getting fake calls") added to `BUSINESS_PAIN_PATTERNS`. Consumer-grade
+phrasing — "spam calls", "robocall" — sits in the weak tier and needs
+corroboration, so a personal phone complaint is not a lead.
+
+**Software comparison held.** The pool builder comparing JobTread, Pool Studio
+and Vip3D stays `TOOL_RESEARCH`: research outranks the new deliberation path,
+and tool research is never auto-contacted.
+
+All twelve correctly-rejected Blue Collar posts — financing, tax, licensing,
+bonuses, business sales, insurance, equity, growth chat, promotions, equipment
+— are fixtures asserting they stay rejected.
+
 ### Fixed — qualification recall was too low to find real leads
 
 Found by the first fresh scrape, Apify run `Q3Ix6zmHrEDhgiQGf` (dataset

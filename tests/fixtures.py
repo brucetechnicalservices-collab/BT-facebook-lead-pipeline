@@ -278,6 +278,150 @@ MEDSPA_CANDIDATE_FIXTURES = {
 
 
 # ---------------------------------------------------------------------------
+# The 2026-08-19 Blue Collar Millionaire live run (Apify run
+# BnHEoWoDCZDPnM8iY, dataset MiUEsgX1KSeiGuUyH, 50 posts).
+#
+# Attribution worked again. Two things did not: only 25 of the 50 fresh
+# imports were evaluated at all (the queue window was AI_BATCH_LIMIT * 5), and
+# four of the posts that were evaluated were misclassified.
+#
+# These four are the exact live posts, lightly sanitised.
+# ---------------------------------------------------------------------------
+
+#: Deliberation, not decision. Named Microsoft 365, workflow automation and
+#: CRM, scored 58, and was thrown away as UNRELATED / NO_BUYING_INTENT.
+ELECTRICAL_M365_INTAKE = (
+    "Customer intake and service requests\n\n"
+    "As a small electrical contractor, most of my revenue comes from service "
+    "work. I am looking at ways to systemize my customer and job intake.\n\n"
+    "I know a lot of people utilize CRMs such as service titan, jobber, house "
+    "call. But being that I already have access to Microsoft 365, I am "
+    "considering setting up some workflows and forms through that.\n\n"
+    "Is there a more streamline/professional way to handle all of this, or is "
+    "everyone just doing it by phone and text? Ultimately I want to make "
+    "things as simple and efficient as possible for the customer."
+)
+
+#: An owner who cannot reach his own customers, asking about the thing that
+#: fixes it. This one was never evaluated at all -- it sat beyond the 25.
+SURFACE_RESTORATION_LEAD_GEN = (
+    "Looking to take the next step and launch a service based business in "
+    "surface restoration. I have the technical side handled but physically "
+    "selling jobs is new to me.\n\n"
+    "Am I looking at hiring a sales manager and investing into some lead "
+    "generation? My partner and I are both technicians and neither of us are "
+    "in a position to properly market and sell to our target customer "
+    "base.\n\n"
+    "We're leaning towards paid lead generation to get the phone ringing but "
+    "I don't know where to start."
+)
+
+#: Genuine tool research. Useful operator intelligence, never outreach.
+POOL_BUILDER_SOFTWARE_STACK = (
+    "Launching a new pool division and trying to get our software stack "
+    "sorted. What apps, software or websites do people recommend for pool "
+    "design, estimating and job costing, scheduling, project management and "
+    "customer proposals?\n\n"
+    "I've been looking at Pool Studio and Vip3D for design and JobTread for "
+    "the job management side. Curious what everyone actually uses day to day."
+)
+
+#: A business phone system under attack. Previously NO_SERVICE_MATCH.
+RINGCENTRAL_TELEPHONY_ATTACK = (
+    "Has anyone delt with a telephony dial of services attack? We keep "
+    "getting fake calls sent to gmb and it's affecting our LSA ranking.\n\n"
+    "They are spoofing real local numbers, not getting past the ivr on our "
+    "RingCentral system and every time I change my gmb number they catch on "
+    "within a day. Our whole phone system is basically under attack and I "
+    "don't know who to call about it."
+)
+
+BLUE_COLLAR_CANDIDATE_FIXTURES = {
+    "ELECTRICAL_M365_INTAKE": ELECTRICAL_M365_INTAKE,
+    "SURFACE_RESTORATION_LEAD_GEN": SURFACE_RESTORATION_LEAD_GEN,
+    "POOL_BUILDER_SOFTWARE_STACK": POOL_BUILDER_SOFTWARE_STACK,
+    "RINGCENTRAL_TELEPHONY_ATTACK": RINGCENTRAL_TELEPHONY_ATTACK,
+}
+
+# --- Correctly rejected in the same run, and must stay rejected -------------
+
+CARGO_VAN_LENDER = (
+    "Anyone know a good lender for a cargo van? I own a small contracting "
+    "company and need financing for another vehicle this quarter."
+)
+
+EQUIPMENT_FINANCING = (
+    "Looking at equipment financing for a new skid steer. What are the banks "
+    "looking for these days from a small construction company?"
+)
+
+TAX_STRATEGIST_REQUEST = (
+    "I own a landscaping business. Anyone have a good tax strategist they "
+    "recommend for S-corp planning?"
+)
+
+TRADE_LICENSING_QUESTION = (
+    "I run a small electrical company. What licensing do I need to work "
+    "across provincial lines, anyone been through this?"
+)
+
+EMPLOYEE_BONUS_STRUCTURE = (
+    "I own a plumbing business with 12 employees. How do you all structure "
+    "employee bonuses to keep guys motivated?"
+)
+
+BUYING_A_BUSINESS = (
+    "Thinking about buying an existing HVAC business. What should I be "
+    "looking at in their books before I make an offer?"
+)
+
+INSURANCE_AGENT_REQUEST = (
+    "I run a roofing company and need a new insurance agent, anyone have "
+    "someone good for commercial general liability?"
+)
+
+BUSINESS_EQUITY_ADVICE = (
+    "I own a small business and I'm considering selling equity to a partner. "
+    "Any advice on valuation for a service company?"
+)
+
+GENERAL_GROWTH_QUESTION = (
+    "I own a small contracting company. How did everyone get from one crew "
+    "to three? Just looking for general growth advice."
+)
+
+PROMOTIONAL_FINANCE_POST = (
+    "We help contractors get approved for equipment financing in 24 hours. "
+    "DM me for a free consultation, limited time rates!"
+)
+
+HEALTH_COACH_PROMOTION = (
+    "Health coach here! I help blue collar business owners lose weight "
+    "without giving up beer. Book a call with me, limited spots."
+)
+
+TRAILER_SIZE_QUESTION = (
+    "What size trailer is everyone running for a two man landscaping crew? "
+    "Looking at a 7x14 but not sure."
+)
+
+BLUE_COLLAR_NOISE_FIXTURES = {
+    "CARGO_VAN_LENDER": CARGO_VAN_LENDER,
+    "EQUIPMENT_FINANCING": EQUIPMENT_FINANCING,
+    "TAX_STRATEGIST_REQUEST": TAX_STRATEGIST_REQUEST,
+    "TRADE_LICENSING_QUESTION": TRADE_LICENSING_QUESTION,
+    "EMPLOYEE_BONUS_STRUCTURE": EMPLOYEE_BONUS_STRUCTURE,
+    "BUYING_A_BUSINESS": BUYING_A_BUSINESS,
+    "INSURANCE_AGENT_REQUEST": INSURANCE_AGENT_REQUEST,
+    "BUSINESS_EQUITY_ADVICE": BUSINESS_EQUITY_ADVICE,
+    "GENERAL_GROWTH_QUESTION": GENERAL_GROWTH_QUESTION,
+    "PROMOTIONAL_FINANCE_POST": PROMOTIONAL_FINANCE_POST,
+    "HEALTH_COACH_PROMOTION": HEALTH_COACH_PROMOTION,
+    "TRAILER_SIZE_QUESTION": TRAILER_SIZE_QUESTION,
+}
+
+
+# ---------------------------------------------------------------------------
 # Supporting fixtures
 # ---------------------------------------------------------------------------
 
@@ -326,6 +470,8 @@ ALL_FIXTURES = {
     "BOULEVARD_SWITCHING_RESEARCH": BOULEVARD_SWITCHING_RESEARCH,
     "WEB_DESIGN_SELLER_CTA": WEB_DESIGN_SELLER_CTA,
     **MEDSPA_NOISE_FIXTURES,
+    **BLUE_COLLAR_CANDIDATE_FIXTURES,
+    **BLUE_COLLAR_NOISE_FIXTURES,
     "PROMOTIONAL_AGENCY": PROMOTIONAL_AGENCY,
     "JOB_SEEKER": JOB_SEEKER,
     "API_INTEGRATION": API_INTEGRATION,

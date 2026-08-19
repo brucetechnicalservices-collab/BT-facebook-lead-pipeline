@@ -45,6 +45,9 @@ Word-boundary service matching (Python)
       │   named · described (operational failure) · adjacent (growth)
       │   physical/clinical goods → no weak match
       ▼
+Every current-run record evaluated ─── by record ID, unbounded
+      │                                (backlog capped at PREFILTER_SCAN_LIMIT)
+      ▼
 Prefilter Score ─── gates the AI call, orders the queue
       │             (general advice and unrelated stop here, for free)
       ▼
@@ -301,8 +304,29 @@ inferred one.
 | Basis | Rule | Example |
 | --- | --- | --- |
 | `named` | The post uses BruceTech vocabulary | "the whole GoHighLevel setup" |
-| `described` | It describes an operational systems failure, from a business with commercial context | "200 units missing and no systems in place" |
+| `described` | It describes an operational systems failure, from a business with operator context | "200 units missing and no systems in place" |
 | `adjacent` | It asks a provider for measurable client acquisition, which BruceTech serves through the site, SEO, booking flow and CRM underneath | "a marketing agency to get me patients" |
+
+### Deliberation counts as intent
+
+The implementation patterns want a decision already made — "need help setting
+up", "looking to migrate". An owner working out *how* phrases it as
+deliberation, and that is exactly when a conversation is useful:
+
+> "I am looking at ways to systemize my customer and job intake… being that I
+> already have access to Microsoft 365, I am considering setting up some
+> workflows and forms through that. Is there a more streamline/professional
+> way to handle all of this?"
+
+That live post named Microsoft 365, workflow automation, and CRM, and was
+still discarded as `UNRELATED`. Deliberation now classifies as
+`IMPLEMENTATION_REQUEST`, gated on operator context and checked *after* every
+explicit intent — so a research question stays research. Isolated mentions of
+"forms", "workflow", or "system" are never sufficient.
+
+The same gating carries a growth-pain path: an owner who says they cannot
+market or sell, alongside an adjacent-growth request, is `BUSINESS_PAIN`. All
+three are required — any one alone is ordinary business chatter.
 
 `described` and `adjacent` never produce a *strong* match. They credit the
 categories BruceTech would actually deliver and lean on the model for the
@@ -315,6 +339,12 @@ creators, photographers, PR, branding, print — is excluded from `adjacent`
 unless it also names something BruceTech builds.
 
 ### The physical-goods guard
+
+Business phone systems are BruceTech work: RingCentral, 8x8, Dialpad, VoIP,
+SIP trunking, PBX, IVR, and the abuse that targets them all match
+`business_telephony`. Consumer-grade phrasing — "spam calls", "robocall" —
+sits in the weak tier and needs corroboration, so a personal phone complaint
+is not a lead.
 
 BruceTech does not sell, service, or advise on physical clinical equipment. A
 post shopping for goods gets no weak-signal service match, whatever
@@ -341,21 +371,43 @@ rejects nothing on its own.
 
 ## The AI queue
 
-Each run fetches candidates in three phases:
+**Fetching is not rationing.** Everything fetched here gets deterministic
+evaluation, which is regex over post text and costs nothing. The spend limit
+is applied later and applies to *calls*, not records:
 
-1. **Every** record where `Human Decision = Approve` and `AI Status` is blank
+```
+every current-run record
+    → deterministic Python evaluation   (free, unbounded for this run)
+    → eligible candidates sorted by intent and score
+    → AI_BATCH_LIMIT caps OPENAI CALLS ONLY
+```
+
+Each run fetches candidates in four phases:
+
+1. **Every** record this run imported, fetched by record ID.
+2. **Every** record where `Human Decision = Approve` and `AI Status` is blank
    or `Pending`.
-2. **Every** record where `Prequalification = Send to AI` and `AI Status` is
+3. **Every** record where `Prequalification = Send to AI` and `AI Status` is
    blank or `Pending`.
-3. The newest remaining unprocessed records, sorted server-side by post
-   time, to fill the window (`AI_BATCH_LIMIT × 5`).
+4. The newest remaining unprocessed backlog, sorted server-side by post time,
+   up to `PREFILTER_SCAN_LIMIT` (default 200).
 
-Phases 1 and 2 exist so neither your approvals nor the formula's selection is
-lost behind an arbitrary page of the backlog. Phase 1 ignores
+Phase 1 is unbounded on purpose: a run that imports 50 posts evaluates all 50,
+and a run that imports 300 evaluates all 300. Fetching by record ID also means
+no Airtable page boundary or result ordering can hide one of them.
+
+Phases 2 and 3 exist so neither your approvals nor the formula's selection is
+lost behind an arbitrary page of the backlog. Phase 2 ignores
 `REQUIRE_AIRTABLE_PREQUALIFICATION`: that flag narrows which machine-eligible
 records are worth reading, and you have already answered that question by
-approving the record. Phase 3 is sorted because truncating an unsorted
+approving the record. Phase 4 is sorted because truncating an unsorted
 Airtable query returns records in table order, not by relevance.
+
+> **Fixed 2026-08-19.** The queue window used to be `AI_BATCH_LIMIT × 5`. A
+> live run with `AI_BATCH_LIMIT=5` therefore evaluated 25 of its 50 fresh
+> imports and never looked at the other 25 — one of which was a strong lead.
+> `PREFILTER_SCAN_LIMIT` is now a separate setting, and the current run is
+> never governed by it.
 
 **`Prequalification` decides what is looked at, never what is sent to the
 model.** It is an Airtable formula computed from `Request Signal`,
@@ -500,7 +552,8 @@ AI processing and recovery:
 | `OPENAI_MAX_OUTPUT_TOKENS` | `2500` | Output token ceiling |
 | `OPENAI_MAX_ATTEMPTS` | `3` | Retries per post, within one run |
 | `OPENAI_RETRY_DELAY_SECONDS` | `5` | Base retry delay |
-| `AI_BATCH_LIMIT` | `20` | Max AI calls per run |
+| `AI_BATCH_LIMIT` | `20` | Max **OpenAI calls** per run. Never limits how many records are evaluated |
+| `PREFILTER_SCAN_LIMIT` | `200` | Max **backlog** records pulled in for deterministic evaluation. Never limits the current run's own imports |
 | `MAX_POST_CHARS` | `8000` | Post text truncation |
 | `RETRY_AI_ERRORS` | `true` | Re-queue records whose last attempt failed |
 | `AI_ERROR_MAX_ATTEMPTS` | `3` | Total attempts per record, across runs |

@@ -138,7 +138,23 @@ def require_env(name: str) -> str:
 
 OPENAI_MODEL = env_str("OPENAI_MODEL", "gpt-5-mini")
 
+#: How many OpenAI calls one run may make. This is a *spend* limit and
+#: nothing else: it caps calls, never how many records are evaluated.
 AI_BATCH_LIMIT = env_int("AI_BATCH_LIMIT", 20)
+
+#: How many historical backlog records to pull in for deterministic
+#: evaluation each run.
+#:
+#: Deterministic evaluation is regex over post text -- effectively free. This
+#: limit exists only to bound the Airtable read against a table that now holds
+#: thousands of records, and is deliberately independent of AI_BATCH_LIMIT.
+#:
+#: Records imported by the current run are NOT governed by this limit. They
+#: are fetched by record ID and evaluated in full, however many there are --
+#: see fetch_ai_queue. Before 2026-08-19 the queue window was
+#: ``AI_BATCH_LIMIT * 5``, so a live run with AI_BATCH_LIMIT=5 evaluated 25 of
+#: its 50 freshly imported posts and silently ignored the rest.
+PREFILTER_SCAN_LIMIT = env_int("PREFILTER_SCAN_LIMIT", 200)
 
 #: Minimum score for Qualified. Raised from 55 to 65.
 QUALIFICATION_THRESHOLD = env_int(
@@ -1301,6 +1317,42 @@ def build_prequalified_queue_formula() -> str:
     )
 
 
+def build_record_id_formula(record_ids: Sequence[str]) -> str:
+    """Match an explicit set of records by their Airtable record ID."""
+    clauses = ",".join(f"RECORD_ID()='{rid}'" for rid in record_ids)
+    return (
+        "AND("
+        f"OR({clauses}),"
+        f"{build_unprocessed_status_clause()}"
+        ")"
+    )
+
+
+#: Record IDs per RECORD_ID() query. Airtable's formula parameter is a URL
+#: query string, so a 200-post scrape has to be asked for in pieces.
+RECORD_ID_QUERY_CHUNK = 40
+
+
+def fetch_records_by_id(record_ids: Sequence[str]) -> list[dict[str, Any]]:
+    """
+    Fetch specific records by ID, in chunks, preserving nothing about order.
+
+    Used for the current run's own imports so their evaluation cannot depend
+    on where they happen to fall in an Airtable page.
+    """
+    records: list[dict[str, Any]] = []
+
+    for chunk in chunks(list(record_ids), RECORD_ID_QUERY_CHUNK):
+        records.extend(
+            list_airtable_records(
+                formula=build_record_id_formula(chunk),
+                fields=AI_QUEUE_FIELDS,
+            )
+        )
+
+    return records
+
+
 def build_human_approved_queue_formula() -> str:
     """Records a person set Human Decision = 'Approve' on."""
     return (
@@ -1313,53 +1365,77 @@ def build_human_approved_queue_formula() -> str:
     )
 
 
-def fetch_ai_queue() -> list[dict[str, Any]]:
+def fetch_ai_queue(
+    current_run_ids: Sequence[str] = (),
+) -> list[dict[str, Any]]:
     """
     Retrieve Airtable records that have never been processed by the AI.
 
-    Fetched in three phases so neither a person's approvals nor the formula's
-    selection is lost behind an arbitrary page of the backlog:
+    Everything fetched here gets deterministic evaluation. Fetching is not
+    rationing: the OpenAI spend limit is applied later, in process_ai_queue,
+    and applies to *calls*, not to records.
 
-    1. Every record a human set Human Decision = 'Approve' on.
-    2. Every record the Airtable formula marks 'Send to AI'.
-    3. The newest remaining unprocessed records, to top up the window.
+    Four phases, in priority order:
 
-    Phases 1 and 2 decide what is *looked at*, never what is sent to the
-    model: every record from every phase goes through the same deterministic
-    prefilter afterwards, and the non-overridable gate in process_ai_queue()
-    applies to all of them equally.
+    1. Every record imported by this run, fetched by record ID.
+    2. Every record a human set Human Decision = 'Approve' on.
+    3. Every record the Airtable formula marks 'Send to AI'.
+    4. The newest remaining unprocessed backlog, up to PREFILTER_SCAN_LIMIT.
 
-    Phase 1 ignores REQUIRE_AIRTABLE_PREQUALIFICATION. That flag narrows which
-    *machine-eligible* records are worth reading; a person who approved a
-    record has already answered that question.
+    Phase 1 is the one that matters for a live scrape, and it is unbounded on
+    purpose. A run that imports 50 posts evaluates all 50. Before
+    2026-08-19 there was no phase 1 at all: the whole queue was capped at
+    ``AI_BATCH_LIMIT * 5``, so a run with AI_BATCH_LIMIT=5 evaluated 25 of its
+    50 fresh imports and never looked at the other 25 -- one of which was a
+    strong lead.
 
-    Phase 3 is sorted server-side by post time. Without that sort, Airtable
-    returns records in table order, so truncating to a window produced an
-    arbitrary slice and the prioritisation below could only reorder that
-    slice.
+    Fetching this run's imports by ID also removes any dependence on Airtable
+    result ordering. Phase 4 is sorted server-side by post time because
+    truncating an unsorted query returns records in table order, so a window
+    over it is an arbitrary slice.
+
+    Phases 1-3 decide what is *looked at*, never what is sent to the model.
+    Every record from every phase goes through the same deterministic
+    prefilter, and the non-overridable gate in process_ai_queue applies to all
+    of them equally.
     """
-    approved = list_airtable_records(
-        formula=build_human_approved_queue_formula(),
-        fields=AI_QUEUE_FIELDS,
-    )
+    selected: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
 
-    if approved:
+    def take(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Add records that are not already selected."""
+        fresh = [
+            record
+            for record in records
+            if record.get("id") and record.get("id") not in seen_ids
+        ]
+        seen_ids.update(record["id"] for record in fresh)
+        selected.extend(fresh)
+        return fresh
+
+    if current_run_ids:
+        imported = take(fetch_records_by_id(current_run_ids))
         print(
-            f"Found {len(approved)} records a human approved.",
+            f"Evaluating {len(imported)} of this run's "
+            f"{len(current_run_ids)} imported records.",
             flush=True,
         )
 
-    seen_ids = {record.get("id") for record in approved}
+    approved = take(
+        list_airtable_records(
+            formula=build_human_approved_queue_formula(),
+            fields=AI_QUEUE_FIELDS,
+        )
+    )
+    if approved:
+        print(f"Found {len(approved)} records a human approved.", flush=True)
 
-    prequalified = [
-        record
-        for record in list_airtable_records(
+    prequalified = take(
+        list_airtable_records(
             formula=build_prequalified_queue_formula(),
             fields=AI_QUEUE_FIELDS,
         )
-        if record.get("id") not in seen_ids
-    ]
-
+    )
     if prequalified:
         print(
             f"Found {len(prequalified)} records the Airtable formula marks "
@@ -1367,34 +1443,34 @@ def fetch_ai_queue() -> list[dict[str, Any]]:
             flush=True,
         )
 
-    selected = approved + prequalified
-    seen_ids.update(record.get("id") for record in prequalified)
-    window = max(AI_BATCH_LIMIT * 5, AI_BATCH_LIMIT)
-    remaining = max(window - len(selected), 0)
+    remaining = max(PREFILTER_SCAN_LIMIT - len(selected), 0)
 
-    backlog: list[dict[str, Any]] = []
     if remaining and not REQUIRE_AIRTABLE_PREQUALIFICATION:
-        backlog = [
-            record
-            for record in list_airtable_records(
-                formula=build_ai_queue_formula(),
-                fields=AI_QUEUE_FIELDS,
-                max_records=remaining + len(selected),
-                sort_field=FIELD_TIME,
-                sort_direction="desc",
-            )
-            if record.get("id") not in seen_ids
-        ][:remaining]
+        backlog = take(
+            [
+                record
+                for record in list_airtable_records(
+                    formula=build_ai_queue_formula(),
+                    fields=AI_QUEUE_FIELDS,
+                    max_records=remaining + len(selected),
+                    sort_field=FIELD_TIME,
+                    sort_direction="desc",
+                )
+                if record.get("id") not in seen_ids
+            ][:remaining]
+        )
 
         print(
-            f"Topped up with {len(backlog)} newest unprocessed records.",
+            f"Topped up with {len(backlog)} newest unprocessed backlog "
+            f"records (scan limit {PREFILTER_SCAN_LIMIT}).",
             flush=True,
         )
 
-    records = selected + backlog
-
-    print(f"Found {len(records)} unprocessed Airtable records.", flush=True)
-    return records
+    print(
+        f"Found {len(selected)} records for deterministic evaluation.",
+        flush=True,
+    )
+    return selected
 
 
 def prioritize_ai_queue(
@@ -2473,7 +2549,7 @@ def main() -> None:
         print("No new Facebook posts were imported.", flush=True)
 
     # 3. Prioritise the backlog, then qualify.
-    ai_records = fetch_ai_queue()
+    ai_records = fetch_ai_queue(created_record_ids)
     prioritized = prioritize_ai_queue(ai_records, set(created_record_ids))
     process_ai_queue(prioritized, summary=summary)
 

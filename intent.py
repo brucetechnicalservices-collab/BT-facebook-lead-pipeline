@@ -227,6 +227,14 @@ STRONG_SERVICE_TERMS: dict[str, tuple[str, ...]] = {
     "chatbots": (
         "chatbot", "chat bot", "live chat", "messenger bot",
     ),
+    "business_telephony": (
+        "ringcentral", "ring central", "8x8", "dialpad", "nextiva", "vonage",
+        "zoom phone", "goto connect", "grasshopper", "ooma",
+        "voip", "voice over ip", "sip trunk", "sip trunking", "pbx",
+        "ivr", "auto attendant", "phone tree", "call routing",
+        "call forwarding", "softphone", "business phone system",
+        "phone system", "telephony", "toll free number", "did number",
+    ),
     "business_process_consulting": (
         "process mapping", "digitize", "digitise", "digital transformation",
         "paperless", "spreadsheet hell", "double entry", "data entry",
@@ -250,6 +258,13 @@ WEAK_SERVICE_TERMS: dict[str, tuple[str, ...]] = {
         "scheduling", "appointment", "booking", "follow up", "follow-up",
     ),
     "business_process_consulting": ("paperwork", "manual process", "admin"),
+    # Telephony abuse language. Real BruceTech work when it is happening to a
+    # business phone system, and an ordinary consumer complaint otherwise:
+    # "my personal phone keeps getting spam calls" is not a lead.
+    "business_telephony": (
+        "caller id spoofing", "call spoofing", "spoofed calls", "robocall",
+        "spam calls", "fake calls", "call volume",
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -313,6 +328,73 @@ OPERATIONS_PAIN_PATTERNS: tuple[str, ...] = (
 _OPERATIONS_PAIN_RE = tuple(
     re.compile(pattern, re.IGNORECASE) for pattern in OPERATIONS_PAIN_PATTERNS
 )
+
+# ---------------------------------------------------------------------------
+# Exploratory implementation
+#
+# The implementation patterns above all require someone to have decided:
+# "need help setting up", "looking to migrate", "want to automate". A business
+# owner working out *how* to solve something phrases it as deliberation:
+#
+#   "I am looking at ways to systemize my customer and job intake ... being
+#    that I already have access to Microsoft 365, I am considering setting up
+#    some workflows and forms through that. Is there a more streamline /
+#    professional way to handle all of this?"
+#
+# That is a live Blue Collar post from 2026-08-19. It named Microsoft 365,
+# workflow automation, and CRM, scored 58, and was thrown away as UNRELATED
+# with NO_BUYING_INTENT, because deliberation is not decision.
+#
+# Deliberation about implementing something is worth a conversation. These
+# patterns are gated on operator context and are checked *after* every
+# explicit intent, so a research question stays research.
+# ---------------------------------------------------------------------------
+
+#: The thing being considered has to be an implementation, not a purchase.
+IMPLEMENTATION_EXPLORATION_PATTERNS: tuple[str, ...] = (
+    r"(?:looking|look) (?:at|into) (?:ways|options|how) to\s+"
+    r"(?:\w+\s+){0,2}"
+    r"(?:systemi[sz]e|systemati[sz]e|streamline|automate|digiti[sz]e|"
+    r"organi[sz]e|simplify|standardi[sz]e|centrali[sz]e|manage|handle|"
+    r"track|improve)",
+    r"(?:considering|thinking about|exploring|weighing|debating|"
+    r"trying to figure out (?:how|whether))\s+"
+    r"(?:\w+\s+){0,3}"
+    r"(?:set(?:ting)? ?up|build(?:ing)?|implement(?:ing)?|automat(?:e|ing)|"
+    r"integrat(?:e|ing)|migrat(?:e|ing)|systemi[sz]|streamlin)",
+    r"(?:want|need|trying) to (?:systemi[sz]e|systemati[sz]e|standardi[sz]e|"
+    r"centrali[sz]e)",
+    # "a more streamline/professional way to handle all of this" -- the
+    # slash is how the live post wrote it.
+    r"(?:more|better|a) (?:streamline[d]?|streamlined|professional|"
+    r"efficient|organi[sz]ed|automated|systemi[sz]ed)"
+    r"(?:[\s/]+(?:and\s+)?\w+)*[\s/]+"
+    r"way to (?:handle|manage|do|run|track|process)",
+    r"(?:customer|client|job|service|work|lead|order) intake",
+    r"(?:intake|onboarding|dispatch|quoting|invoicing|scheduling) "
+    r"(?:process|workflow|system|forms?)",
+    r"(?:set(?:ting)? ?up|create|creating|build|building) "
+    r"(?:some |a few |custom )?(?:workflows?|forms?|automations?) "
+    r"(?:through|in|with|using)",
+    r"(?:systemi[sz]e|systemati[sz]e) (?:my|our) "
+    r"(?:customer|client|job|service|intake|business|process)",
+)
+
+_IMPLEMENTATION_EXPLORATION_RE = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in IMPLEMENTATION_EXPLORATION_PATTERNS
+)
+
+
+def implementation_exploration_evidence(text: Any) -> list[str]:
+    """Return evidence that the author is working out how to build something."""
+    body = str(text or "")
+    return [
+        p.pattern[:60]
+        for p in _IMPLEMENTATION_EXPLORATION_RE
+        if p.search(body)
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Adjacent digital growth
@@ -427,6 +509,35 @@ def is_shopping_for_physical_goods(text: Any) -> bool:
     """Is this post shopping for equipment, devices, or clinical product?"""
     body = str(text or "")
     return any(p.search(body) for p in _PHYSICAL_GOODS_RE)
+
+
+#: An owner saying, in plain words, that they cannot reach their own
+#: customers. On its own this is a confession, not a lead -- it is only an
+#: intent alongside adjacent-growth evidence and operator context.
+GROWTH_PAIN_PATTERNS: tuple[str, ...] = (
+    r"(?:not|neither|none) (?:of us )?(?:are |is |am )?"
+    r"(?:in a position|able|equipped|set up|ready) to\s+"
+    r"(?:\w+\s+){0,3}(?:market|sell|advertise|promote)",
+    r"(?:selling|sales|marketing|advertising)\b[^.!?]{0,40}"
+    r"(?:is|are) (?:new to me|new to us|not my|not our|isn'?t my|"
+    r"outside my|outside our|a weak)",
+    r"(?:leaning towards|planning on|looking at|thinking about) "
+    r"(?:paid |some )?(?:lead gen|lead generation|ads|advertising|marketing)",
+    r"(?:don'?t|do not|dont) know where to start",
+    r"(?:get|getting) the phone(?:s)? ringing",
+    r"(?:no|not enough|struggling for) (?:new )?"
+    r"(?:leads?|customers?|clients?|patients?|work) coming in",
+)
+
+_GROWTH_PAIN_RE = tuple(
+    re.compile(p, re.IGNORECASE) for p in GROWTH_PAIN_PATTERNS
+)
+
+
+def growth_pain_evidence(text: Any) -> list[str]:
+    """Return evidence the author cannot reach their own customers."""
+    body = str(text or "")
+    return [p.pattern[:60] for p in _GROWTH_PAIN_RE if p.search(body)]
 
 
 def adjacent_growth_evidence(text: Any) -> list[str]:
@@ -774,6 +885,20 @@ BUSINESS_PAIN_PATTERNS: tuple[str, ...] = (
     r"(?:falling|slipping) through the cracks",
     r"double.?book",
     r"(?:losing|lost) (?:business|customers|clients|leads|jobs) because",
+    # IT and telephony incidents. Specific enough to stand without a context
+    # gate, and the prefilter still requires a service match alongside.
+    r"(?:denial of service|dial of service|ddos|dos attack)",
+    r"(?:under|being|getting) attack(?:ed)?",
+    r"(?:spoof|spoofing|spoofed) (?:real |local |our )?(?:numbers?|calls?|"
+    r"caller|phone)",
+    r"(?:fake|spam|fraudulent|junk) (?:calls?|numbers?|leads?|reviews?) "
+    r"(?:sent |coming |flooding |hitting )?(?:to|into|at|our|us)",
+    r"(?:keep|keeps) getting (?:fake|spam|spoofed|fraudulent|hacked|"
+    r"attacked|phished)",
+    r"(?:affecting|hurting|tanking|killing) (?:our|my) "
+    r"(?:lsa |google |gmb |local |search )?(?:ranking|listing|profile)",
+    r"(?:got|been|being) (?:hacked|phished|breached|compromised)",
+    r"(?:ransomware|phishing|malware) (?:attack|incident|hit)",
     r"(?:spending|wasting) (?:hours|so long|too long|all day)",
     r"no (?:good )?(?:way|system) to (?:track|manage|schedule|organize|organise)",
 )
@@ -871,6 +996,32 @@ def classify_intent(text: Any) -> IntentResult:
                 label=INTENT_LABELS[intent_type],
                 evidence=evidence,
             )
+
+    # Deliberation about building something. Checked after every explicit
+    # intent so a research question stays research, and gated on operator
+    # context so idle curiosity is not an implementation request.
+    exploration = implementation_exploration_evidence(body)
+    if exploration and _hits(body, _OPERATOR_COMPILED):
+        return IntentResult(
+            intent_type=INTENT_IMPLEMENTATION_REQUEST,
+            label=INTENT_LABELS[INTENT_IMPLEMENTATION_REQUEST],
+            evidence=exploration,
+        )
+
+    # An owner who cannot market or sell, asking about the thing that fixes
+    # it. Requires growth pain AND adjacent-growth evidence AND operator
+    # context: any one of the three alone is ordinary business chatter.
+    growth = growth_pain_evidence(body)
+    if (
+        growth
+        and adjacent_growth_evidence(body)
+        and _hits(body, _OPERATOR_COMPILED)
+    ):
+        return IntentResult(
+            intent_type=INTENT_BUSINESS_PAIN,
+            label=INTENT_LABELS[INTENT_BUSINESS_PAIN],
+            evidence=growth,
+        )
 
     # Operational systems failure described in plain English, from a business
     # with credible commercial context. "Two hundred units missing and no
@@ -1006,6 +1157,16 @@ OPERATOR_CONTEXT_TERMS: tuple[str, ...] = (
     "studio owner", "business owner", "owner here", "new manager at",
     "i manage", "we manage", "i opened", "we opened", "opened my own",
     "opened our own", "i started", "we started",
+    # Blue Collar live run: "As a small electrical contractor, most of my
+    # revenue comes from service work" and "My partner and I are both
+    # technicians" are owner framings the list did not previously carry.
+    "as a small", "as the owner", "as a new owner", "i'm a small",
+    "im a small", "i am a small", "my revenue", "our revenue",
+    "my partner and i", "my business partner", "our target customer",
+    "my jobs", "our jobs", "my techs", "our techs", "my guys", "our guys",
+    "launch a service", "launching a service", "launch a business",
+    "launching a business", "start my own", "starting my own",
+    "start our own", "starting our own",
 )
 
 _OPERATOR_COMPILED = _compile_all(OPERATOR_CONTEXT_TERMS)

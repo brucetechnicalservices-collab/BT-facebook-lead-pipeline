@@ -356,6 +356,11 @@ SERVICE_CATEGORIES = (
     "integrations",
     "chatbots",
     "business_process_consulting",
+    # Business phone systems: VoIP platforms, IVR, SIP trunking, and the
+    # abuse that targets them. Added after a live Blue Collar post about a
+    # telephony denial-of-service attack against a RingCentral IVR matched no
+    # BruceTech service at all.
+    "business_telephony",
     "none",
 )
 
