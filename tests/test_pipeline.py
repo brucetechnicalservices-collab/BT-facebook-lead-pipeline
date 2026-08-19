@@ -354,31 +354,35 @@ def test_dry_run_reports_the_intended_decision(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# Human "Send to AI" selection
+# Queue ordering: human approval versus the Prequalification formula
+#
+# Prequalification is an Airtable *formula*. It orders the queue and nothing
+# more. Human Decision = Approve is the only human signal.
 # ---------------------------------------------------------------------------
 
-def flagged_record(record_id, *, text, days_old, flagged):
+def flagged_record(record_id, *, text, days_old, flagged=False, decision=None):
     entry = record(record_id, text=text, days_old=days_old)
     if flagged:
         entry["fields"][rp.FIELD_PREQUALIFICATION] = "Send to AI"
+    if decision:
+        entry["fields"][rp.FIELD_HUMAN_DECISION] = decision
     return entry
 
 
-def test_is_human_flagged_matches_case_insensitively():
-    assert rp.is_human_flagged({rp.FIELD_PREQUALIFICATION: "Send to AI"})
-    assert rp.is_human_flagged({rp.FIELD_PREQUALIFICATION: "send to ai "})
-    assert not rp.is_human_flagged({rp.FIELD_PREQUALIFICATION: "Skip"})
-    assert not rp.is_human_flagged({})
+def test_is_airtable_prequalified_matches_case_insensitively():
+    assert rp.is_airtable_prequalified({rp.FIELD_PREQUALIFICATION: "Send to AI"})
+    assert rp.is_airtable_prequalified({rp.FIELD_PREQUALIFICATION: "send to ai "})
+    assert not rp.is_airtable_prequalified({rp.FIELD_PREQUALIFICATION: "Skip"})
+    assert not rp.is_airtable_prequalified({})
 
 
-def test_human_flagged_records_are_processed_first():
-    """A curated selection outranks recency and prefilter score."""
+def test_human_approved_records_are_processed_first():
+    """An approved record outranks recency and prefilter score."""
     ordered = rp.prioritize_ai_queue(
         [
-            flagged_record("recNewStrong", text=STRONG_TEXT, days_old=1,
-                           flagged=False),
+            flagged_record("recNewStrong", text=STRONG_TEXT, days_old=1),
             flagged_record("recOldWeak", text=WEAK_TEXT, days_old=90,
-                           flagged=True),
+                           decision="Approve"),
         ],
         set(),
         now=NOW,
@@ -387,19 +391,51 @@ def test_human_flagged_records_are_processed_first():
     assert [r["id"] for r, _ in ordered] == ["recOldWeak", "recNewStrong"]
 
 
-def test_human_flagged_record_outranks_records_imported_this_run():
+def test_human_approved_record_outranks_records_imported_this_run():
     ordered = rp.prioritize_ai_queue(
         [
-            flagged_record("recImported", text=STRONG_TEXT, days_old=1,
-                           flagged=False),
-            flagged_record("recFlagged", text=WEAK_TEXT, days_old=30,
+            flagged_record("recImported", text=STRONG_TEXT, days_old=1),
+            flagged_record("recApproved", text=WEAK_TEXT, days_old=30,
+                           decision="Approve"),
+        ],
+        {"recImported"},
+        now=NOW,
+    )
+
+    assert [r["id"] for r, _ in ordered] == ["recApproved", "recImported"]
+
+
+def test_prequalification_formula_does_not_outrank_this_run_s_imports():
+    """
+    The formula is a machine tiebreaker. It must not push a stale, weak
+    record ahead of a fresh one the run just imported.
+    """
+    ordered = rp.prioritize_ai_queue(
+        [
+            flagged_record("recImported", text=STRONG_TEXT, days_old=1),
+            flagged_record("recFormula", text=WEAK_TEXT, days_old=30,
                            flagged=True),
         ],
         {"recImported"},
         now=NOW,
     )
 
-    assert [r["id"] for r, _ in ordered] == ["recFlagged", "recImported"]
+    assert [r["id"] for r, _ in ordered] == ["recImported", "recFormula"]
+
+
+def test_prequalification_formula_still_breaks_ties():
+    """Equal on every stronger key, the formula decides the order."""
+    ordered = rp.prioritize_ai_queue(
+        [
+            flagged_record("recPlain", text=WEAK_TEXT, days_old=2),
+            flagged_record("recFormula", text=WEAK_TEXT, days_old=2,
+                           flagged=True),
+        ],
+        set(),
+        now=NOW,
+    )
+
+    assert [r["id"] for r, _ in ordered] == ["recFormula", "recPlain"]
 
 
 def test_prequalified_formula_requires_send_to_ai_and_unprocessed():

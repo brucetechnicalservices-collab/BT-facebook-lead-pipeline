@@ -3,9 +3,11 @@ Regression tests for defects found in the pre-merge production readiness review.
 
 Four defects, all confirmed against running code before being fixed:
 
-1. A human's ``Send to AI`` override bypassed the prefilter but was then
-   vetoed by the same intent heuristic at decision time — after the OpenAI
-   call had been paid for.
+1. A human override bypassed the prefilter but was then vetoed by the same
+   intent heuristic at decision time — after the OpenAI call had been paid
+   for. (The *source* of that override was itself wrong, and was corrected
+   later: see tests/test_pre_ai_gating.py. These tests exercise the rule, and
+   pass ``human_override`` directly.)
 2. ``prefilter_post``'s early returns (too short, stale) reported the
    dataclass default ``UNRELATED`` without classifying, writing factually
    wrong intent diagnostics into Airtable.
@@ -147,10 +149,10 @@ def test_no_buying_intent_still_fires_on_general_advice():
 
 
 # ---------------------------------------------------------------------------
-# Defect 1 — a human's Send to AI override must survive the decision
+# Defect 1 — a human's Approve must survive the decision
 # ---------------------------------------------------------------------------
 
-def test_human_send_to_ai_override_is_not_vetoed_by_intent():
+def test_human_approve_override_is_not_vetoed_by_intent():
     """
     DEFECT: a reviewed record bypassed the prefilter, cost an OpenAI call, and
     was then hard-rejected by the very heuristic the human overrode.

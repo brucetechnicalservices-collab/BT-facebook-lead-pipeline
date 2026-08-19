@@ -47,8 +47,11 @@ Word-boundary service matching (Python)
 Prefilter Score ─── gates the AI call, orders the queue
       │             (general advice and unrelated stop here, for free)
       ▼
-Prioritised AI queue ─── Send to AI › this run › provider ›
-      │                  implementation › score › fresh › quiet
+Non-overridable gate ─── stale · no service match · promotional ·
+      │                  job seeker · resolved · too short → rejected free
+      ▼
+Prioritised AI queue ─── Approve › this run › provider › implementation ›
+      │                  prequalified › score › fresh › quiet
       ▼
 AI signal extraction ─── 24 structured signals, no score, no verdict
       │
@@ -156,10 +159,16 @@ that trips any of these is Rejected.
 | `SUPPRESSED_AUTHOR` | Author is in `SUPPRESSED_AUTHORS` |
 | `DISALLOWED_GROUP` | Group is in `DISALLOWED_GROUPS` |
 | `HUMAN_REJECTED` | A human set `Human Decision = Reject` |
+| `POST_TOO_SHORT` | Not enough text to evaluate |
 
-The last seven are decided in Python and are **never offered to the model** —
+The last eight are decided in Python and are **never offered to the model** —
 they are absent from the JSON schema enum. `STALE_POST` in particular is
 computed from the post timestamp and never trusted from the model.
+
+Only `NO_BUYING_INTENT`, `FUNDING_OR_FINANCE_REQUEST`, and `HIRING_UNRELATED`
+can be lifted by a human — they are the heuristic guesses a reviewer can see
+are wrong by reading the post. Every other code in this table is in
+`NON_OVERRIDABLE_HARD_REJECTIONS` and stands regardless of who approved what.
 
 ### Qualified vs Outreach Ready
 
@@ -286,29 +295,41 @@ in a busy thread still reaches the model; it just sorts lower.
 
 ## The AI queue
 
-Each run fetches candidates in two phases:
+Each run fetches candidates in three phases:
 
-1. **Every** record where `Prequalification = Send to AI` and `AI Status` is
+1. **Every** record where `Human Decision = Approve` and `AI Status` is blank
+   or `Pending`.
+2. **Every** record where `Prequalification = Send to AI` and `AI Status` is
    blank or `Pending`.
-2. The newest remaining unprocessed records, sorted server-side by post
+3. The newest remaining unprocessed records, sorted server-side by post
    time, to fill the window (`AI_BATCH_LIMIT × 5`).
 
-Phase 1 exists so a curated selection is never lost behind an arbitrary page
-of the backlog. Phase 2 is sorted because truncating an unsorted Airtable
-query returns records in table order, not by relevance.
+Phases 1 and 2 exist so neither your approvals nor the formula's selection is
+lost behind an arbitrary page of the backlog. Phase 1 ignores
+`REQUIRE_AIRTABLE_PREQUALIFICATION`: that flag narrows which machine-eligible
+records are worth reading, and you have already answered that question by
+approving the record. Phase 3 is sorted because truncating an unsorted
+Airtable query returns records in table order, not by relevance.
+
+**`Prequalification` decides what is looked at, never what is sent to the
+model.** It is an Airtable formula computed from `Request Signal`,
+`Service Signal`, and `Promotion Signal`. It knows nothing about post age,
+intent, or human review, and it grants a record nothing: every candidate from
+either phase goes through the same deterministic prefilter afterwards.
 
 With `RETRY_AI_ERRORS` enabled (the default), records whose last AI attempt
 failed are re-queued too — see [AI errors](#ai-errors-and-recovery).
 
 ### Queue order
 
-1. Records a human flagged `Send to AI`
+1. Records a human set `Human Decision = Approve` on
 2. Records imported during this run
 3. Provider requests
 4. Implementation requests
-5. Highest Prefilter Score
-6. Newest post time
-7. Least comment competition
+5. Records `Prequalification` marks `Send to AI`
+6. Highest Prefilter Score
+7. Newest post time
+8. Least comment competition
 
 Intent outranks recency deliberately. A three-day-old "looking for someone to
 rebuild our site" is worth more than a fresh vague grumble, and the previous
@@ -322,22 +343,56 @@ before the day's real leads were reached.
   classification run can never overwrite a recorded sales outcome.
 - **Retry budget spent.** A record that has failed `AI_ERROR_MAX_ATTEMPTS`
   times is retired from the queue.
+- **Rejected by a human.** `Human Decision = Reject` ends it there. The model
+  is not asked to argue with a person who has already decided.
+- **Blocked by a non-overridable rejection** — see below.
 
-### `Send to AI` overrides the prefilter
+### The non-overridable pre-AI gate
 
-A record you flag `Send to AI` sorts above everything else — including
-records imported in the current run — and **bypasses the keyword prefilter
-entirely**. If you have reviewed a record and marked it, it goes to the AI
-even if the keyword heuristics would have rejected it.
+Before the queue, before any override, and before the OpenAI client is even
+constructed, a record carrying any of these is rejected deterministically:
+
+| Code | Meaning |
+| --- | --- |
+| `STALE_POST` | Older than `MAX_POST_AGE_DAYS` |
+| `NO_SERVICE_MATCH` | Nothing in it is a BruceTech job |
+| `PROMOTIONAL_POST` | A provider advertising themselves |
+| `JOB_SEEKER` | Someone offering their labour |
+| `ALREADY_RESOLVED` | The request has already been answered |
+| `POST_TOO_SHORT` | Not enough text to evaluate |
+
+Nothing lifts these. Not `Human Decision = Approve`, not the
+`Prequalification` formula, not `ENFORCE_PYTHON_PREFILTER=false` — that
+switch turns off the *heuristic* prefilter, and age is not a heuristic.
+
+This exists because of the 2026-08-18 production run: six records the
+Airtable formula marked `Send to AI` skipped the prefilter, and five posts
+between 17 and 25 days old were sent to `gpt-5-mini` and rejected as
+`STALE_POST` after the call had been paid for.
+
+### `Human Decision = Approve` overrides the prefilter
+
+`Approve` is the **only** human override in the pipeline. It sorts a record
+above everything else — including records imported in the current run — and
+lets it past the prefilter when the only thing standing in the way is a
+heuristic: the intent classification, or a Prefilter Score below the minimum.
+
+At decision time it lifts exactly `NO_BUYING_INTENT`,
+`FUNDING_OR_FINANCE_REQUEST`, and `HIRING_UNRELATED`. It lifts nothing else,
+and it never makes a lead outreach-ready on its own — you are already in the
+loop and will see the result.
+
+`Review` is not a decision. It changes nothing about filtering.
 
 Every other record that fails the prefilter is marked
 `AI Status = Processed`, `Lead Tier = Rejected` **without an AI call**, and
 is not evaluated again. That is intended behaviour: it keeps the backlog
 from growing and keeps token spend on plausible leads. It also means a
-borderline post can be rejected on keywords alone — flag it `Send to AI` if
-you want the model to decide instead.
+borderline post can be rejected on keywords alone — set
+`Human Decision = Approve` if you want the model to decide instead.
 
-Set `ENFORCE_PYTHON_PREFILTER=false` to send everything to the AI.
+Set `ENFORCE_PYTHON_PREFILTER=false` to send everything else to the AI. The
+non-overridable gate above still applies.
 
 ---
 
@@ -474,7 +529,7 @@ The pipeline **reads** these fields and never writes them:
 
 | Field | Effect on the pipeline |
 |---|---|
-| `Human Decision` | `Reject` adds the `HUMAN_REJECTED` disqualifier and blocks outreach |
+| `Human Decision` | `Approve` is the only human override: it lifts the intent heuristics and nothing else. `Reject` stops the record before the AI call and adds `HUMAN_REJECTED`. `Review` changes nothing |
 | `Outreach Status` | Anything past `Not Contacted` makes the record skip classification entirely |
 | `Last Contacted` | Read only |
 | `Contacted` (legacy checkbox) | Read only; counted as contacted when `Outreach Status` is empty |

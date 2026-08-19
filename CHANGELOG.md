@@ -15,6 +15,51 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Fixed — an Airtable formula was acting as human approval, and stale posts were reaching the model
+
+Found by the first production run of this branch,
+[32198160409](https://github.com/brucetechnicalservices-collab/BT-facebook-lead-pipeline/actions/runs/32198160409)
+on 2026-08-18. Five posts dated 2026-07-24 to 2026-08-01 — 17 to 25 days old
+against `MAX_POST_AGE_DAYS=5` — were sent to `gpt-5-mini`. All five came back
+hard-rejected with `STALE_POST`. The rejections were correct; paying for them
+was not.
+
+`is_human_flagged()` read the Airtable `Prequalification` field and treated
+`Send to AI` as a human's reviewed selection. `Prequalification` is a
+**formula**. It is computed from `Request Signal`, `Service Signal`, and
+`Promotion Signal`, and knows nothing about post age, intent, or human
+review. Because the pipeline read it as human judgement, the six records
+carrying it skipped the deterministic prefilter entirely and went straight to
+the model.
+
+Two rules replace it:
+
+**`Human Decision = Approve` is the only human override.** `Prequalification`
+survives as what it always was — a machine eligibility hint that chooses which
+records to fetch and breaks ties in the queue order. It overrides nothing.
+`Review` is not a decision and changes nothing. `Reject` now stops a record
+before the AI call rather than after it.
+
+**A non-overridable gate runs before the AI queue.** `prefilter_post` now
+returns machine-readable `rejection_codes`, and any code in
+`NON_OVERRIDABLE_HARD_REJECTIONS` — `STALE_POST`, `NO_SERVICE_MATCH`,
+`PROMOTIONAL_POST`, `JOB_SEEKER`, `ALREADY_RESOLVED`, `POST_TOO_SHORT` —
+rejects the record deterministically, before `get_openai_client()` is called.
+Nothing lifts it: not an `Approve`, not the formula, not
+`ENFORCE_PYTHON_PREFILTER=false`, which turns off the *heuristic* prefilter
+and never covered the age check.
+
+`Approve` now lifts exactly `NO_BUYING_INTENT`, `FUNDING_OR_FINANCE_REQUEST`,
+and `HIRING_UNRELATED`, applied by filtering the finished code list against
+`HUMAN_OVERRIDABLE_HARD_REJECTIONS`. A rejection code added later is
+non-overridable until someone deliberately lists it.
+
+Pre-AI rejections now write their codes to `Disqualifiers`, so a record
+rejected before the model says `STALE_POST` in the same column a post-AI
+rejection would.
+
+`MAX_POST_AGE_DAYS` is unchanged at 5.
+
 ### Fixed — `"working capital"` registered as an API integration lead
 
 The prefilter matched service keywords by substring:

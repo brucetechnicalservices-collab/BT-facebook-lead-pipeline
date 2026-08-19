@@ -27,7 +27,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from urllib.parse import quote
 
 import requests
@@ -50,9 +50,12 @@ from qualification import (
     DEFAULT_MIN_OUTREACH_CONFIDENCE,
     DEFAULT_PREFILTER_PASS_SCORE,
     DEFAULT_QUALIFICATION_THRESHOLD,
+    HARD_REJECTION_REASONS,
     KNOWN_DISQUALIFIER_CODES,
+    NON_OVERRIDABLE_HARD_REJECTIONS,
     REJECT_DISALLOWED_GROUP,
     REJECT_HUMAN_REJECTED,
+    REJECT_STALE_POST,
     REJECT_SUPPRESSED_AUTHOR,
     SERVICE_CATEGORIES,
     TIER_MANUAL_REVIEW,
@@ -211,9 +214,13 @@ BUSINESS_PAIN_OUTREACH_MIN_SCORE = env_int(
 SUPPRESSED_AUTHORS = env_csv("SUPPRESSED_AUTHORS")
 DISALLOWED_GROUPS = env_csv("DISALLOWED_GROUPS")
 
-#: The Airtable Prequalification formula is undocumented and easy to break.
-#: Python prefiltering is now authoritative; set this to true to additionally
-#: require the Airtable formula to say "Send to AI".
+#: The Airtable Prequalification formula is machine generated: it derives
+#: "Send to AI" from the Request, Service, and Promotion signal columns and
+#: knows nothing about post age, human review, or intent. It is an
+#: informational eligibility hint only -- Python is authoritative for pre-AI
+#: eligibility, and no code path may treat this field as human approval.
+#: Set this to true to additionally *narrow* the queue to records the formula
+#: already likes; it can never widen what Python allows through.
 REQUIRE_AIRTABLE_PREQUALIFICATION = env_bool(
     "REQUIRE_AIRTABLE_PREQUALIFICATION", False
 )
@@ -1218,6 +1225,17 @@ def is_human_rejected(fields: dict[str, Any]) -> bool:
     return human_decision(fields).lower() == HUMAN_DECISION_REJECT.lower()
 
 
+def is_human_approved(fields: dict[str, Any]) -> bool:
+    """
+    Did a person set Human Decision = "Approve" on this record?
+
+    This is the *only* source of an explicit human override in the pipeline.
+    "Review" means someone wants to look at it, not that they have decided, so
+    it never bypasses deterministic filtering.
+    """
+    return human_decision(fields).lower() == HUMAN_DECISION_APPROVE.lower()
+
+
 def has_active_outreach(fields: dict[str, Any]) -> bool:
     """Is this lead already somewhere in the sales funnel?"""
     status = str(
@@ -1254,18 +1272,40 @@ def is_retry_exhausted(fields: dict[str, Any]) -> bool:
     )
 
 
-def is_human_flagged(fields: dict[str, Any]) -> bool:
-    """Did a human mark this record 'Send to AI' in Airtable?"""
+def is_airtable_prequalified(fields: dict[str, Any]) -> bool:
+    """
+    Does the Airtable Prequalification *formula* currently say 'Send to AI'?
+
+    This is a machine-generated value computed from the Request, Service, and
+    Promotion signal columns. It is not a human decision, and it must never be
+    used as one: it cannot bypass the prefilter, lift a hard rejection, or
+    approve an expired post. Its only jobs are choosing which records to fetch
+    and breaking ties in the queue order.
+
+    See ``is_human_approved`` for the real human override.
+    """
     return str(
         (fields or {}).get(FIELD_PREQUALIFICATION, "")
     ).strip().lower() == "send to ai"
 
 
 def build_prequalified_queue_formula() -> str:
-    """Records a human explicitly flagged as 'Send to AI'."""
+    """Records the Airtable formula currently marks 'Send to AI'."""
     return (
         "AND("
         f"{{{FIELD_PREQUALIFICATION}}}='Send to AI',"
+        f"{build_unprocessed_status_clause()},"
+        f"LEN({{{FIELD_TEXT}}}&'')>0,"
+        f"LEN({{{FIELD_URL}}}&'')>0"
+        ")"
+    )
+
+
+def build_human_approved_queue_formula() -> str:
+    """Records a person set Human Decision = 'Approve' on."""
+    return (
+        "AND("
+        f"{{{FIELD_HUMAN_DECISION}}}='{HUMAN_DECISION_APPROVE}',"
         f"{build_unprocessed_status_clause()},"
         f"LEN({{{FIELD_TEXT}}}&'')>0,"
         f"LEN({{{FIELD_URL}}}&'')>0"
@@ -1277,31 +1317,60 @@ def fetch_ai_queue() -> list[dict[str, Any]]:
     """
     Retrieve Airtable records that have never been processed by the AI.
 
-    Fetched in two phases so a curated Prequalification selection is never
-    lost behind an arbitrary page of the backlog:
+    Fetched in three phases so neither a person's approvals nor the formula's
+    selection is lost behind an arbitrary page of the backlog:
 
-    1. Every record flagged 'Send to AI' by a human.
-    2. The newest remaining unprocessed records, to top up the window.
+    1. Every record a human set Human Decision = 'Approve' on.
+    2. Every record the Airtable formula marks 'Send to AI'.
+    3. The newest remaining unprocessed records, to top up the window.
 
-    Phase 2 is sorted server-side by post time. Without that sort, Airtable
+    Phases 1 and 2 decide what is *looked at*, never what is sent to the
+    model: every record from every phase goes through the same deterministic
+    prefilter afterwards, and the non-overridable gate in process_ai_queue()
+    applies to all of them equally.
+
+    Phase 1 ignores REQUIRE_AIRTABLE_PREQUALIFICATION. That flag narrows which
+    *machine-eligible* records are worth reading; a person who approved a
+    record has already answered that question.
+
+    Phase 3 is sorted server-side by post time. Without that sort, Airtable
     returns records in table order, so truncating to a window produced an
     arbitrary slice and the prioritisation below could only reorder that
     slice.
     """
-    prequalified = list_airtable_records(
-        formula=build_prequalified_queue_formula(),
+    approved = list_airtable_records(
+        formula=build_human_approved_queue_formula(),
         fields=AI_QUEUE_FIELDS,
     )
 
-    if prequalified:
+    if approved:
         print(
-            f"Found {len(prequalified)} records flagged 'Send to AI'.",
+            f"Found {len(approved)} records a human approved.",
             flush=True,
         )
 
-    seen_ids = {record.get("id") for record in prequalified}
+    seen_ids = {record.get("id") for record in approved}
+
+    prequalified = [
+        record
+        for record in list_airtable_records(
+            formula=build_prequalified_queue_formula(),
+            fields=AI_QUEUE_FIELDS,
+        )
+        if record.get("id") not in seen_ids
+    ]
+
+    if prequalified:
+        print(
+            f"Found {len(prequalified)} records the Airtable formula marks "
+            f"'Send to AI' (machine signal, not human approval).",
+            flush=True,
+        )
+
+    selected = approved + prequalified
+    seen_ids.update(record.get("id") for record in prequalified)
     window = max(AI_BATCH_LIMIT * 5, AI_BATCH_LIMIT)
-    remaining = max(window - len(prequalified), 0)
+    remaining = max(window - len(selected), 0)
 
     backlog: list[dict[str, Any]] = []
     if remaining and not REQUIRE_AIRTABLE_PREQUALIFICATION:
@@ -1310,7 +1379,7 @@ def fetch_ai_queue() -> list[dict[str, Any]]:
             for record in list_airtable_records(
                 formula=build_ai_queue_formula(),
                 fields=AI_QUEUE_FIELDS,
-                max_records=remaining + len(prequalified),
+                max_records=remaining + len(selected),
                 sort_field=FIELD_TIME,
                 sort_direction="desc",
             )
@@ -1322,7 +1391,7 @@ def fetch_ai_queue() -> list[dict[str, Any]]:
             flush=True,
         )
 
-    records = prequalified + backlog
+    records = selected + backlog
 
     print(f"Found {len(records)} unprocessed Airtable records.", flush=True)
     return records
@@ -1338,17 +1407,19 @@ def prioritize_ai_queue(
     Order the queue and attach each record's prefilter result.
 
     Priority order:
-      1. Records a human flagged 'Send to AI' in Airtable
+      1. Records a human set Human Decision = 'Approve' on
       2. Records imported during this run
       3. Provider requests
       4. Implementation requests
-      5. Strongest Prefilter Score
-      6. Newest posts
-      7. Least comment competition
+      5. Records the Airtable Prequalification formula marks 'Send to AI'
+      6. Strongest Prefilter Score
+      7. Newest posts
+      8. Least comment competition
 
-    A human's explicit selection outranks everything else: if someone went
-    through the table and marked records, those are what the run should spend
-    its batch on.
+    A human's explicit approval outranks everything else: if someone went
+    through the table and approved records, those are what the run should
+    spend its batch on. The Prequalification formula sits far lower, as the
+    machine tiebreaker it is -- ordering only, never eligibility.
 
     Intent outranks recency on purpose. A three-day-old "looking for someone
     to rebuild our site" is worth more than a fresh vague grumble, and the old
@@ -1376,8 +1447,9 @@ def prioritize_ai_queue(
         record, prefilter = entry
         fields = record.get("fields", {}) or {}
 
-        prequalified = 1 if is_human_flagged(fields) else 0
+        approved = 1 if is_human_approved(fields) else 0
         imported_now = 1 if record.get("id") in created_record_ids else 0
+        prequalified = 1 if is_airtable_prequalified(fields) else 0
 
         provider = 1 if prefilter.intent_type == intent.INTENT_PROVIDER_REQUEST else 0
         implementation = (
@@ -1395,10 +1467,11 @@ def prioritize_ai_queue(
             comments = 0
 
         return (
-            -prequalified,
+            -approved,
             -imported_now,
             -provider,
             -implementation,
+            -prequalified,
             -prefilter.score,
             -recency,
             comments,
@@ -1789,15 +1862,23 @@ def mark_ai_error(
 def build_prefilter_rejection_update(
     record_id: str,
     prefilter: PrefilterResult,
+    *,
+    extra_codes: Sequence[str] = (),
 ) -> dict[str, Any]:
     """
     Build the Airtable payload for a post rejected before the AI call.
 
-    These records cost nothing. The intent classification is recorded in AI
-    Output so a human can see *why* the post never reached the model without
-    having to re-read it.
+    These records cost nothing. The intent classification and the machine
+    -readable rejection codes are recorded so a human can see *why* the post
+    never reached the model without having to re-read it -- a stale record
+    now says STALE_POST in Disqualifiers, exactly as a post-AI rejection
+    would.
     """
+    codes = list(dict.fromkeys([*prefilter.rejection_codes, *extra_codes]))
+
     reason = " ".join(prefilter.reasons) or "Rejected by deterministic prefilter."
+    if REJECT_HUMAN_REJECTED in extra_codes:
+        reason = HARD_REJECTION_REASONS[REJECT_HUMAN_REJECTED]
 
     diagnostics = {
         "qualification_version": QUALIFICATION_VERSION,
@@ -1809,6 +1890,8 @@ def build_prefilter_rejection_update(
         "prefilter_score": prefilter.score,
         "prefilter_breakdown": prefilter.breakdown,
         "reasons": prefilter.reasons,
+        "rejection_codes": codes,
+        "ai_called": False,
     }
 
     return {
@@ -1824,6 +1907,7 @@ def build_prefilter_rejection_update(
             FIELD_LEAD_TIER: TIER_REJECTED,
             FIELD_MANUAL_REVIEW: False,
             FIELD_OUTREACH_READY: False,
+            FIELD_DISQUALIFIERS: ", ".join(codes),
             FIELD_PREFILTER_SCORE: int(prefilter.score),
             FIELD_QUALIFICATION_VERSION: QUALIFICATION_VERSION,
             FIELD_AI_OUTPUT: json.dumps(
@@ -1851,6 +1935,11 @@ class RunSummary:
     skipped_retry_exhausted: int = 0
     prefilter_accepted: int = 0
     prefilter_rejected: int = 0
+    #: Rejected before the AI call because the post was past MAX_POST_AGE_DAYS.
+    #: Counted inside prefilter_rejected; broken out so a run that spends
+    #: nothing on expired leads says so on its own line.
+    stale_skipped: int = 0
+    human_rejected: int = 0
     provider_requests: int = 0
     implementation_requests: int = 0
     business_pain: int = 0
@@ -1880,6 +1969,8 @@ class RunSummary:
                 f"  Skipped (retries up)  {self.skipped_retry_exhausted}",
                 f"  Prefilter accepted    {self.prefilter_accepted}",
                 f"  Prefilter rejected    {self.prefilter_rejected}",
+                f"  Stale (no AI call)    {self.stale_skipped}",
+                f"  Human rejected        {self.human_rejected}",
                 "",
                 f"  Provider requests     {self.provider_requests}",
                 f"  Implementation reqs   {self.implementation_requests}",
@@ -1962,16 +2053,70 @@ def process_ai_queue(
             )
             continue
 
-        # A human's explicit 'Send to AI' overrides the keyword prefilter.
-        # Someone reviewed this record; do not silently reject it on a
-        # keyword miss.
-        human_flagged = is_human_flagged(fields)
+        # A human's explicit Approve overrides the intent heuristics only.
+        # It is read from Human Decision, never from the machine-generated
+        # Prequalification formula.
+        human_approved = is_human_approved(fields)
+
+        # A human's explicit Reject ends it here. Asking the model about a
+        # record someone has already turned down cannot change the outcome,
+        # so it must not cost a call.
+        if is_human_rejected(fields):
+            summary.human_rejected += 1
+            summary.rejected += 1
+            pending_updates.append(
+                build_prefilter_rejection_update(
+                    record_id,
+                    prefilter,
+                    extra_codes=[REJECT_HUMAN_REJECTED],
+                )
+            )
+            print(
+                f"[{index}/{len(prioritized)}] Skipped: Human Decision is "
+                f"{HUMAN_DECISION_REJECT!r}. URL={post_url}",
+                flush=True,
+            )
+            flush()
+            continue
+
+        # Non-overridable pre-AI gate.
+        #
+        # STALE_POST is the reason this exists. An expired post is rejected
+        # by evaluate_lead() anyway, so sending it to the model buys nothing
+        # and costs a call -- which is exactly what happened in production on
+        # 2026-08-18, when six formula-prequalified records skipped the
+        # prefilter and five posts between 17 and 25 days old were paid for
+        # before being rejected as stale.
+        #
+        # This runs before ENFORCE_PYTHON_PREFILTER, before the human
+        # override, and before get_openai_client(). Nothing lifts it.
+        blocking_codes = prefilter.non_overridable_codes
+        if blocking_codes:
+            if prefilter.is_stale:
+                summary.stale_skipped += 1
+            summary.prefilter_rejected += 1
+            summary.rejected += 1
+            pending_updates.append(
+                build_prefilter_rejection_update(record_id, prefilter)
+            )
+            print(
+                f"[{index}/{len(prioritized)}] Blocked before AI "
+                f"({', '.join(blocking_codes)}) "
+                f"intent={prefilter.intent_type} "
+                f"score={prefilter.score} URL={post_url}",
+                flush=True,
+            )
+            flush()
+            continue
 
         # Deterministic prefilter: never spend a token on an obvious reject.
+        # Past this point a human Approve may let a record through, because
+        # everything still standing is a heuristic judgement -- intent, or a
+        # Prefilter Score below the minimum.
         if (
             ENFORCE_PYTHON_PREFILTER
             and not prefilter.passed
-            and not human_flagged
+            and not human_approved
         ):
             summary.prefilter_rejected += 1
             summary.rejected += 1
@@ -1999,7 +2144,7 @@ def process_ai_queue(
                 fields,
                 prefilter=prefilter,
                 now=now,
-                human_override=human_flagged,
+                human_override=human_approved,
             )
 
             if decision.tier == "Hot":

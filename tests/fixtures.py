@@ -15,6 +15,8 @@ GOHIGHLEVEL   PROVIDER_REQUEST      yes            outreach candidate
 PEN_AND_PAPER BUSINESS_PAIN         yes            AI, then evidence
 VIRTUAL_ASST  UNRELATED             no             never reaches AI
 CRM_RESEARCH  TOOL_RESEARCH         yes            manual review only
+AIRBNB_TENANCY TOOL_RESEARCH        no             never reaches AI
+WEBSITE_WORTH UNRELATED             yes            AI only if approved
 ============  ====================  =============  ==================
 """
 
@@ -80,6 +82,46 @@ CRM_RESEARCH = (
 )
 
 # ---------------------------------------------------------------------------
+# Example F -- solution hopping, taken from the 2026-08-18 production run.
+#
+# A short-term rental host asking about lease contracts, tenancy rules,
+# background checks, and booking risk. The model scored it 77 and proposed AI
+# automation, workflow automation, and a CRM: none of which the author asked
+# for, and none of which answers a tenancy-law question.
+#
+# The request is legal and administrative advice. BruceTech being able to
+# automate part of somebody's week is not a reason to treat their question as
+# a lead. This must not qualify, and must not produce a DM.
+# ---------------------------------------------------------------------------
+
+AIRBNB_TENANCY_ADVICE = (
+    "Hi all, I host a few short term rental units and I'm thinking about "
+    "switching one over to a long term rental. What are people using for the "
+    "lease contract, and are there tenancy rules I should know about before "
+    "I sign anything? Also curious how everyone handles background checks on "
+    "tenants, and whether the booking risk of losing the short term income is "
+    "worth it. Any advice appreciated."
+)
+
+# ---------------------------------------------------------------------------
+# Example G -- the one thing a human Approve is allowed to change.
+#
+# General chatter that names real BruceTech services. The intent heuristic
+# vetoes it and it never reaches the model on its own. A reviewer who reads it
+# and sets Human Decision = Approve can send it to the model anyway, because
+# the only thing standing in the way is a heuristic guess about intent.
+#
+# Its rejection codes are overridable *by construction*: no STALE_POST, no
+# NO_SERVICE_MATCH, no promotional or resolved signal.
+# ---------------------------------------------------------------------------
+
+WEBSITE_WORTH_IT_ADVICE = (
+    "Curious what everyone thinks. Is it still worth having a website for a "
+    "small landscaping business in 2026, or is a Facebook page enough these "
+    "days? Wondering if SEO actually brings in any work."
+)
+
+# ---------------------------------------------------------------------------
 # Supporting fixtures
 # ---------------------------------------------------------------------------
 
@@ -121,6 +163,8 @@ ALL_FIXTURES = {
     "PEN_AND_PAPER_ELECTRICIAN": PEN_AND_PAPER_ELECTRICIAN,
     "VIRTUAL_ASSISTANT": VIRTUAL_ASSISTANT,
     "CRM_RESEARCH": CRM_RESEARCH,
+    "AIRBNB_TENANCY_ADVICE": AIRBNB_TENANCY_ADVICE,
+    "WEBSITE_WORTH_IT_ADVICE": WEBSITE_WORTH_IT_ADVICE,
     "PROMOTIONAL_AGENCY": PROMOTIONAL_AGENCY,
     "JOB_SEEKER": JOB_SEEKER,
     "API_INTEGRATION": API_INTEGRATION,

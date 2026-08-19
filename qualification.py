@@ -99,6 +99,7 @@ REJECT_HIRING_UNRELATED = "HIRING_UNRELATED"
 REJECT_SUPPRESSED_AUTHOR = "SUPPRESSED_AUTHOR"
 REJECT_DISALLOWED_GROUP = "DISALLOWED_GROUP"
 REJECT_HUMAN_REJECTED = "HUMAN_REJECTED"
+REJECT_POST_TOO_SHORT = "POST_TOO_SHORT"
 
 HARD_REJECTION_REASONS: dict[str, str] = {
     REJECT_PERSONAL_REQUEST: (
@@ -160,6 +161,9 @@ HARD_REJECTION_REASONS: dict[str, str] = {
     REJECT_HUMAN_REJECTED: (
         "A human reviewer rejected this record."
     ),
+    REJECT_POST_TOO_SHORT: (
+        "Post text is too short to evaluate."
+    ),
 }
 
 #: Codes decided in Python. The model is never asked about these, so they are
@@ -172,7 +176,56 @@ PYTHON_ONLY_DISQUALIFIER_CODES = (
     REJECT_SUPPRESSED_AUTHOR,
     REJECT_DISALLOWED_GROUP,
     REJECT_HUMAN_REJECTED,
+    REJECT_POST_TOO_SHORT,
 )
+
+# ---------------------------------------------------------------------------
+# What a human "Approve" may and may not override
+#
+# A person setting Human Decision = Approve is saying "the intent heuristic is
+# wrong about this post, ask the model anyway". That is the only thing it
+# means. It is not a licence to spend a token on an expired post, to contact a
+# self-promoting agency, or to re-open a request that is already resolved.
+#
+# The two sets below are exhaustive and mutually exclusive, and the override is
+# applied by *filtering against them* rather than by conditionals scattered
+# through the rejection logic. Any code added later is non-overridable until
+# someone deliberately lists it as overridable, which is the safe default.
+# ---------------------------------------------------------------------------
+
+#: Heuristic intent vetoes. These are the only rejections a human Approve may
+#: lift, because they are exactly the guesses a human reviewer can see are
+#: wrong by reading the post.
+HUMAN_OVERRIDABLE_HARD_REJECTIONS = frozenset(
+    {
+        REJECT_NO_BUYING_INTENT,
+        REJECT_FUNDING_REQUEST,
+        REJECT_HIRING_UNRELATED,
+    }
+)
+
+#: Data-integrity and safety exclusions. No human decision, no Airtable
+#: formula, and no configuration flag lifts any of these. STALE_POST is here
+#: deliberately: an expired Facebook lead must never consume an AI call, even
+#: when someone approved it.
+NON_OVERRIDABLE_HARD_REJECTIONS = frozenset(
+    code
+    for code in HARD_REJECTION_REASONS
+    if code not in HUMAN_OVERRIDABLE_HARD_REJECTIONS
+)
+
+
+def apply_human_override(codes: Sequence[str]) -> list[str]:
+    """
+    Drop the rejection codes a human Approve is allowed to lift.
+
+    Everything in :data:`NON_OVERRIDABLE_HARD_REJECTIONS` survives.
+    """
+    return [
+        code
+        for code in codes
+        if code not in HUMAN_OVERRIDABLE_HARD_REJECTIONS
+    ]
 
 #: disqualifier_codes the model may return that map onto a hard rejection.
 KNOWN_DISQUALIFIER_CODES = tuple(
@@ -475,11 +528,13 @@ def collect_hard_rejections(
     deterministic intent, author suppression, group exclusion, a human
     rejection -- that the model is never asked about.
 
-    ``human_override`` suppresses the *intent* veto only. A record someone
-    reviewed and flagged "Send to AI" bypasses the keyword prefilter; without
-    this, the same heuristic they overrode would reject the result anyway,
-    after the AI call had already been paid for. Every other hard rejection
-    still applies, and outreach remains gated in evaluate_lead().
+    ``human_override`` means a person set Human Decision = "Approve" on the
+    record. It lifts the codes in HUMAN_OVERRIDABLE_HARD_REJECTIONS -- the
+    intent heuristics -- and nothing else. It is never derived from the
+    Airtable ``Prequalification`` formula, which is machine generated and
+    carries no human judgement. Everything in
+    NON_OVERRIDABLE_HARD_REJECTIONS still applies, STALE_POST included, and
+    outreach remains gated in evaluate_lead().
     """
     codes: list[str] = []
 
@@ -533,11 +588,7 @@ def collect_hard_rejections(
     # Deterministic intent. A post the classifier read as general business
     # advice or as unrelated chatter is never a BruceTech lead, however
     # generously the model scored it. This is the anti-solution-hopping rule.
-    if (
-        intent_type is not None
-        and not human_override
-        and intent_type not in intent.OUTREACH_INTENTS
-    ):
+    if intent_type is not None and intent_type not in intent.OUTREACH_INTENTS:
         if intent_type == intent.INTENT_TOOL_RESEARCH:
             # Research is not a rejection -- it is a human decision. Scoring
             # continues; outreach is blocked further down in evaluate_lead().
@@ -549,6 +600,11 @@ def collect_hard_rejections(
         code = str(raw_code).strip().upper().replace(" ", "_")
         if code in HARD_REJECTION_REASONS:
             add(code)
+
+    # The override is applied last, as a filter over the finished list, so it
+    # can only ever remove codes that are explicitly listed as overridable.
+    if human_override:
+        codes = apply_human_override(codes)
 
     return codes
 
@@ -727,10 +783,15 @@ def evaluate_lead(
     gates outreach: only provider requests, implementation requests, and
     strong business pain may ever produce an automatic DM.
 
-    ``human_override`` marks a record a person flagged "Send to AI". It lifts
-    the intent veto so their review is not undone by the heuristic they
-    overrode, but it does not lift outreach gating -- a human is already in
-    the loop and will see the result.
+    ``human_override`` means a person set Human Decision = "Approve" on the
+    record. It lifts the intent veto so their review is not undone by the
+    heuristic they overrode. It does not lift outreach gating -- a human is
+    already in the loop and will see the result -- and it does not lift
+    anything in NON_OVERRIDABLE_HARD_REJECTIONS, STALE_POST included.
+
+    It is never derived from the Airtable ``Prequalification`` formula. That
+    field is machine generated from the Request, Service, and Promotion signal
+    columns and carries no human judgement at all.
     """
     signals = signals or {}
 
@@ -938,6 +999,10 @@ class PrefilterResult:
     service_categories: list[str] = field(default_factory=list)
     promotional: bool = False
     breakdown: dict[str, int] = field(default_factory=dict)
+    #: Machine-readable reasons this post failed, using the same vocabulary as
+    #: the post-AI hard rejections. ``reasons`` is prose for a human reading
+    #: Airtable; this is what the pipeline branches on. Empty when ``passed``.
+    rejection_codes: list[str] = field(default_factory=list)
 
     @property
     def is_provider_request(self) -> bool:
@@ -946,6 +1011,29 @@ class PrefilterResult:
     @property
     def allows_outreach(self) -> bool:
         return self.intent_type in intent.OUTREACH_INTENTS
+
+    @property
+    def is_stale(self) -> bool:
+        """Older than the configured maximum age. Never overridable."""
+        return REJECT_STALE_POST in self.rejection_codes
+
+    @property
+    def non_overridable_codes(self) -> list[str]:
+        """
+        The failures no human Approve may spend an AI call on.
+
+        A post carrying any of these is rejected deterministically, before the
+        OpenAI client is even constructed.
+        """
+        return [
+            code
+            for code in self.rejection_codes
+            if code in NON_OVERRIDABLE_HARD_REJECTIONS
+        ]
+
+    @property
+    def blocks_ai_call(self) -> bool:
+        return bool(self.non_overridable_codes)
 
 
 def _banded_score(
@@ -1006,6 +1094,7 @@ def prefilter_post(
     """
     body = str(text or "").strip()
     reasons: list[str] = []
+    codes: list[str] = []
 
     # Classify before the early returns. A rejected post still has its
     # assessment written to Airtable for a human to read, and reporting the
@@ -1014,7 +1103,7 @@ def prefilter_post(
     intent_result = intent.classify_intent(body)
     services = intent.match_services(body)
 
-    def rejected(reason: str) -> PrefilterResult:
+    def rejected(reason: str, code: str) -> PrefilterResult:
         return PrefilterResult(
             passed=False,
             score=0,
@@ -1024,16 +1113,24 @@ def prefilter_post(
             intent_label=intent_result.label,
             service_matched=services.matched,
             service_categories=list(services.categories),
+            rejection_codes=[code],
         )
 
     if len(body) < MIN_PREFILTER_TEXT_LENGTH:
-        return rejected("Post text is too short to evaluate.")
+        return rejected(
+            "Post text is too short to evaluate.",
+            REJECT_POST_TOO_SHORT,
+        )
 
+    # Age is checked here, before anything else can pass a post through, and
+    # the code it emits is non-overridable. This is the gate that keeps an
+    # expired lead from ever reaching the model.
     age_days = post_age_in_days(post_time, now=now) if post_time else None
     if age_days is not None and age_days > max_post_age_days:
         return rejected(
             f"Post is {age_days:.0f} days old, older than the "
-            f"{max_post_age_days}-day maximum."
+            f"{max_post_age_days}-day maximum.",
+            REJECT_STALE_POST,
         )
 
     negatives = intent.detect_negative_signals(body)
@@ -1106,14 +1203,17 @@ def prefilter_post(
     # only worth recording when something is actually wrong.
     if not services.matched:
         reasons.append("No credible BruceTech service match.")
+        codes.append(REJECT_NO_SERVICE_MATCH)
 
     if intent_result.intent_type == intent.INTENT_GENERAL_ADVICE:
         reasons.append(
             "General business advice question rather than a request "
             "BruceTech can serve."
         )
+        codes.append(intent_disqualifier_code(intent_result.intent_type, body))
     elif intent_result.intent_type == intent.INTENT_UNRELATED:
         reasons.append("No request, problem, or buying intent detected.")
+        codes.append(REJECT_NO_BUYING_INTENT)
     elif (
         intent_result.intent_type == intent.INTENT_TOOL_RESEARCH
         and not allow_tool_research
@@ -1121,17 +1221,23 @@ def prefilter_post(
         reasons.append(
             "Tool research rather than a request for an implementer."
         )
+        codes.append(REJECT_NO_BUYING_INTENT)
 
     if negatives.promotional:
         reasons.append(
             "Self-promotional language: "
             + ", ".join(sorted(set(negatives.promotional))[:5])
         )
+        codes.append(REJECT_PROMOTIONAL_POST)
     if negatives.job_seeking:
         reasons.append("Job-seeking language.")
+        codes.append(REJECT_JOB_SEEKER)
     if negatives.resolved:
         reasons.append("Request appears already resolved.")
+        codes.append(REJECT_ALREADY_RESOLVED)
     if negatives.free_only:
+        # Recorded for the human reading Airtable, but not a rejection code:
+        # asking for free work is a scoring penalty here, not a pre-AI veto.
         reasons.append("Asking for free work only.")
 
     allowed_intents = set(intent.AI_ELIGIBLE_INTENTS)
@@ -1164,4 +1270,6 @@ def prefilter_post(
         service_categories=list(services.categories),
         promotional=bool(negatives.promotional),
         breakdown=breakdown,
+        # A post that passed carries no rejection codes, by construction.
+        rejection_codes=[] if passed else codes,
     )

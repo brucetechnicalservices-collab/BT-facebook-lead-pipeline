@@ -290,6 +290,26 @@ Defect 4 is the one worth remembering: **column names are not unique across
 the base.** Any future shared write helper must take its protected set per
 table rather than inheriting a default.
 
+### Defect 5, found by the first production run
+
+Run [32198160409](https://github.com/brucetechnicalservices-collab/BT-facebook-lead-pipeline/actions/runs/32198160409)
+on 2026-08-18 exposed the assumption underneath defect 1.
+
+| Defect | Impact | Fix |
+|---|---|---|
+| `human_override` was derived from the Airtable `Prequalification` **formula**, which is machine generated from the Request, Service, and Promotion signal columns and knows nothing about post age or human review | Six formula-marked records skipped the prefilter; five posts dated 2026-07-24 to 2026-08-01 — 17 to 25 days old against `MAX_POST_AGE_DAYS=5` — were sent to `gpt-5-mini` and all came back `STALE_POST`, after the calls had been paid for | The override now comes only from `Human Decision = Approve`. A non-overridable gate rejects stale, promotional, job-seeking, resolved, service-unmatched, and too-short posts before the queue and before the OpenAI client is constructed |
+
+The lesson generalises past this field: **a machine-generated value must
+never stand in for a human decision.** `Prequalification` reads like an
+approval and is not one. Anything that grants a record an exemption has to
+name the human who granted it.
+
+The override is now applied by filtering a finished list of rejection codes
+against `HUMAN_OVERRIDABLE_HARD_REJECTIONS`, so a code added later is
+non-overridable until someone deliberately lists it. `STALE_POST` is
+permanently outside that set: a human may inspect an expired lead by hand,
+but the automatic pipeline will not spend a token on it.
+
 ### Retry storage isolation
 
 The cross-run attempt counter moved into `ai_retry.RetryStore`, which owns the
@@ -404,9 +424,13 @@ passes roughly 50k rows this should become an incremental or view-scoped read.
 It handles the shapes in `tests/fixtures.py` and the patterns observed in
 production, but it is pattern matching, not comprehension. Novel phrasings will
 land in `UNRELATED` and be rejected without an AI call. That is the intended
-failure direction — a missed lead costs less than a bad DM — but it means
-`Send to AI` remains the escape hatch, and it still bypasses the prefilter
-entirely.
+failure direction — a missed lead costs less than a bad DM — but it means an
+escape hatch is needed: `Human Decision = Approve` is that hatch. It bypasses
+the intent heuristic and the score minimum, and nothing else. It cannot send
+a stale, promotional, resolved, or service-unmatched post to the model.
+
+The Airtable `Prequalification` formula is **not** an escape hatch. It is
+machine generated and grants a record nothing.
 
 ### `MAX_POST_AGE_DAYS` dropped from 45 to 5
 
