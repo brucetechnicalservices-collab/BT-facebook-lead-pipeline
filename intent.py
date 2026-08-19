@@ -252,6 +252,208 @@ WEAK_SERVICE_TERMS: dict[str, tuple[str, ...]] = {
     "business_process_consulting": ("paperwork", "manual process", "admin"),
 }
 
+# ---------------------------------------------------------------------------
+# Operational systems pain
+#
+# A business describing a broken or absent operating system -- inventory that
+# does not reconcile, no process in place, a schedule nobody is filling -- is
+# describing work BruceTech does, even when it names no software.
+#
+# The 2026-08-19 fresh run rejected a med spa manager who had "200 units
+# missing" and "no systems in place" as UNRELATED with no service match. That
+# is a systems engagement described in plain English.
+#
+# These patterns deliberately describe a *problem*, not a noun. "Inventory"
+# alone is a word every retail business uses; "issue with inventory" and
+# "inventory discrepancy" are operational failures. They only ever establish
+# a match alongside commercial context -- see ``operations_pain_evidence``.
+# ---------------------------------------------------------------------------
+
+OPERATIONS_PAIN_PATTERNS: tuple[str, ...] = (
+    # Absent systems and process.
+    r"no (?:real |proper |actual |good )?(?:systems?|process(?:es)?|procedures?|"
+    r"structure|tracking|organization|organisation) (?:in place|at all|here|"
+    r"whatsoever)",
+    r"(?:without|lack of|lacking) (?:any )?(?:systems?|process(?:es)?|"
+    r"procedures?|tracking)",
+    r"(?:everything|it'?s all|we'?re) (?:is )?(?:done )?(?:manually|by hand|"
+    r"on paper)",
+    r"starting from (?:the )?(?:ground up|scratch) (?:with|and)",
+    # Inventory and reconciliation failures.
+    r"(?:issues?|problems?|trouble|struggling) with (?:our |the |my )?"
+    r"(?:inventory|stock|supplies|ordering|scheduling|booking|billing)",
+    r"inventory (?:discrepanc|shortage|tracking|count|management|reconcil|"
+    r"is a|isn'?t|is not|never)",
+    r"(?:can'?t|cannot|unable to|nobody can) (?:tell me |figure out |work out |"
+    r"track |account for )?(?:where|what happened to) (?:they|it|them|the \w+) "
+    r"(?:went|go)",
+    r"(?:\d+ )?(?:units?|products?|items?|stock|inventory|supplies) "
+    r"(?:are |is |went |gone )?missing",
+    r"missing (?:about |around |roughly |approximately )?\d+ (?:units?|"
+    r"products?|items?)",
+    r"(?:reconcil\w+|counts?) (?:issues?|problems?|never match|don'?t match|"
+    r"do not match|is a nightmare)",
+    r"(?:manually|by hand) (?:track|tracking|count|counting|log|logging|"
+    r"record|recording|enter|entering)",
+    r"no (?:good )?(?:way|system) to (?:track|manage|schedule|organize|"
+    r"organise|monitor)",
+    # Scheduling, booking, and customer workflow failures.
+    r"(?:schedule|calendar|books?|columns?) (?:is|are|stays?|sits?|remains?) "
+    r"(?:half )?(?:empty|bare|light|dead|open)",
+    r"(?:fill|filling|fill up|filling up) (?:up )?(?:her|his|their|our|the|my) "
+    r"(?:schedule|books?|calendar|column|chair)",
+    r"struggle (?:to keep|keeping) (?:her|him|them|the \w+) (?:busy|booked)",
+    r"(?:keep|keeping) (?:her|him|them) (?:busy|booked)",
+    r"(?:business|clinic|shop|practice) (?:that )?is (?:bleeding|hemorrhaging|"
+    r"haemorrhaging|a mess|in chaos)",
+    r"(?:no.?show|late cancel)\w* (?:are|is|keep|problem|issue|killing)",
+    r"(?:double|over).?(?:book|booking|booked)",
+)
+
+_OPERATIONS_PAIN_RE = tuple(
+    re.compile(pattern, re.IGNORECASE) for pattern in OPERATIONS_PAIN_PATTERNS
+)
+
+# ---------------------------------------------------------------------------
+# Adjacent digital growth
+#
+# A clinic asking for "a marketing agency to get me patients" is not asking
+# for a website. But digital client acquisition is delivered *through* the
+# things BruceTech builds: the site, the SEO, the booking flow, the CRM, and
+# the follow-up automation behind it.
+#
+# This is a deliberately narrow bridge, not a service match. It requires an
+# explicit provider request AND a digital acquisition goal AND commercial
+# context, and it credits only the categories BruceTech would actually
+# deliver. The model then decides whether real fit exists.
+#
+# "Generic marketing" is not enough on its own, and a request that is purely
+# for creative or physical-media work is excluded outright.
+# ---------------------------------------------------------------------------
+
+ADJACENT_GROWTH_PROVIDER_PATTERNS: tuple[str, ...] = (
+    r"marketing (?:agency|agencies|company|companies|firm|team|partner|"
+    r"platform|person|guy|help)",
+    r"(?:digital|online|internet) marketing",
+    r"(?:ads?|advertising) (?:agency|company|manager|management)",
+    r"(?:google|facebook|meta|instagram) ads?",
+    r"lead gen(?:eration)?",
+    r"funnel",
+)
+
+#: The outcome must be measurable client acquisition, not exposure.
+ADJACENT_GROWTH_GOAL_PATTERNS: tuple[str, ...] = (
+    r"(?:get|getting|bring|bringing|drive|driving|attract|attracting|land|"
+    r"landing|book|booking|fill|filling)(?: me| us| in| more)*\s*"
+    r"(?:new |more |real |actual )*"
+    r"(?:patients?|clients?|customers?|leads?|appointments?|bookings?|"
+    r"consults?|consultations?)",
+    r"(?:new|more|real|actual) (?:patients?|clients?|customers?|leads?|"
+    r"appointments?|bookings?)",
+    r"(?:grow|growing|build|building|scale|scaling) (?:my|our) "
+    r"(?:practice|clinic|business|patient base|client base|book of business)",
+    r"(?:client|patient|customer) (?:acquisition|retention|flow)",
+    r"(?:fill|filling) (?:up )?(?:my|our|the|her|his|their) "
+    r"(?:schedule|books?|calendar|chairs?|rooms?)",
+)
+
+#: Creative and physical-media work BruceTech does not sell. A request that
+#: names only these has no BruceTech fit, whatever the goal.
+NON_BRUCETECH_MARKETING_PATTERNS: tuple[str, ...] = (
+    r"influencer",
+    r"(?:content|ugc) creator",
+    r"photographer|videographer|photo ?shoot|video ?shoot",
+    r"\bpr\b|public relations|press release",
+    r"(?:brand|branding|logo|rebrand)\w* (?:only|design|designer|identity|"
+    r"package|awareness)",
+    r"(?:billboard|flyer|flier|print ad|direct mail|radio|magazine|banner "
+    r"stand|trade ?show booth)",
+)
+
+_ADJACENT_PROVIDER_RE = tuple(
+    re.compile(p, re.IGNORECASE) for p in ADJACENT_GROWTH_PROVIDER_PATTERNS
+)
+_ADJACENT_GOAL_RE = tuple(
+    re.compile(p, re.IGNORECASE) for p in ADJACENT_GROWTH_GOAL_PATTERNS
+)
+_NON_BRUCETECH_MARKETING_RE = tuple(
+    re.compile(p, re.IGNORECASE) for p in NON_BRUCETECH_MARKETING_PATTERNS
+)
+
+# ---------------------------------------------------------------------------
+# Physical and clinical goods
+#
+# A medical spa group talks constantly about buying lasers, syringes, and
+# treatment chairs. Those posts contain words like "system", "platform", and
+# "device" that would otherwise corroborate a weak service hit.
+#
+# BruceTech does not sell, service, or advise on physical clinical equipment.
+# When a post is shopping for goods and names no unambiguous BruceTech
+# service, the weak-signal path is suppressed entirely.
+#
+# IT hardware is deliberately absent from this list: "the printer is down"
+# and "our workstation crashed" are BruceTech work.
+# ---------------------------------------------------------------------------
+
+PHYSICAL_GOODS_PATTERNS: tuple[str, ...] = (
+    r"(?:buy|buying|purchas\w+|invest in|investing in|shopping for|"
+    r"looking at buying|spend\w* .{0,25} on) (?:a |an |the |some )?"
+    r"(?:\w+ ){0,3}(?:laser|device|machine|equipment|chair|bed|unit|"
+    r"handpiece|platform|system)\b",
+    r"(?:laser|device|machine|equipment|chair|bed|handpiece|syringe|needle|"
+    r"cannula)s? (?:for sale|comparison|recommendations?|reviews?)",
+    r"(?:which|what) (?:\w+ ){0,2}(?:machine|device|laser|equipment|unit|"
+    r"handpiece|syringe|needle|cannula)\b",
+    r"\$\s?\d+\s?(?:k|,000)?\b.{0,40}(?:device|machine|equipment|laser)",
+    r"(?:botox|dysport|xeomin|jeuveau|neurotoxin|filler|injectable|"
+    r"microneedling|skincare ingredient|serum|peel)\b",
+    r"(?:tattoo removal|hair removal|body contouring) (?:equipment|device|"
+    r"machine|laser|comparison)",
+    r"\b(?:syringe|needle|cannula|handpiece|cartridge)s?\b",
+)
+
+_PHYSICAL_GOODS_RE = tuple(
+    re.compile(p, re.IGNORECASE) for p in PHYSICAL_GOODS_PATTERNS
+)
+
+
+def operations_pain_evidence(text: Any) -> list[str]:
+    """Return the operational-systems failures described in a post."""
+    body = str(text or "")
+    return [p.pattern[:60] for p in _OPERATIONS_PAIN_RE if p.search(body)]
+
+
+def is_shopping_for_physical_goods(text: Any) -> bool:
+    """Is this post shopping for equipment, devices, or clinical product?"""
+    body = str(text or "")
+    return any(p.search(body) for p in _PHYSICAL_GOODS_RE)
+
+
+def adjacent_growth_evidence(text: Any) -> list[str]:
+    """
+    Return evidence that a growth request is one BruceTech can partly serve.
+
+    Requires a provider-shaped marketing ask *and* a measurable client
+    acquisition goal. A request naming only creative or physical-media work
+    returns nothing, however commercially framed.
+    """
+    body = str(text or "")
+
+    provider = [p.pattern[:60] for p in _ADJACENT_PROVIDER_RE if p.search(body)]
+    goal = [p.pattern[:60] for p in _ADJACENT_GOAL_RE if p.search(body)]
+
+    if not provider or not goal:
+        return []
+
+    # Only creative or physical media asked for, and nothing BruceTech
+    # builds named alongside it.
+    excluded = any(p.search(body) for p in _NON_BRUCETECH_MARKETING_RE)
+    if excluded and not match_services_core(body).matched:
+        return []
+
+    return provider + goal
+
+
 #: Terms that make a weak service hit credible. "Our office network keeps
 #: dropping" is a managed-IT lead; "grow my network" is not.
 TECH_CONTEXT_TERMS: tuple[str, ...] = (
@@ -288,16 +490,32 @@ class ServiceMatch:
     strong_terms: list[str] = field(default_factory=list)
     weak_terms: list[str] = field(default_factory=list)
     has_tech_context: bool = False
+    #: Matched through described operational failure rather than vocabulary.
+    operations_pain: list[str] = field(default_factory=list)
+    #: Matched as an adjacent digital-growth request the model must confirm.
+    adjacent_growth: list[str] = field(default_factory=list)
+    #: Weak-signal path suppressed because the post is shopping for goods.
+    physical_goods: bool = False
 
     @property
     def strong(self) -> bool:
         """True when at least one unambiguous service term was found."""
         return bool(self.strong_terms)
 
+    @property
+    def needs_ai_confirmation(self) -> bool:
+        """
+        True when the match is inferred rather than stated.
 
-def match_services(text: Any) -> ServiceMatch:
+        These reach the model precisely so it can rule on real fit; they are
+        never treated as an established service match on their own.
+        """
+        return bool(self.adjacent_growth) and not self.strong_terms
+
+
+def match_services_core(text: Any) -> ServiceMatch:
     """
-    Determine whether a post credibly matches a BruceTech service.
+    Determine whether a post names a BruceTech service.
 
     The rule, in full:
 
@@ -308,7 +526,12 @@ def match_services(text: Any) -> ServiceMatch:
     * **One weak term plus technical context.** "office network keeps
       dropping" pairs a weak term with a support-shaped verb.
 
-    Anything else is not a service match, no matter how sympathetic the post.
+    The weak paths are suppressed entirely when the post is shopping for
+    physical or clinical goods. "Looking at buying a laser platform for a
+    small clinic" contains "platform" and "clinic" and is not BruceTech work.
+
+    Anything else is not a service match here, no matter how sympathetic the
+    post. See ``match_services`` for the two inferred paths layered on top.
     """
     body = str(text or "")
     if not body.strip():
@@ -334,10 +557,11 @@ def match_services(text: Any) -> ServiceMatch:
                 weak_categories.append(category)
 
     has_tech_context = bool(_hits(body, _TECH_CONTEXT_COMPILED))
+    physical_goods = is_shopping_for_physical_goods(body)
 
     matched = bool(strong_terms)
 
-    if not matched and weak_terms:
+    if not matched and weak_terms and not physical_goods:
         # A weak signal needs corroboration: either breadth (two separate
         # weak areas) or a technical verb that makes it a support request.
         matched = len(weak_categories) >= 2 or has_tech_context
@@ -354,6 +578,80 @@ def match_services(text: Any) -> ServiceMatch:
         strong_terms=strong_terms,
         weak_terms=weak_terms,
         has_tech_context=has_tech_context,
+        physical_goods=physical_goods,
+    )
+
+
+#: What BruceTech would actually deliver for a business with no systems.
+OPERATIONS_PAIN_CATEGORIES = ("business_process_consulting", "workflow_automation")
+
+#: What BruceTech would actually deliver against a client-acquisition goal.
+ADJACENT_GROWTH_CATEGORIES = (
+    "website_development", "seo", "crm", "workflow_automation",
+)
+
+
+def match_services(text: Any) -> ServiceMatch:
+    """
+    Determine whether a post credibly matches a BruceTech service.
+
+    Three ways to match, in order:
+
+    1. **Named** -- ``match_services_core``: the post uses BruceTech
+       vocabulary.
+    2. **Described** -- the post describes an operational systems failure
+       (inventory that does not reconcile, no process in place, a schedule
+       nobody can fill) from a business with credible commercial context. The
+       author never says "software"; they are still describing a systems
+       engagement.
+    3. **Adjacent** -- the post asks for a provider to deliver measurable
+       client acquisition, which BruceTech serves through the site, SEO,
+       booking flow, CRM, and follow-up automation underneath it.
+
+    Paths 2 and 3 both require commercial context, and neither produces a
+    strong match: they credit the categories BruceTech would deliver and lean
+    on the model for the final commercial judgement. Path 3 is flagged
+    ``needs_ai_confirmation`` so nothing downstream mistakes it for a stated
+    requirement.
+    """
+    body = str(text or "")
+    core = match_services_core(body)
+
+    if core.matched:
+        return core
+
+    if not _hits(body, _OPERATOR_COMPILED):
+        # Neither inferred path is available unless the author runs the
+        # business. A customer describing the same failure is not a lead.
+        return core
+
+    operations = operations_pain_evidence(body)
+    adjacent = adjacent_growth_evidence(body)
+
+    if not operations and not adjacent:
+        return core
+
+    categories = list(core.categories)
+
+    if operations:
+        for category in OPERATIONS_PAIN_CATEGORIES:
+            if category not in categories:
+                categories.append(category)
+
+    if adjacent:
+        for category in ADJACENT_GROWTH_CATEGORIES:
+            if category not in categories:
+                categories.append(category)
+
+    return ServiceMatch(
+        matched=True,
+        categories=categories,
+        strong_terms=[],
+        weak_terms=core.weak_terms,
+        has_tech_context=core.has_tech_context,
+        operations_pain=operations,
+        adjacent_growth=adjacent,
+        physical_goods=core.physical_goods,
     )
 
 
@@ -438,6 +736,21 @@ TOOL_RESEARCH_PATTERNS: tuple[str, ...] = (
     r"thoughts on (?:using )?[a-z0-9.]+\?",
     r"(?:pros and cons|comparison) (?:of|between)",
     r"(?:worth it|any good)\?",
+    # "Mangomint or boulevard POS system and why?" -- a named either/or over
+    # a software noun. The software noun is required: "PicoWay or PicoSure
+    # laser" is equipment shopping, not tool research.
+    r"\b[a-z][\w.']{2,}\s+(?:or|vs\.?|versus)\s+[a-z][\w.']{2,}"
+    r"(?:\s+\w+){0,2}\s+(?:pos|crm|software|system|platform|app|suite|"
+    r"booking system|scheduling software|point of sale)\b",
+    # "thinking of switching to either Mangomint or GlossGenius"
+    r"(?:think(?:ing)?|considering|looking) (?:about |of |at )?"
+    r"(?:switch(?:ing)?|mov(?:e|ing)|migrat(?:e|ing)|chang(?:e|ing))"
+    r"(?: over)? to\b",
+    r"(?:currently|we|they) (?:use|using|are on|'re on|run|running)\s+"
+    r"[a-z][\w.']{2,}\b.{0,80}?(?:switch|instead|alternative|replace|"
+    r"pros and cons|thoughts)",
+    r"\bpros and cons\b",
+    r"(?:switch(?:ing)?|migrat(?:e|ing)) (?:from|off) [a-z][\w.']{2,}",
 )
 
 #: Operational pain that BruceTech's automation and IT work addresses.
@@ -550,7 +863,6 @@ def classify_intent(text: Any) -> IntentResult:
         (INTENT_IMPLEMENTATION_REQUEST, _IMPLEMENTATION_RE),
         (INTENT_TOOL_RESEARCH, _TOOL_RESEARCH_RE),
         (INTENT_BUSINESS_PAIN, _BUSINESS_PAIN_RE),
-        (INTENT_GENERAL_ADVICE, _GENERAL_ADVICE_RE),
     ):
         evidence = _matched_patterns(body, patterns)
         if evidence:
@@ -559,6 +871,28 @@ def classify_intent(text: Any) -> IntentResult:
                 label=INTENT_LABELS[intent_type],
                 evidence=evidence,
             )
+
+    # Operational systems failure described in plain English, from a business
+    # with credible commercial context. "Two hundred units missing and no
+    # systems in place" names no software and is still operational pain.
+    #
+    # Checked after the explicit pain patterns and before general advice, and
+    # gated on commercial context so a consumer grumble stays UNRELATED.
+    operations = operations_pain_evidence(body)
+    if operations and _hits(body, _OPERATOR_COMPILED):
+        return IntentResult(
+            intent_type=INTENT_BUSINESS_PAIN,
+            label=INTENT_LABELS[INTENT_BUSINESS_PAIN],
+            evidence=operations,
+        )
+
+    advice = _matched_patterns(body, _GENERAL_ADVICE_RE)
+    if advice:
+        return IntentResult(
+            intent_type=INTENT_GENERAL_ADVICE,
+            label=INTENT_LABELS[INTENT_GENERAL_ADVICE],
+            evidence=advice,
+        )
 
     return IntentResult(
         intent_type=INTENT_UNRELATED,
@@ -573,14 +907,35 @@ def classify_intent(text: Any) -> IntentResult:
 # on the formula having calculated.
 # ---------------------------------------------------------------------------
 
+#: Unambiguous seller-to-audience evidence. One hit is enough: these are
+#: calls to action, solicitations, and announcements, not description.
 PROMOTIONAL_TERMS: tuple[str, ...] = (
-    "dm me", "pm me", "inbox me", "hire me", "message me for", "i offer",
-    "we offer", "my services", "our services", "we provide", "we specialize",
-    "we specialise", "our agency", "my agency", "book a call with",
-    "limited time", "promo code", "discount code", "sign up now",
-    "click the link", "link in bio", "affiliate", "for sale", "now booking",
+    "dm me", "pm me", "inbox me", "hire me", "message me for",
+    "message me if", "shoot me a message", "reach out to me",
+    "book a call with", "book now", "book your", "call us today",
+    "contact us", "contact me for",
+    "limited time", "promo code", "discount code", "special offer",
+    "sign up now", "click the link", "link in bio", "affiliate",
+    "for sale", "available now", "now booking",
     "accepting new clients", "taking on new clients", "free consultation",
     "free audit", "check out my", "check out our", "proud to announce",
+    "packages start", "pricing starts", "our rates",
+)
+
+#: Self-description that is promotional *only alongside* a call to action.
+#:
+#: "We offer facials, DiamondGlow and SkinPen but her books are half empty"
+#: is a business owner giving context for a problem. Treating that as
+#: self-promotion rejected a real lead before the model ever saw it, which is
+#: exactly what happened to a med spa owner in the 2026-08-19 fresh run.
+#:
+#: These establish that the author sells something. A CTA from
+#: PROMOTIONAL_TERMS establishes that they are selling it *here*, to this
+#: audience. Promotion requires both.
+PROMOTIONAL_SELF_DESCRIPTION_TERMS: tuple[str, ...] = (
+    "i offer", "we offer", "my services", "our services", "we provide",
+    "i provide", "we specialize", "we specialise", "our agency",
+    "my agency", "we sell", "i sell", "selling", "we carry",
 )
 
 JOB_SEEKER_TERMS: tuple[str, ...] = (
@@ -603,6 +958,7 @@ RESOLVED_TERMS: tuple[str, ...] = (
 )
 
 _PROMOTIONAL_COMPILED = _compile_all(PROMOTIONAL_TERMS)
+_PROMOTIONAL_SELF_COMPILED = _compile_all(PROMOTIONAL_SELF_DESCRIPTION_TERMS)
 _JOB_SEEKER_COMPILED = _compile_all(JOB_SEEKER_TERMS)
 _FREE_ONLY_COMPILED = _compile_all(FREE_ONLY_TERMS)
 _RESOLVED_COMPILED = _compile_all(RESOLVED_TERMS)
@@ -618,9 +974,46 @@ COMMERCIAL_CONTEXT_TERMS: tuple[str, ...] = (
     "contractor", "electrician", "plumber", "hvac", "roofer", "landscaper",
     "restaurant", "clinic", "dental", "salon", "gym", "law firm",
     "real estate", "brokerage", "dealership", "excavation", "construction",
+    # Medical spa and practice framings, added after the 2026-08-19 fresh
+    # run: an owner writing "I recently opened my own med spa" is giving
+    # business context as plainly as "I own a restaurant".
+    "med spa", "medspa", "medical spa", "my practice", "our practice",
+    "solo md", "my clinic", "our clinic", "practice owner", "clinic owner",
+    "spa owner", "studio owner", "new manager at",
 )
 
 _COMMERCIAL_COMPILED = _compile_all(COMMERCIAL_CONTEXT_TERMS)
+
+#: The subset of commercial context that establishes the author *runs* the
+#: business, rather than merely naming one.
+#:
+#: COMMERCIAL_CONTEXT_TERMS includes bare industry nouns -- "salon", "clinic",
+#: "gym" -- which a customer uses as readily as an owner. That is fine for
+#: scoring, where it is one weighted signal among several. It is not fine as
+#: the gate on an inferred match: "my salon appointment was double booked and
+#: nobody could tell me where my order went" is a customer complaint that
+#: otherwise reads as operational pain from a business.
+#:
+#: The two inferred service paths gate on this list instead.
+OPERATOR_CONTEXT_TERMS: tuple[str, ...] = (
+    "my business", "our business", "my company", "our company", "my shop",
+    "our shop", "my store", "our store", "my clients", "our clients",
+    "my customers", "our customers", "my staff", "our staff", "my team",
+    "our team", "i own", "we own", "i run", "we run", "my crew", "our crew",
+    "our office", "my office", "my employees", "our employees",
+    "my practice", "our practice", "my clinic", "our clinic",
+    "solo md", "practice owner", "clinic owner", "spa owner",
+    "studio owner", "business owner", "owner here", "new manager at",
+    "i manage", "we manage", "i opened", "we opened", "opened my own",
+    "opened our own", "i started", "we started",
+)
+
+_OPERATOR_COMPILED = _compile_all(OPERATOR_CONTEXT_TERMS)
+
+
+def operator_context_terms(text: Any) -> list[str]:
+    """Return the phrases showing the author runs the business."""
+    return _hits(str(text or ""), _OPERATOR_COMPILED)
 
 
 @dataclass
@@ -631,6 +1024,9 @@ class NegativeSignals:
     job_seeking: list[str] = field(default_factory=list)
     free_only: list[str] = field(default_factory=list)
     resolved: list[str] = field(default_factory=list)
+    #: Self-description found without a call to action. Recorded for the
+    #: diagnostics blob only -- it is not a rejection on its own.
+    self_description: list[str] = field(default_factory=list)
 
     @property
     def any_present(self) -> bool:
@@ -640,14 +1036,33 @@ class NegativeSignals:
 
 
 def detect_negative_signals(text: Any) -> NegativeSignals:
-    """Find promotional, job-seeking, free-only, and resolved language."""
+    """
+    Find promotional, job-seeking, free-only, and resolved language.
+
+    Promotion needs seller-to-audience evidence, not merely evidence that the
+    author sells something. "We offer facials" describes a business;
+    "we offer facials, DM me to book" advertises one. Only the second is
+    promotional, and only the second sets ``promotional``.
+    """
     body = str(text or "")
 
+    call_to_action = _hits(body, _PROMOTIONAL_COMPILED)
+    self_description = _hits(body, _PROMOTIONAL_SELF_COMPILED)
+
+    promotional = list(call_to_action)
+    if call_to_action and self_description:
+        # A seller describing their offer *and* soliciting. Report both so
+        # the Airtable reason names what was actually found.
+        promotional.extend(
+            term for term in self_description if term not in promotional
+        )
+
     return NegativeSignals(
-        promotional=_hits(body, _PROMOTIONAL_COMPILED),
+        promotional=promotional,
         job_seeking=_hits(body, _JOB_SEEKER_COMPILED),
         free_only=_hits(body, _FREE_ONLY_COMPILED),
         resolved=_hits(body, _RESOLVED_COMPILED),
+        self_description=self_description,
     )
 
 

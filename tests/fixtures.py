@@ -18,6 +18,21 @@ CRM_RESEARCH  TOOL_RESEARCH         yes            manual review only
 AIRBNB_TENANCY TOOL_RESEARCH        no             never reaches AI
 WEBSITE_WORTH UNRELATED             yes            AI only if approved
 ============  ====================  =============  ==================
+
+The 2026-08-19 medical spa fixtures carry their own contract:
+
+================  ================  ==============  ==================
+Fixture           Intent            Match basis     Outcome
+================  ================  ==============  ==================
+MEDSPA_INVENTORY  BUSINESS_PAIN     described       reaches AI
+MEDSPA_ESTHETIC.  BUSINESS_PAIN     described       reaches AI
+SOLO_MD_MARKET.   PROVIDER_REQUEST  adjacent        reaches AI
+NEW_MEDSPA_MARK.  PROVIDER_REQUEST  adjacent        reaches AI
+MANGOMINT_OR_BLV  TOOL_RESEARCH     named           research only
+BOULEVARD_SWITCH  TOOL_RESEARCH     none            never reaches AI
+WEB_DESIGN_CTA    (promotional)     n/a             never reaches AI
+MEDSPA_NOISE_*    various           none            never reaches AI
+================  ================  ==============  ==================
 """
 
 from __future__ import annotations
@@ -122,6 +137,147 @@ WEBSITE_WORTH_IT_ADVICE = (
 )
 
 # ---------------------------------------------------------------------------
+# The 2026-08-19 fresh-run medical spa scrape (Apify run Q3Ix6zmHrEDhgiQGf).
+#
+# The infrastructure worked: 50 posts, correctly attributed. Qualification
+# recall did not -- effectively nothing reached the model, including several
+# credible business problems and provider requests. These are the posts that
+# exposed it, lightly sanitised.
+#
+# The first six must reach the model. The rest must not, and are the reason
+# the recall fixes are narrow: a medical spa group talks about buying lasers
+# and syringes all day, and none of that is BruceTech work.
+# ---------------------------------------------------------------------------
+
+#: Operational systems failure with no software vocabulary anywhere in it.
+#: Previously UNRELATED with no service match.
+MEDSPA_INVENTORY_NO_SYSTEMS = (
+    "Hi I'm a new manager at a med spa and we have been having a issue with "
+    "inventory. We are missing about 200 units and nobody can tell me where "
+    "they went. I came into a business that is bleeding and no systems in "
+    "place and starting from the ground up and was trying to see the "
+    "different ways I could go about it."
+)
+
+#: "We offer" as context for a problem, not as an advertisement. Previously
+#: rejected as PROMOTIONAL_POST on those two words alone.
+MEDSPA_ESTHETICIAN_SCHEDULE = (
+    "Med spa owner here! What are some ways that helped fill up your "
+    "estheticians schedule? She is newer and we struggle to keep her busy. "
+    "We offer facials, DiamondGlow, SkinPen and a few other treatments but "
+    "her books are half empty most weeks."
+)
+
+#: The same words with a call to action. This one really is promotional.
+WEB_DESIGN_SELLER_CTA = (
+    "We offer web design and SEO for clinics across the GTA. Book a call "
+    "with me this week and I'll audit your site for free. Limited time."
+)
+
+#: Marketing provider request with a measurable acquisition goal.
+SOLO_MD_MARKETING_AGENCY = (
+    "I'm a solo MD looking for marketing agency or platform to get me "
+    "patients. Anyone have someone they actually trust? Happy to pay for "
+    "something that works."
+)
+
+NEW_MEDSPA_MARKETING_COMPANY = (
+    "I recently opened my own med spa and I am looking for a reliable "
+    "marketing company that actually delivers real results and brings in "
+    "real clients. Tired of paying for promises."
+)
+
+#: Software either/or over a named category. Previously UNRELATED.
+MANGOMINT_OR_BOULEVARD = (
+    "Mangomint or boulevard POS system and why? Trying to decide before we "
+    "open next month and I keep going back and forth on it."
+)
+
+BOULEVARD_SWITCHING_RESEARCH = (
+    "We currently use Boulevard and are thinking of switching to either "
+    "Mangomint or GlossGenius. Pros and cons? Curious what made people move."
+)
+
+# --- Must stay rejected before the AI ---------------------------------------
+
+#: Creative work only. A real provider request with no BruceTech fit.
+INFLUENCER_ONLY_REQUEST = (
+    "Looking for an influencer to promote our new facial line, and maybe a "
+    "photographer for content. Just brand awareness stuff for now."
+)
+
+INJECTOR_HIRING = (
+    "We are hiring an experienced injector for our clinic. Competitive pay, "
+    "must have 2 years experience with neurotoxins and filler. Send resume."
+)
+
+AESTHETIC_CHAIR_FOR_SALE = (
+    "Aesthetic treatment chair for sale, barely used, $1800 obo. Pick up "
+    "only, message me if interested."
+)
+
+#: Equipment shopping. Contains "platform" and "clinic" and is not our work.
+LASER_DEVICE_PURCHASE = (
+    "Looking at buying a laser device for hair removal. Anyone have "
+    "experience with the Candela vs Cynosure platforms for a small clinic?"
+)
+
+BOTOX_SYRINGE_PREFERENCE = (
+    "What syringe do you all prefer for botox injections? I've been using a "
+    "31g and wondering if there is something better out there."
+)
+
+SKINCARE_INGREDIENT_CHAT = (
+    "What's one skincare ingredient you think is seriously underrated? I "
+    "feel like niacinamide never gets the credit it deserves honestly."
+)
+
+HUNDRED_K_DEVICE_QUESTION = (
+    "If you had $100k to spend on one device, what would you buy and why? "
+    "Curious what everyone would pick if they were starting over."
+)
+
+TATTOO_REMOVAL_EQUIPMENT = (
+    "Tattoo removal equipment comparisons, anyone used the PicoWay vs "
+    "PicoSure? Trying to figure out which machine performs better."
+)
+
+CPA_SCORP_PROMOTION = (
+    "Most med spa owners overpay taxes. As a CPA I help clinics elect "
+    "S-Corp status and save thousands. DM me for a free consultation to "
+    "review your books."
+)
+
+NURSE_PRACTITIONER_JOB_SEEKER = (
+    "Nurse practitioner looking for work in the aesthetics space. 6 years "
+    "experience with injectables, resume attached, available for hire "
+    "immediately."
+)
+
+#: Every fresh-run post that must never reach the model, in one place.
+MEDSPA_NOISE_FIXTURES = {
+    "INFLUENCER_ONLY_REQUEST": INFLUENCER_ONLY_REQUEST,
+    "INJECTOR_HIRING": INJECTOR_HIRING,
+    "AESTHETIC_CHAIR_FOR_SALE": AESTHETIC_CHAIR_FOR_SALE,
+    "LASER_DEVICE_PURCHASE": LASER_DEVICE_PURCHASE,
+    "BOTOX_SYRINGE_PREFERENCE": BOTOX_SYRINGE_PREFERENCE,
+    "SKINCARE_INGREDIENT_CHAT": SKINCARE_INGREDIENT_CHAT,
+    "HUNDRED_K_DEVICE_QUESTION": HUNDRED_K_DEVICE_QUESTION,
+    "TATTOO_REMOVAL_EQUIPMENT": TATTOO_REMOVAL_EQUIPMENT,
+    "CPA_SCORP_PROMOTION": CPA_SCORP_PROMOTION,
+    "NURSE_PRACTITIONER_JOB_SEEKER": NURSE_PRACTITIONER_JOB_SEEKER,
+}
+
+#: Every fresh-run post that must reach the model.
+MEDSPA_CANDIDATE_FIXTURES = {
+    "MEDSPA_INVENTORY_NO_SYSTEMS": MEDSPA_INVENTORY_NO_SYSTEMS,
+    "MEDSPA_ESTHETICIAN_SCHEDULE": MEDSPA_ESTHETICIAN_SCHEDULE,
+    "SOLO_MD_MARKETING_AGENCY": SOLO_MD_MARKETING_AGENCY,
+    "NEW_MEDSPA_MARKETING_COMPANY": NEW_MEDSPA_MARKETING_COMPANY,
+}
+
+
+# ---------------------------------------------------------------------------
 # Supporting fixtures
 # ---------------------------------------------------------------------------
 
@@ -165,6 +321,11 @@ ALL_FIXTURES = {
     "CRM_RESEARCH": CRM_RESEARCH,
     "AIRBNB_TENANCY_ADVICE": AIRBNB_TENANCY_ADVICE,
     "WEBSITE_WORTH_IT_ADVICE": WEBSITE_WORTH_IT_ADVICE,
+    **MEDSPA_CANDIDATE_FIXTURES,
+    "MANGOMINT_OR_BOULEVARD": MANGOMINT_OR_BOULEVARD,
+    "BOULEVARD_SWITCHING_RESEARCH": BOULEVARD_SWITCHING_RESEARCH,
+    "WEB_DESIGN_SELLER_CTA": WEB_DESIGN_SELLER_CTA,
+    **MEDSPA_NOISE_FIXTURES,
     "PROMOTIONAL_AGENCY": PROMOTIONAL_AGENCY,
     "JOB_SEEKER": JOB_SEEKER,
     "API_INTEGRATION": API_INTEGRATION,

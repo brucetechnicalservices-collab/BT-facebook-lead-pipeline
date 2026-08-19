@@ -299,6 +299,37 @@ on 2026-08-18 exposed the assumption underneath defect 1.
 |---|---|---|
 | `human_override` was derived from the Airtable `Prequalification` **formula**, which is machine generated from the Request, Service, and Promotion signal columns and knows nothing about post age or human review | Six formula-marked records skipped the prefilter; five posts dated 2026-07-24 to 2026-08-01 — 17 to 25 days old against `MAX_POST_AGE_DAYS=5` — were sent to `gpt-5-mini` and all came back `STALE_POST`, after the calls had been paid for | The override now comes only from `Human Decision = Approve`. A non-overridable gate rejects stale, promotional, job-seeking, resolved, service-unmatched, and too-short posts before the queue and before the OpenAI client is constructed |
 
+### Defect 6, found by the first fresh scrape
+
+Apify run `Q3Ix6zmHrEDhgiQGf` (dataset `rVjOEFf81ZIT23RWl`, 50 posts) on
+2026-08-19 confirmed the attribution architecture end to end — every Raw
+Signal carried the run ID and linked to the correct Scraper Run record — and
+exposed the opposite failure from defect 5: recall.
+
+| Defect | Impact | Fix |
+|---|---|---|
+| Operational failure described without software vocabulary was `UNRELATED` | A med spa manager with "200 units missing" and "no systems in place" — a systems engagement in plain English — never reached the model | `OPERATIONS_PAIN_PATTERNS`, gated on commercial context, classify described failure as `BUSINESS_PAIN` and credit a `described` service match |
+| `"we offer"` alone set `PROMOTIONAL_POST` | An owner listing their treatments as context for a scheduling problem was rejected as an advertiser | Promotion requires seller-to-audience evidence; self-description is promotional only alongside a call to action |
+| Marketing provider requests matched no service | "A marketing agency to get me patients" — delivered through the site, SEO, booking flow and CRM BruceTech builds — was rejected `NO_SERVICE_MATCH` | A narrow `adjacent` path requiring provider ask + acquisition goal + commercial context, flagged `needs_ai_confirmation` |
+| Software either/or was not tool research | "Mangomint or boulevard POS system and why?" was `UNRELATED` | Named either/or over a *software* noun, and switching language, classify as `TOOL_RESEARCH` |
+
+Every widening here is paired with a suppression, because the same scrape is
+full of posts that must stay rejected. The **physical-goods guard** is the
+important one: a medical spa group discusses lasers, syringes, and treatment
+chairs constantly, and those posts contain "system", "platform", and "device".
+A post shopping for physical or clinical goods now gets no weak-signal service
+match at all.
+
+The guard is scoped to clinical and retail equipment on purpose. IT hardware —
+printers, workstations, servers — is BruceTech work and is deliberately
+outside it, asserted by a test.
+
+Recall work is the easiest place to lose precision quietly, so the fresh-run
+posts are fixtures on both sides: `MEDSPA_CANDIDATE_FIXTURES` must reach the
+model and `MEDSPA_NOISE_FIXTURES` must not, each asserted per post by name.
+No quota or ratio is encoded anywhere — the split is asserted as an exact set
+of fixture names, not a count.
+
 The lesson generalises past this field: **a machine-generated value must
 never stand in for a human decision.** `Prequalification` reads like an
 approval and is not one. Anything that grants a record an exemption has to

@@ -42,7 +42,8 @@ Deterministic intent classification (Python)
       │   Tool Research · General Advice · Unrelated
       ▼
 Word-boundary service matching (Python)
-      │   strong term · weak term + context · no match
+      │   named · described (operational failure) · adjacent (growth)
+      │   physical/clinical goods → no weak match
       ▼
 Prefilter Score ─── gates the AI call, orders the queue
       │             (general advice and unrelated stop here, for free)
@@ -290,6 +291,51 @@ language, and a score of at least `PREFILTER_PASS_SCORE` (default `30`).
 
 Comment volume is a **prioritisation** signal, not a rejection. A strong lead
 in a busy thread still reaches the model; it just sorts lower.
+
+### Three ways to match a service
+
+A post can establish BruceTech fit three ways. The basis is recorded on every
+record as `match_basis`, so an operator can tell a stated requirement from an
+inferred one.
+
+| Basis | Rule | Example |
+| --- | --- | --- |
+| `named` | The post uses BruceTech vocabulary | "the whole GoHighLevel setup" |
+| `described` | It describes an operational systems failure, from a business with commercial context | "200 units missing and no systems in place" |
+| `adjacent` | It asks a provider for measurable client acquisition, which BruceTech serves through the site, SEO, booking flow and CRM underneath | "a marketing agency to get me patients" |
+
+`described` and `adjacent` never produce a *strong* match. They credit the
+categories BruceTech would actually deliver and lean on the model for the
+commercial judgement — an `adjacent` match is flagged `needs_ai_confirmation`,
+and `NO_SERVICE_MATCH` still applies to whatever the model returns. Both
+require commercial context; neither is available to an anonymous post.
+
+A request naming only creative or physical-media work — influencers, content
+creators, photographers, PR, branding, print — is excluded from `adjacent`
+unless it also names something BruceTech builds.
+
+### The physical-goods guard
+
+BruceTech does not sell, service, or advise on physical clinical equipment. A
+post shopping for goods gets no weak-signal service match, whatever
+vocabulary it happens to contain:
+
+> "Looking at buying a laser device… the Candela vs Cynosure **platforms** for
+> a small **clinic**"
+
+Two corroborating weak signals, and not a lead. IT hardware is deliberately
+outside the guard — a dead printer or a crashed workstation is BruceTech work.
+
+### Promotion needs a call to action
+
+Describing what your business sells is not advertising it. "We offer facials,
+DiamondGlow and SkinPen, but her books are half empty" is a business owner
+giving context for a problem.
+
+`PROMOTIONAL_POST` requires seller-to-audience evidence — "DM me", "book now",
+"limited time", "for sale", "free consultation". Self-description alone
+("we offer", "our services", "we provide") is recorded in the diagnostics and
+rejects nothing on its own.
 
 ---
 

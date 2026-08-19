@@ -1667,6 +1667,9 @@ def build_ai_output(
         payload["prefilter_score"] = prefilter.score
         payload["prefilter_breakdown"] = prefilter.breakdown
         payload["service_categories"] = prefilter.service_categories
+        # How the service match was established. "adjacent" means Python
+        # inferred fit and the model's answer is what settles it.
+        payload["match_basis"] = prefilter.match_basis
 
     try:
         return json.dumps(payload, indent=2, sort_keys=True, default=str)
@@ -1891,6 +1894,7 @@ def build_prefilter_rejection_update(
         "prefilter_breakdown": prefilter.breakdown,
         "reasons": prefilter.reasons,
         "rejection_codes": codes,
+        "match_basis": prefilter.match_basis,
         "ai_called": False,
     }
 

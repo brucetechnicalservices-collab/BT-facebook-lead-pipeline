@@ -15,6 +15,69 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Fixed — qualification recall was too low to find real leads
+
+Found by the first fresh scrape, Apify run `Q3Ix6zmHrEDhgiQGf` (dataset
+`rVjOEFf81ZIT23RWl`, 50 posts) on 2026-08-19. Attribution and scraper-run
+logging were correct — all 50 Raw Signals carried the run ID and linked to the
+right Scraper Run record — but effectively nothing reached the model, several
+credible business problems and two explicit provider requests included.
+
+Four recall defects, each fixed narrowly:
+
+**Operational failure described in plain English was invisible.** A med spa
+manager with "200 units missing" and "no systems in place" classified as
+`UNRELATED` with no service match. `OPERATIONS_PAIN_PATTERNS` now recognises
+absent systems, inventory and reconciliation failures, and scheduling or
+booking breakdowns — as *problems*, never as nouns. "Inventory" alone matches
+nothing. Gated on commercial context, so a consumer grumble stays `UNRELATED`.
+
+**"We offer" made a post promotional.** Describing what a business sells is
+not advertising it. `PROMOTIONAL_TERMS` now holds only seller-to-audience
+evidence — "DM me", "book now", "limited time", "for sale". Self-description
+moved to `PROMOTIONAL_SELF_DESCRIPTION_TERMS` and is promotional only
+alongside a call to action; on its own it is recorded in the diagnostics and
+rejects nothing.
+
+**Marketing provider requests had no path.** "A marketing agency to get me
+patients" is not a website request, but digital client acquisition is
+delivered through the site, SEO, booking flow, CRM, and follow-up automation
+underneath it. A narrow `adjacent` path requires an explicit provider ask,
+a measurable acquisition goal, and commercial context; it credits only the
+categories BruceTech would deliver, flags itself `needs_ai_confirmation`, and
+leaves real fit to the model. Requests for influencers, content creators,
+photographers, PR, branding, or print media are excluded outright unless
+something BruceTech builds is named alongside.
+
+**Software comparisons were not tool research.** "Mangomint or boulevard POS
+system and why?" classified as `UNRELATED`. Named either/or over a *software*
+noun, and switching language, now classify as `TOOL_RESEARCH` — which is
+AI-eligible but never auto-contacted.
+
+The counterweight is a physical-goods guard. A medical spa group discusses
+lasers, syringes, and treatment chairs constantly, and those posts are full of
+words like "system", "platform", and "device". A post shopping for physical or
+clinical goods now gets no weak-signal service match at all. IT hardware is
+deliberately outside the guard: a dead printer is BruceTech work.
+
+Every record now records `match_basis` — `named`, `described`, `adjacent`, or
+`none` — so an operator can tell a stated requirement from an inferred one.
+
+No scoring weight, threshold, or gate changed. The stale gate, `Human
+Decision` behaviour, deduplication, attribution, retry architecture, and write
+protection are untouched, each asserted by a test.
+
+### Changed — operator-visible Airtable intent formulas
+
+`airtable_formulas.py` holds pasteable sources for `Provider Intent Signal`,
+`Research Intent Signal`, and `Intent Type`, closing the gaps the fresh run
+showed: a marketing-agency provider request read as "Other" with
+`Provider Intent Signal = 0`.
+
+These decide nothing. `intent.py` remains authoritative, a test asserts
+`run_pipeline` never imports the module, and applying them to the base is a
+manual step the pipeline does not depend on.
+
 ### Fixed — an Airtable formula was acting as human approval, and stale posts were reaching the model
 
 Found by the first production run of this branch,

@@ -985,6 +985,23 @@ PREFILTER_FREE_ONLY_PENALTY = 25
 PREFILTER_NO_SERVICE_PENALTY = 20
 
 
+def describe_match_basis(services: Any) -> str:
+    """Name how a service match was established, for the audit trail."""
+    if not getattr(services, "matched", False):
+        return "none"
+
+    if getattr(services, "strong_terms", None) or not (
+        getattr(services, "operations_pain", None)
+        or getattr(services, "adjacent_growth", None)
+    ):
+        return "named"
+
+    if getattr(services, "adjacent_growth", None):
+        return "adjacent"
+
+    return "described"
+
+
 @dataclass
 class PrefilterResult:
     """Outcome of the deterministic, pre-AI screen."""
@@ -1003,6 +1020,15 @@ class PrefilterResult:
     #: the post-AI hard rejections. ``reasons`` is prose for a human reading
     #: Airtable; this is what the pipeline branches on. Empty when ``passed``.
     rejection_codes: list[str] = field(default_factory=list)
+    #: How the service match was established: "named" (the post used
+    #: BruceTech vocabulary), "described" (it described an operational systems
+    #: failure), "adjacent" (it asked for client acquisition BruceTech serves
+    #: through the site, SEO, booking and CRM underneath), or "none".
+    #:
+    #: Recorded so an operator reading Airtable can tell a stated requirement
+    #: from an inferred one. "adjacent" in particular means the model, not
+    #: Python, decides whether real fit exists.
+    match_basis: str = "none"
 
     @property
     def is_provider_request(self) -> bool:
@@ -1102,6 +1128,7 @@ def prefilter_post(
     # "UNRELATED" regardless of what it actually said.
     intent_result = intent.classify_intent(body)
     services = intent.match_services(body)
+    match_basis = describe_match_basis(services)
 
     def rejected(reason: str, code: str) -> PrefilterResult:
         return PrefilterResult(
@@ -1114,6 +1141,7 @@ def prefilter_post(
             service_matched=services.matched,
             service_categories=list(services.categories),
             rejection_codes=[code],
+            match_basis=match_basis,
         )
 
     if len(body) < MIN_PREFILTER_TEXT_LENGTH:
@@ -1272,4 +1300,5 @@ def prefilter_post(
         breakdown=breakdown,
         # A post that passed carries no rejection codes, by construction.
         rejection_codes=[] if passed else codes,
+        match_basis=match_basis,
     )
