@@ -90,48 +90,71 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ==================================================================
-      # TEMPORARY: Suggested Comment OpenAI smoke test.
-      #
-      # This step replaces the production pipeline run for one manual
-      # execution. It calls scripts/suggested_comment_smoke_test.py, which
-      # exercises run_pipeline.qualify_post against five in-memory records.
-      #
-      # OpenAI is the ONLY external service reachable here. Every Airtable
-      # and Apify credential is deliberately blank, so any accidental call
-      # would fail loudly rather than touch production data.
-      #
-      # REVERT THIS STEP after the smoke test log is captured.
-      # ==================================================================
-      - name: Suggested Comment OpenAI smoke test (TEMPORARY)
+      - name: Run BruceTech lead pipeline
         env:
-          # The only credential this step is given.
+          # Secrets. Never hard-code these values.
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          APIFY_TASK_ID: ${{ secrets.APIFY_TASK_ID }}
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # Deliberately blank. Nothing here may reach Airtable or Apify.
-          AIRTABLE_TOKEN: ""
-          AIRTABLE_BASE_ID: ""
-          AIRTABLE_TABLE_NAME: ""
-          APIFY_TOKEN: ""
-          APIFY_TASK_ID: ""
-          RUN_APIFY_TASK: "false"
-          DRY_RUN: "true"
-
-          # Production model and qualification settings, so the smoke test
-          # exercises exactly what production would.
+          # Model configuration.
           OPENAI_MODEL: "gpt-5-mini"
           OPENAI_MAX_OUTPUT_TOKENS: "2500"
           OPENAI_MAX_ATTEMPTS: "3"
           OPENAI_RETRY_DELAY_SECONDS: "5"
+
+          # Qualification thresholds.
           QUALIFICATION_THRESHOLD: "65"
           MANUAL_REVIEW_THRESHOLD: "55"
           HOT_LEAD_THRESHOLD: "80"
+
+          # Lowered from 45. The scraper works a ~3-day window and a request
+          # older than a work week has usually been answered already.
           MAX_POST_AGE_DAYS: "5"
+
+          # Stamped on every record this release evaluates, so legacy and new
+          # qualification results stay comparable. Historical records are
+          # never rewritten.
           QUALIFICATION_VERSION: "facebook-v2"
+
+          # Outreach gating. Outreach Ready is strictly narrower than
+          # Qualified: see README.md.
           MIN_OUTREACH_CONFIDENCE: "0.55"
           BUSINESS_PAIN_OUTREACH_MIN_SCORE: "70"
           ALLOW_TOOL_RESEARCH_TO_AI: "true"
+
+          # Queue behaviour.
+          # Dry run makes no Airtable writes and starts no paid Apify run.
+          DRY_RUN: >-
+            ${{ github.event.inputs.dry_run || 'false' }}
+          AI_BATCH_LIMIT: >-
+            ${{ github.event.inputs.ai_batch_limit || '40' }}
           MAX_POST_CHARS: "8000"
+          AIRTABLE_FORMULA_WAIT_SECONDS: "15"
           ENFORCE_PYTHON_PREFILTER: "true"
           PREFILTER_PASS_SCORE: "30"
-        run: python scripts/smoke_suggested_comment.py
+          REQUIRE_AIRTABLE_PREQUALIFICATION: "false"
+
+          # Bounded AI error recovery. A transient failure is retried on a
+          # later run; three failures retire the record from the queue.
+          RETRY_AI_ERRORS: "true"
+          AI_ERROR_MAX_ATTEMPTS: "3"
+
+          # Apify run attribution. Every imported post is tied to one exact
+          # run, which is logged to Facebook Post Scraper Runs.
+          RUN_APIFY_TASK: >-
+            ${{ github.event.inputs.start_new_apify_run || 'false' }}
+          APIFY_RUN_ID: >-
+            ${{ github.event.inputs.apify_run_id || '' }}
+          APIFY_RUN_TIMEOUT_SECONDS: "900"
+          APIFY_POLL_INTERVAL_SECONDS: "15"
+          LOG_SCRAPER_RUNS: "true"
+
+          # Feedback loop.
+          UPDATE_GROUP_PERFORMANCE: "true"
+          AIRTABLE_SCRAPER_RUNS_TABLE: "Facebook Post Scraper Runs"
+          AIRTABLE_GROUP_PERFORMANCE_TABLE: "Facebook Group Performance"
+        run: python run_pipeline.py
