@@ -40,9 +40,12 @@ import scraper_runs
 from normalization import (
     build_seen_keys,
     deduplicate_posts,
+    identity_from_apify,
+    is_duplicate,
     normalize_facebook_url,
 )
 from qualification import (
+    CHANNEL_DO_NOT_CONTACT,
     DEFAULT_BUSINESS_PAIN_OUTREACH_SCORE,
     DEFAULT_HOT_THRESHOLD,
     DEFAULT_MANUAL_REVIEW_THRESHOLD,
@@ -138,9 +141,18 @@ def require_env(name: str) -> str:
 
 OPENAI_MODEL = env_str("OPENAI_MODEL", "gpt-5-mini")
 
-#: How many OpenAI calls one run may make. This is a *spend* limit and
-#: nothing else: it caps calls, never how many records are evaluated.
-AI_BATCH_LIMIT = env_int("AI_BATCH_LIMIT", 20)
+#: How many RECORDS one run may send to the model. This is a *spend* limit
+#: and nothing else: it caps records, never how many records are evaluated.
+#:
+#: It is not a cap on HTTP requests. Each record may cost up to
+#: OPENAI_MAX_ATTEMPTS requests when the model errors or returns an
+#: incomplete response, so the worst case here is
+#: AI_BATCH_LIMIT * OPENAI_MAX_ATTEMPTS. See OPENAI_REQUEST_BUDGET.
+#: The application default, named so the workflow, the README, and the
+#: consistency test can all agree on one number instead of three literals.
+DEFAULT_AI_BATCH_LIMIT = 20
+
+AI_BATCH_LIMIT = env_int("AI_BATCH_LIMIT", DEFAULT_AI_BATCH_LIMIT)
 
 #: How many historical backlog records to pull in for deterministic
 #: evaluation each run.
@@ -168,7 +180,26 @@ MAX_POST_AGE_DAYS = env_int("MAX_POST_AGE_DAYS", DEFAULT_MAX_POST_AGE_DAYS)
 
 AIRTABLE_FORMULA_WAIT_SECONDS = env_int("AIRTABLE_FORMULA_WAIT_SECONDS", 15)
 OPENAI_MAX_OUTPUT_TOKENS = env_int("OPENAI_MAX_OUTPUT_TOKENS", 2500)
-OPENAI_MAX_ATTEMPTS = env_int("OPENAI_MAX_ATTEMPTS", 3)
+#: How many requests one record may cost when the model errors or truncates.
+DEFAULT_OPENAI_MAX_ATTEMPTS = 3
+
+OPENAI_MAX_ATTEMPTS = env_int(
+    "OPENAI_MAX_ATTEMPTS", DEFAULT_OPENAI_MAX_ATTEMPTS
+)
+
+#: Hard ceiling on responses.create() calls for the whole run.
+#:
+#: AI_BATCH_LIMIT counts records; this counts actual API requests, which is
+#: what the invoice counts. With the defaults a run of 20 records that all
+#: retried twice would issue 60 requests, and before this existed nothing
+#: stopped it. Set to 0 to disable the ceiling.
+#:
+#: The default is deliberately generous -- it is a runaway stop, not a
+#: throttle -- and is computed from the two settings above so that lowering
+#: AI_BATCH_LIMIT for a test lowers the ceiling with it.
+OPENAI_REQUEST_BUDGET = env_int(
+    "OPENAI_REQUEST_BUDGET", AI_BATCH_LIMIT * OPENAI_MAX_ATTEMPTS
+)
 OPENAI_RETRY_DELAY_SECONDS = env_int("OPENAI_RETRY_DELAY_SECONDS", 5)
 MAX_POST_CHARS = env_int("MAX_POST_CHARS", 8000)
 
@@ -492,6 +523,45 @@ def reset_openai_client() -> None:
     _OPENAI_CLIENT = None
 
 
+class OpenAIBudgetExhausted(RuntimeError):
+    """The run has issued its whole OPENAI_REQUEST_BUDGET of API requests."""
+
+
+#: Actual responses.create() calls issued by this run, retries included.
+_OPENAI_REQUESTS_MADE = 0
+
+
+def openai_requests_made() -> int:
+    """How many API requests this run has issued so far."""
+    return _OPENAI_REQUESTS_MADE
+
+
+def reset_openai_request_budget() -> None:
+    """Zero the request counter. Used by tests and at the start of a run."""
+    global _OPENAI_REQUESTS_MADE
+    _OPENAI_REQUESTS_MADE = 0
+
+
+def consume_openai_request() -> None:
+    """
+    Account for one API request, refusing to exceed the run budget.
+
+    Called immediately before every responses.create(), so retries are
+    counted the same as first attempts. AI_BATCH_LIMIT caps records; this
+    caps requests, which is what actually gets billed.
+    """
+    global _OPENAI_REQUESTS_MADE
+
+    if OPENAI_REQUEST_BUDGET and _OPENAI_REQUESTS_MADE >= OPENAI_REQUEST_BUDGET:
+        raise OpenAIBudgetExhausted(
+            f"This run has issued its full budget of "
+            f"{OPENAI_REQUEST_BUDGET} OpenAI requests "
+            f"(OPENAI_REQUEST_BUDGET). No further requests will be made."
+        )
+
+    _OPENAI_REQUESTS_MADE += 1
+
+
 # ---------------------------------------------------------------------------
 # OpenAI instructions
 #
@@ -808,13 +878,59 @@ def chunks(items: list[Any], size: int) -> Iterator[list[Any]]:
         yield items[index:index + size]
 
 
+class AmbiguousWriteError(RuntimeError):
+    """
+    A non-idempotent request failed in a way that cannot be resolved locally.
+
+    The request may or may not have been accepted by the server. Retrying it
+    would risk creating a second record or starting a second paid Apify run,
+    so the pipeline stops and lets the caller reconcile against reality.
+    """
+
+
+#: HTTP methods that are safe to replay. A retried POST creates a second
+#: resource; a retried GET or PATCH-by-record-id does not.
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"})
+
+
+def _is_pre_send_failure(exc: Exception) -> bool:
+    """
+    Did this failure happen before the server could have accepted the request?
+
+    Only a connect timeout proves it: the TCP connection was never
+    established, so no bytes reached the server. A read timeout is the
+    dangerous one -- the request was sent and the *response* was lost, which
+    looks identical to a network blip and is not.
+    """
+    return isinstance(exc, requests.ConnectTimeout)
+
+
 def request_with_retry(
     method: str,
     url: str,
     *,
     max_attempts: int = 5,
+    idempotent: bool | None = None,
     **kwargs: Any,
 ) -> requests.Response:
+    """
+    Send an HTTP request, retrying only where a replay is actually safe.
+
+    Idempotent methods retry on network errors and on 429/5xx as before.
+
+    Non-idempotent methods (POST) are treated as write-once. They retry only
+    when the failure provably happened *before* the server saw the request:
+    a connect timeout, or a 429, which means the request was rejected rather
+    than processed. Anything else -- a read timeout, a dropped connection
+    mid-flight, a 500 -- is ambiguous, and raises AmbiguousWriteError instead
+    of being replayed.
+
+    This is the difference between a duplicated Airtable record and a clear
+    failure the operator can reconcile.
+    """
+    if idempotent is None:
+        idempotent = method.upper() in IDEMPOTENT_METHODS
+
     last_error: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
@@ -822,6 +938,14 @@ def request_with_retry(
             response = requests.request(method, url, timeout=120, **kwargs)
         except requests.RequestException as exc:
             last_error = exc
+
+            if not idempotent and not _is_pre_send_failure(exc):
+                raise AmbiguousWriteError(
+                    f"{method.upper()} {url} failed after the request was "
+                    f"sent ({exc}). It may have been accepted. Not retrying: "
+                    f"a replay could duplicate the write."
+                ) from exc
+
             if attempt == max_attempts:
                 break
 
@@ -837,6 +961,15 @@ def request_with_retry(
             return response
 
         if response.status_code in {429, 500, 502, 503, 504}:
+            # 429 means the request was rejected before it was processed, so
+            # replaying it is safe for any method. A 5xx is ambiguous.
+            if not idempotent and response.status_code != 429:
+                raise AmbiguousWriteError(
+                    f"{method.upper()} {url} returned "
+                    f"{response.status_code}. The write may have been "
+                    f"applied. Not retrying: a replay could duplicate it."
+                )
+
             if attempt == max_attempts:
                 response.raise_for_status()
 
@@ -1147,6 +1280,69 @@ def map_apify_to_airtable(
     return mapped
 
 
+#: Prefix for the synthetic record IDs used only in dry-run mode. These never
+#: reach Airtable: DRY_RUN blocks every write path before one could.
+DRY_RUN_RECORD_PREFIX = "dryrun-"
+
+
+def build_dry_run_records(
+    posts: list[dict[str, Any]],
+    *,
+    apify_run_id: str = "",
+    scraper_run_record_id: str = "",
+) -> list[dict[str, Any]]:
+    """
+    Shape this run's new posts as in-memory records for a dry run.
+
+    A dry run creates nothing, so the newly scraped posts have no Airtable
+    record IDs and used to vanish before the prefilter -- the run reported on
+    the backlog and said nothing at all about the scrape it had just read.
+    That is the opposite of what a dry run is for.
+
+    These carry the same fields the real import would write, so they go
+    through the identical prefilter, queue ordering, and qualification path.
+    Their IDs are synthetic and clearly marked; nothing writes them anywhere.
+    """
+    return [
+        {
+            "id": f"{DRY_RUN_RECORD_PREFIX}{index:04d}",
+            "fields": map_apify_to_airtable(
+                post,
+                apify_run_id=apify_run_id,
+                scraper_run_record_id=scraper_run_record_id,
+            ),
+        }
+        for index, post in enumerate(posts)
+    ]
+
+
+def reconcile_import(posts: list[dict[str, Any]]) -> str:
+    """
+    After an ambiguous create, report which of these posts are now in Airtable.
+
+    Reads the identity keys back and counts how many of the batch landed. The
+    pipeline does not retry the write: the next run deduplicates against these
+    same keys, so whatever arrived is kept and whatever did not is imported
+    then. This exists so the operator sees the real state instead of guessing.
+    """
+    try:
+        seen = fetch_existing_identity_keys()
+    except Exception as exc:  # noqa: BLE001 - reconciliation is best effort
+        return f"could not re-read Airtable to reconcile ({exc})"
+
+    landed = sum(
+        1
+        for post in posts
+        if is_duplicate(identity_from_apify(post), seen)
+    )
+
+    return (
+        f"{landed} of {len(posts)} posts from this batch are present in "
+        f"Airtable. Nothing was retried. The next run will import the "
+        f"remainder and skip the rest by deduplication."
+    )
+
+
 def create_new_posts_in_airtable(
     posts: list[dict[str, Any]],
     *,
@@ -1188,7 +1384,16 @@ def create_new_posts_in_airtable(
         for post in posts
     ]
 
-    created_records = create_table_records(airtable_url(), mapped)
+    try:
+        created_records = create_table_records(airtable_url(), mapped)
+    except AmbiguousWriteError as exc:
+        # The POST may or may not have landed. Reconcile against Airtable
+        # rather than replaying it, which is what would duplicate records.
+        raise AmbiguousWriteError(
+            f"{exc} Reconciling before anything else happens: "
+            f"{reconcile_import(posts)}"
+        ) from exc
+
     created_record_ids = [
         record["id"] for record in created_records if record.get("id")
     ]
@@ -1328,6 +1533,12 @@ RETRY_STORE = ai_retry.RetryStore(
     output_field=FIELD_AI_OUTPUT,
     attempts_field=env_str("AIRTABLE_AI_ATTEMPTS_FIELD", ""),
     error_status=AI_STATUS_ERROR,
+    # A failed reprocess withdraws outreach eligibility. Lead Score, Lead
+    # Tier, Qualified, and the summary all survive as history.
+    outreach_ready_field=FIELD_OUTREACH_READY,
+    outreach_copy_fields=(FIELD_SUGGESTED_DM, FIELD_SUGGESTED_COMMENT),
+    outreach_channel_field=FIELD_RECOMMENDED_CHANNEL,
+    outreach_channel_off=CHANNEL_DO_NOT_CONTACT,
 )
 
 
@@ -1650,6 +1861,11 @@ POST URL:
         try:
             token_limit = OPENAI_MAX_OUTPUT_TOKENS + ((attempt - 1) * 1000)
 
+            # Charged before the call, so a request that is made but fails
+            # still counts against the budget. This is the only place
+            # responses.create() is reached from.
+            consume_openai_request()
+
             response = client.responses.create(
                 model=OPENAI_MODEL,
                 instructions=SYSTEM_INSTRUCTIONS,
@@ -1685,6 +1901,10 @@ POST URL:
 
             return json.loads(output_text)
 
+        except OpenAIBudgetExhausted:
+            # Not a per-record failure. Retrying cannot help, and the whole
+            # run must stop asking.
+            raise
         except Exception as exc:
             last_error = exc
 
@@ -1728,6 +1948,41 @@ def collect_policy_disqualifiers(fields: dict[str, Any]) -> list[str]:
     return codes
 
 
+def is_explicit_service_request(prefilter: PrefilterResult | None) -> bool:
+    """
+    Is this an unmistakable request for a service BruceTech actually sells?
+
+    Both halves are required.
+
+    The intent must be a request for a provider or an implementation, not
+    pain, research, or chatter.
+
+    The service must be **strongly** named: an unambiguous term the author
+    typed, such as "gohighlevel" or "microsoft 365". This reads
+    ``strong_service_match`` rather than ``match_basis == "named"`` on
+    purpose. That basis also covers a match assembled from two weak
+    categories -- "our payment system" is "named" by that measure -- which is
+    far too soft to waive a hard rejection on.
+
+    "I need help with GoHighLevel. I need an expert." qualifies. "A marketing
+    agency to get me patients" does not: that fit is adjacent, and the model
+    rules on it. "Someone to fix our payment system" does not either: no
+    single term there is unambiguous.
+    """
+    if prefilter is None:
+        return False
+
+    return bool(
+        prefilter.service_matched
+        and prefilter.strong_service_match
+        and prefilter.intent_type
+        in (
+            intent.INTENT_PROVIDER_REQUEST,
+            intent.INTENT_IMPLEMENTATION_REQUEST,
+        )
+    )
+
+
 def qualify_post(
     fields: dict[str, Any],
     *,
@@ -1766,6 +2021,10 @@ def qualify_post(
         business_pain_min_score=BUSINESS_PAIN_OUTREACH_MIN_SCORE,
         extra_disqualifiers=collect_policy_disqualifiers(fields),
         human_override=human_override,
+        # An unambiguous ask for a named BruceTech service. Thin business
+        # context downgrades such a record to Manual Review instead of
+        # hard-rejecting it as NO_BUSINESS_CONTEXT.
+        explicit_service_request=is_explicit_service_request(prefilter),
     )
 
     return decision, signals
@@ -2087,6 +2346,8 @@ class RunSummary:
     skipped_retry_exhausted: int = 0
     prefilter_accepted: int = 0
     prefilter_rejected: int = 0
+    #: True when the run stopped early on OPENAI_REQUEST_BUDGET.
+    budget_exhausted: bool = False
     #: Rejected before the AI call because the post was past MAX_POST_AGE_DAYS.
     #: Counted inside prefilter_rejected; broken out so a run that spends
     #: nothing on expired leads says so on its own line.
@@ -2130,6 +2391,8 @@ class RunSummary:
                 f"  Tool research         {self.tool_research}",
                 "",
                 f"  AI processed          {self.ai_processed}",
+                f"  OpenAI requests       {openai_requests_made()}"
+                + (" (BUDGET EXHAUSTED)" if self.budget_exhausted else ""),
                 f"  AI errors             {self.ai_errors}",
                 f"  Hot                   {self.hot}",
                 f"  Qualified             {self.qualified}",
@@ -2342,6 +2605,22 @@ def process_ai_queue(
                 )
 
             flush()
+
+        except OpenAIBudgetExhausted as exc:
+            # The run has spent its request budget. Every remaining record
+            # would fail the same way, and marking them all as AI errors
+            # would burn their retry budgets for a problem that is not
+            # theirs. Stop asking and leave them Pending for the next run.
+            summary.budget_exhausted = True
+            print(
+                f"[{index}/{len(prioritized)}] {exc} "
+                f"Stopping the queue; {len(prioritized) - index + 1} "
+                f"records remain Pending for the next run.",
+                file=sys.stderr,
+                flush=True,
+            )
+            summary.ai_processed -= 1
+            break
 
         except Exception as exc:  # noqa: BLE001 - one bad record must not
             # abort the batch; the failure is recorded and bounded.
@@ -2582,6 +2861,7 @@ def main() -> None:
         )
 
     summary = RunSummary()
+    reset_openai_request_budget()
 
     if not DRY_RUN:
         validate_airtable_schema()
@@ -2630,7 +2910,28 @@ def main() -> None:
 
     # 3. Prioritise the backlog, then qualify.
     ai_records = fetch_ai_queue(created_record_ids)
-    prioritized = prioritize_ai_queue(ai_records, set(created_record_ids))
+    current_run_ids = set(created_record_ids)
+
+    if DRY_RUN and new_posts:
+        # Nothing was created, so evaluate the scrape in memory instead. This
+        # is the whole point of a dry run: see what today's posts would do.
+        dry_run_records = build_dry_run_records(
+            new_posts,
+            apify_run_id=run.id,
+            scraper_run_record_id=(
+                scraper_run.record_id if scraper_run else ""
+            ),
+        )
+        print(
+            f"[DRY RUN] Evaluating {len(dry_run_records)} newly scraped "
+            f"posts in memory. They are not in Airtable and are not "
+            f"written there.",
+            flush=True,
+        )
+        ai_records = dry_run_records + ai_records
+        current_run_ids |= {record["id"] for record in dry_run_records}
+
+    prioritized = prioritize_ai_queue(ai_records, current_run_ids)
     process_ai_queue(prioritized, summary=summary)
 
     # 4. Refresh the measurement loop.

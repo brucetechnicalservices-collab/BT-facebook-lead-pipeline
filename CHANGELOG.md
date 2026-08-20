@@ -15,6 +15,65 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Fixed — five reliability defects found reviewing this PR
+
+**An explicit service request could be thrown away for thin context.** "I need
+help with GoHighLevel. Any recommendations? I need an expert." was
+hard-rejected as `NO_BUSINESS_CONTEXT` in the 2026-08-19 smoke test, because
+the post says nothing about the business behind it. It is still an
+unmistakable request for a service BruceTech sells. When the intent is a
+provider or implementation request and the service is *named* rather than
+inferred, thin context now routes the record to Manual Review instead of the
+bin. The waiver lifts nothing else, and never produces automatic outreach.
+
+**Non-idempotent POSTs were replayed after ambiguous failures.** A read
+timeout or a 500 on an Airtable create looks identical to a network blip and
+is not: the write may already have landed. `request_with_retry` now treats
+POST as write-once, retrying only where a replay is provably safe (a connect
+timeout, or a 429), and raising `AmbiguousWriteError` otherwise. An ambiguous
+Airtable create is reconciled — the pipeline re-reads the identity keys and
+reports how many of the batch landed — rather than resent. The same guard
+covers the Apify run-start POST, where a duplicate is a duplicate invoice.
+
+**A dry run ignored the scrape it had just read.** New posts have no record
+IDs in a dry run, and the queue is fetched by ID, so they vanished before the
+prefilter: the run reported on the stale backlog and said nothing about
+today's posts. They are now evaluated as in-memory records through the
+identical path, with `dryrun-` IDs that nothing writes anywhere.
+
+**A failed reprocess left stale outreach live.** The failure payload was
+deliberately narrow so a transient error could not blank a record's lead
+data. That also left `Outreach Ready = true` and a populated DM from an
+earlier decision the pipeline could no longer reproduce. It now withdraws
+outreach eligibility and blanks both copy fields while preserving
+`Lead Score`, `Qualified`, `Lead Tier`, `Lead Summary`, and `Evidence`, and
+records `outreach_suspended` in the diagnostics. The next successful run
+restores it.
+
+**`AI_BATCH_LIMIT` was not a spend limit.** It counts records; each record can
+cost up to `OPENAI_MAX_ATTEMPTS` requests, so a limit of 5 permitted 15 billed
+calls. `OPENAI_REQUEST_BUDGET` is a new run-level ceiling on actual
+`responses.create()` calls, charged before every request including retries,
+defaulting to `AI_BATCH_LIMIT × OPENAI_MAX_ATTEMPTS`. When it runs out the
+queue stops rather than burning every remaining record's retry budget, and the
+run summary reports the true request count.
+
+Both limits are exposed as `workflow_dispatch` inputs, and the record limit is
+now described as "maximum records evaluated by AI" rather than "max AI calls",
+which is the wording that caused the confusion. README documents recommended
+pairings.
+
+The `NO_BUSINESS_CONTEXT` waiver reads a new `PrefilterResult
+.strong_service_match` rather than inferring strength from `match_basis`. A
+basis of `named` also covers a match assembled from two weak categories
+("our payment system"), which is far too soft to waive a hard rejection on;
+only an unambiguous term the author typed earns it.
+
+A failed reprocess also resets `Recommended channel` to `do_not_contact`.
+`Outreach Ready` is the gate this pipeline enforces, but outreach itself is
+performed by a person reading the row, and a leftover `direct_message` on a
+superseded decision reads as an instruction.
+
 ### Added — Suggested Comment for Outreach Ready leads
 
 Every Outreach Ready lead now gets a short public Facebook comment alongside

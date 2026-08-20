@@ -528,6 +528,7 @@ def collect_hard_rejections(
     post_text: Any = None,
     extra_codes: Sequence[str] = (),
     human_override: bool = False,
+    explicit_service_request: bool = False,
 ) -> list[str]:
     """
     Return every hard rejection code that applies to these signals.
@@ -580,7 +581,17 @@ def collect_hard_rejections(
         add(REJECT_INAPPROPRIATE_OUTREACH)
 
     if normalize_enum(signals.get("business_context"), default="none") == "none":
-        add(REJECT_NO_BUSINESS_CONTEXT)
+        # An explicit request for a provider, naming a BruceTech service, is
+        # its own business context. "I need help with GoHighLevel, I need an
+        # expert" says nothing about the company behind it, and the model
+        # reported business_context = none, which hard-rejected a real
+        # provider request in the 2026-08-19 smoke test.
+        #
+        # Thin context is a reason for a human to look, not a reason to throw
+        # the lead away. The tier is capped at Manual Review in
+        # evaluate_lead() so it can never become automatic outreach.
+        if not explicit_service_request:
+            add(REJECT_NO_BUSINESS_CONTEXT)
 
     if not matched_service_categories(signals.get("service_categories")):
         add(REJECT_NO_SERVICE_MATCH)
@@ -782,6 +793,7 @@ def evaluate_lead(
     business_pain_min_score: int = DEFAULT_BUSINESS_PAIN_OUTREACH_SCORE,
     extra_disqualifiers: Sequence[str] = (),
     human_override: bool = False,
+    explicit_service_request: bool = False,
 ) -> LeadDecision:
     """
     Turn structured AI signals into the final, authoritative decision.
@@ -816,8 +828,16 @@ def evaluate_lead(
         post_text=post_text,
         extra_codes=extra_disqualifiers,
         human_override=human_override,
+        explicit_service_request=explicit_service_request,
     )
     hard_rejected = bool(hard_codes)
+
+    # Did the thin-context waiver above actually apply to this record?
+    thin_context_waived = (
+        explicit_service_request
+        and normalize_enum(signals.get("business_context"), default="none")
+        == "none"
+    )
 
     breakdown = score_signals(signals)
     score = max(0, min(sum(breakdown.values()), 100))
@@ -846,6 +866,11 @@ def evaluate_lead(
         and not hard_rejected
         and tier in QUALIFYING_TIERS
     ):
+        tier = TIER_MANUAL_REVIEW
+
+    # A request we kept despite thin business context goes to a person, not
+    # to an automatic DM. The lead survives; the outreach does not.
+    if thin_context_waived and not hard_rejected and tier in QUALIFYING_TIERS:
         tier = TIER_MANUAL_REVIEW
 
     qualified = tier in QUALIFYING_TIERS
@@ -1055,10 +1080,20 @@ class PrefilterResult:
     #: the post-AI hard rejections. ``reasons`` is prose for a human reading
     #: Airtable; this is what the pipeline branches on. Empty when ``passed``.
     rejection_codes: list[str] = field(default_factory=list)
+    #: True when at least one *unambiguous* service term was found, such as
+    #: "gohighlevel" or "microsoft 365".
+    #:
+    #: Deliberately separate from ``match_basis``. A basis of "named" also
+    #: covers a match assembled from two weak categories ("payment" plus
+    #: "system"), which is a much softer signal, so anything that needs to
+    #: know "did the author actually name a BruceTech service" must read this
+    #: and not infer it from the basis.
+    strong_service_match: bool = False
     #: How the service match was established: "named" (the post used
-    #: BruceTech vocabulary), "described" (it described an operational systems
-    #: failure), "adjacent" (it asked for client acquisition BruceTech serves
-    #: through the site, SEO, booking and CRM underneath), or "none".
+    #: BruceTech vocabulary, strongly or by weak corroboration), "described"
+    #: (it described an operational systems failure), "adjacent" (it asked
+    #: for client acquisition BruceTech serves through the site, SEO,
+    #: booking and CRM underneath), or "none".
     #:
     #: Recorded so an operator reading Airtable can tell a stated requirement
     #: from an inferred one. "adjacent" in particular means the model, not
@@ -1177,6 +1212,7 @@ def prefilter_post(
             service_categories=list(services.categories),
             rejection_codes=[code],
             match_basis=match_basis,
+            strong_service_match=bool(services.strong),
         )
 
     if len(body) < MIN_PREFILTER_TEXT_LENGTH:
@@ -1336,4 +1372,5 @@ def prefilter_post(
         # A post that passed carries no rejection codes, by construction.
         rejection_codes=[] if passed else codes,
         match_basis=match_basis,
+        strong_service_match=bool(services.strong),
     )

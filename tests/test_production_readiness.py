@@ -546,7 +546,20 @@ def test_transient_failure_increments_by_one():
 def test_failure_payload_never_touches_lead_fields():
     payload = rp.build_error_payload("boom", attempts=1, transient=True)
 
-    assert set(payload) == {rp.FIELD_AI_STATUS, rp.FIELD_AI_OUTPUT}
+    # Changed 2026-08-19. A failure writes status, diagnostics, and the
+    # outreach withdrawal, and nothing else. Lead Score, Qualified and Lead
+    # Tier stay untouched, which is what this test was protecting.
+    assert set(payload) == {
+        rp.FIELD_AI_STATUS,
+        rp.FIELD_AI_OUTPUT,
+        rp.FIELD_OUTREACH_READY,
+        rp.FIELD_SUGGESTED_DM,
+        rp.FIELD_SUGGESTED_COMMENT,
+        rp.FIELD_RECOMMENDED_CHANNEL,
+    }
+    assert rp.FIELD_LEAD_SCORE not in payload
+    assert rp.FIELD_QUALIFIED not in payload
+    assert rp.FIELD_LEAD_TIER not in payload
 
 
 def test_run_pipeline_delegates_to_the_store():

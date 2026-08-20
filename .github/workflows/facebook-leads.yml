@@ -14,9 +14,14 @@ on:
         default: false
         required: false
       ai_batch_limit:
-        description: "Max AI calls this run (lower this when testing)"
+        description: "Maximum records evaluated by AI this run (lower this when testing)"
         type: string
-        default: "40"
+        default: "20"
+        required: false
+      openai_request_budget:
+        description: "Maximum OpenAI API requests this run, retries included. Blank uses ai_batch_limit x OPENAI_MAX_ATTEMPTS. 0 disables the ceiling"
+        type: string
+        default: ""
         required: false
       apify_run_id:
         description: "Import from one exact Apify run ID (leave blank for the last successful run)"
@@ -130,8 +135,17 @@ jobs:
           # Dry run makes no Airtable writes and starts no paid Apify run.
           DRY_RUN: >-
             ${{ github.event.inputs.dry_run || 'false' }}
+          # Records sent to the model. NOT a cap on API requests: a record
+          # can cost up to OPENAI_MAX_ATTEMPTS of them.
           AI_BATCH_LIMIT: >-
-            ${{ github.event.inputs.ai_batch_limit || '40' }}
+            ${{ github.event.inputs.ai_batch_limit || '20' }}
+
+          # Actual responses.create() calls for the whole run, retries
+          # included. Left blank the pipeline derives
+          # AI_BATCH_LIMIT * OPENAI_MAX_ATTEMPTS, which is the true worst
+          # case. Set 0 to disable the ceiling.
+          OPENAI_REQUEST_BUDGET: >-
+            ${{ github.event.inputs.openai_request_budget || '' }}
           MAX_POST_CHARS: "8000"
           AIRTABLE_FORMULA_WAIT_SECONDS: "15"
           ENFORCE_PYTHON_PREFILTER: "true"

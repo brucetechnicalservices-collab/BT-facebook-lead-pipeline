@@ -87,6 +87,28 @@ class RetryStore:
     output_field: str
     attempts_field: str = ""
     error_status: str = "Error"
+    #: The field that makes a record appear in an outreach queue. Cleared on
+    #: failure so a stale decision cannot be acted on. Empty disables the
+    #: suspension entirely.
+    outreach_ready_field: str = ""
+    #: Copy fields cleared alongside it, so no one can send a message that
+    #: belongs to a decision the pipeline could not reproduce.
+    outreach_copy_fields: tuple[str, ...] = ()
+    #: The recommended-channel field, reset to ``outreach_channel_off`` on
+    #: failure. Outreach Ready is the gate the pipeline enforces, but nothing
+    #: downstream of Airtable is enforced by this code: a person reading the
+    #: row sees a channel, and "direct_message" left over from a superseded
+    #: decision is an instruction. It is withdrawn with the rest.
+    outreach_channel_field: str = ""
+    outreach_channel_off: str = "do_not_contact"
+
+    @property
+    def outreach_fields(self) -> tuple[str, ...]:
+        """Every field withdrawn when an attempt fails."""
+        if not self.outreach_ready_field:
+            return ()
+
+        return (self.outreach_ready_field, *self.outreach_copy_fields)
 
     @property
     def uses_dedicated_field(self) -> bool:
@@ -158,9 +180,18 @@ class RetryStore:
         """
         Build the Airtable payload for a failed record.
 
-        Deliberately narrow: status, diagnostics, and the attempt count. It
-        never includes Lead Score, Qualified, or Suggested DM, so a failure
-        cannot blank a record's existing lead data.
+        Narrow by design: status, diagnostics, the attempt count, and the
+        outreach suspension below. It never touches Lead Score, Qualified,
+        Lead Tier, Lead Summary, or Evidence, so a failure cannot destroy a
+        record's analytical history.
+
+        It does clear the *actionable* outreach fields. A record that was
+        Outreach Ready under an earlier decision, and whose reprocessing has
+        now failed, must not sit in a salesperson's Outreach Ready view
+        offering copy that no longer reflects a successful evaluation. The
+        history stays readable in Lead Score and Lead Tier; only the
+        instruction to act on it is withdrawn, and the next successful run
+        restores it.
         """
         timestamp = (now or datetime.now(timezone.utc)).isoformat()
 
@@ -172,6 +203,20 @@ class RetryStore:
         }
 
         payload: dict[str, Any] = {status_field: self.error_status}
+
+        # Withdraw outreach eligibility. See the docstring: the analysis
+        # survives, the call to action does not.
+        for field_name in self.outreach_fields:
+            payload[field_name] = (
+                False if field_name == self.outreach_ready_field else ""
+            )
+
+        if self.outreach_channel_field:
+            payload[self.outreach_channel_field] = self.outreach_channel_off
+
+        diagnostics["outreach_suspended"] = bool(
+            self.outreach_fields or self.outreach_channel_field
+        )
 
         if self.attempts_field:
             payload[self.attempts_field] = int(attempts)

@@ -294,10 +294,16 @@ def test_error_payload_records_the_attempt_count_and_nothing_else():
     assert diagnostics["transient"] is True
     assert diagnostics["last_error"] == "boom"
 
-    # Crucially: a failure must not blank the record's lead fields.
+    # Crucially: a failure must not blank the record's lead analysis.
     assert rp.FIELD_LEAD_SCORE not in payload
     assert rp.FIELD_QUALIFIED not in payload
-    assert rp.FIELD_SUGGESTED_DM not in payload
+    assert rp.FIELD_LEAD_TIER not in payload
+
+    # Changed 2026-08-19: it does withdraw outreach eligibility, so a
+    # decision the pipeline could not reproduce cannot be acted on.
+    assert payload[rp.FIELD_OUTREACH_READY] is False
+    assert payload[rp.FIELD_SUGGESTED_DM] == ""
+    assert payload[rp.FIELD_SUGGESTED_COMMENT] == ""
 
 
 def test_error_records_are_requeued_only_when_retry_is_enabled(monkeypatch):

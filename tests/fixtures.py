@@ -336,11 +336,20 @@ RINGCENTRAL_TELEPHONY_ATTACK = (
     "don't know who to call about it."
 )
 
+#: The 2026-08-19 smoke test's false negative. An unmistakable request for a
+#: named BruceTech service, with no word about the business behind it. The
+#: model returned business_context = none and NO_BUSINESS_CONTEXT threw the
+#: lead away. Thin context is a reason for a human to look, not to discard.
+GOHIGHLEVEL_EXPERT_REQUEST = (
+    "I need help with GoHighLevel. Any recommendations? I need an expert."
+)
+
 BLUE_COLLAR_CANDIDATE_FIXTURES = {
     "ELECTRICAL_M365_INTAKE": ELECTRICAL_M365_INTAKE,
     "SURFACE_RESTORATION_LEAD_GEN": SURFACE_RESTORATION_LEAD_GEN,
     "POOL_BUILDER_SOFTWARE_STACK": POOL_BUILDER_SOFTWARE_STACK,
     "RINGCENTRAL_TELEPHONY_ATTACK": RINGCENTRAL_TELEPHONY_ATTACK,
+    "GOHIGHLEVEL_EXPERT_REQUEST": GOHIGHLEVEL_EXPERT_REQUEST,
 }
 
 # --- Correctly rejected in the same run, and must stay rejected -------------

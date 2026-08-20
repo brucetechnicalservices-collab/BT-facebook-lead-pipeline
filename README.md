@@ -169,6 +169,22 @@ The last eight are decided in Python and are **never offered to the model** —
 they are absent from the JSON schema enum. `STALE_POST` in particular is
 computed from the post timestamp and never trusted from the model.
 
+`NO_BUSINESS_CONTEXT` has one narrow waiver, requiring **both**:
+
+1. the intent is `PROVIDER_REQUEST` or `IMPLEMENTATION_REQUEST`, and
+2. `strong_service_match` is true — the author typed an unambiguous term such
+   as `gohighlevel` or `microsoft 365`.
+
+"I need help with GoHighLevel. I need an expert." says nothing about the
+company behind it and is still a real request, so it is capped at **Manual
+Review**: a person sees it, and no automatic DM is ever sent.
+
+The second condition reads `strong_service_match`, **not**
+`match_basis == "named"`. That basis also covers a match assembled from two
+weak categories — "someone to fix our payment system" is `named` by that
+measure — which is far too soft to waive a hard rejection. Inferred
+(`adjacent`) matches never qualify either, and the waiver lifts no other code.
+
 Only `NO_BUYING_INTENT`, `FUNDING_OR_FINANCE_REQUEST`, and `HIRING_UNRELATED`
 can be lifted by a human — they are the heuristic guesses a reviewer can see
 are wrong by reading the post. Every other code in this table is in
@@ -421,6 +437,80 @@ A request naming only creative or physical-media work — influencers, content
 creators, photographers, PR, branding, print — is excluded from `adjacent`
 unless it also names something BruceTech builds.
 
+### Records versus requests
+
+Two different limits, and confusing them is what made `AI_BATCH_LIMIT=5`
+permit fifteen billed calls.
+
+| Setting | Counts | Workflow input |
+| --- | --- | --- |
+| `AI_BATCH_LIMIT` | **Records** evaluated by AI | "Maximum records evaluated by AI this run" |
+| `OPENAI_REQUEST_BUDGET` | **API requests**, retries included | "Maximum OpenAI API requests this run" |
+
+**Retries consume the request budget.** Each record can cost up to
+`OPENAI_MAX_ATTEMPTS` requests when the model errors, rate-limits, or returns
+an incomplete response. The budget is charged immediately before every
+`responses.create()`, so a record that fails three times spends three of it,
+not one.
+
+When the budget runs out the queue **stops** rather than marking every
+remaining record as an AI error. Those records keep their retry budgets and
+stay Pending for the next run. The run summary prints the true request count
+and flags the stop.
+
+**Recommended settings**
+
+| Situation | `AI_BATCH_LIMIT` | `OPENAI_REQUEST_BUDGET` | Worst case |
+| --- | --- | --- | --- |
+| Testing a change | `5` | leave blank (derives 15) | 15 requests |
+| Normal daily run | `20` | leave blank (derives 60) | 60 requests |
+| Working a backlog | `100` | `150` | 150 requests |
+| Diagnosing retry storms | `5` | `5` | 5 requests, one per record |
+
+Leaving the budget blank derives `AI_BATCH_LIMIT × OPENAI_MAX_ATTEMPTS`, which
+is the true worst case and the right default: it is a runaway stop, not a
+throttle. Set it **below** that product only when you want retries to eat into
+the record count, and set `0` to disable the ceiling entirely.
+
+### Writes that must not be replayed
+
+A retried `POST` creates a second record, or starts a second paid Apify run.
+`request_with_retry` therefore treats non-idempotent methods as write-once:
+
+| Failure | Idempotent (GET/PATCH) | POST |
+| --- | --- | --- |
+| Connect timeout (nothing sent) | retry | retry — safe, no bytes arrived |
+| `429` | retry | retry — rejected, not processed |
+| Read timeout, dropped connection | retry | **`AmbiguousWriteError`** |
+| `500`/`502`/`503`/`504` | retry | **`AmbiguousWriteError`** |
+
+An ambiguous Airtable create is reconciled rather than replayed: the pipeline
+re-reads the identity keys, reports how many of the batch actually landed, and
+stops. The next run imports the remainder and skips the rest by
+deduplication, which is the same mechanism that makes the import idempotent in
+the first place.
+
+### A failed reprocess withdraws outreach
+
+If a record was `Outreach Ready` yesterday and today's reprocessing fails, the
+failure payload withdraws the whole call to action:
+
+| Field | On failure |
+| --- | --- |
+| `Outreach Ready` | `false` |
+| `Suggested DM` | blank |
+| `Suggested Comment` | blank |
+| `Recommended channel` | `do_not_contact` |
+
+`Outreach Ready` is the gate this pipeline enforces, but nothing downstream of
+Airtable is enforced by this code — outreach is done by a person reading the
+row. A leftover `direct_message` on a superseded decision reads as an
+instruction, so it is reset too.
+
+The analysis is preserved: `Lead Score`, `Qualified`, `Lead Tier`,
+`Lead Summary`, and `Evidence` are untouched, and `AI Output` records
+`outreach_suspended`. The next successful run restores eligibility.
+
 ### The physical-goods guard
 
 Business phone systems are BruceTech work: RingCentral, 8x8, Dialpad, VoIP,
@@ -462,7 +552,8 @@ is applied later and applies to *calls*, not records:
 every current-run record
     → deterministic Python evaluation   (free, unbounded for this run)
     → eligible candidates sorted by intent and score
-    → AI_BATCH_LIMIT caps OPENAI CALLS ONLY
+    → AI_BATCH_LIMIT caps RECORDS SENT TO THE MODEL
+    → OPENAI_REQUEST_BUDGET caps ACTUAL API REQUESTS, retries included
 ```
 
 Each run fetches candidates in four phases:
@@ -485,6 +576,13 @@ lost behind an arbitrary page of the backlog. Phase 2 ignores
 records are worth reading, and you have already answered that question by
 approving the record. Phase 4 is sorted because truncating an unsorted
 Airtable query returns records in table order, not by relevance.
+
+**A dry run evaluates the scrape it just read.** Because a dry run creates
+nothing, this run's new posts have no record IDs, and they used to disappear
+before the prefilter — the run reported on the backlog and said nothing about
+the scrape. They are now shaped as in-memory records and go through the
+identical prefilter, ordering, and qualification path. Their IDs carry a
+`dryrun-` prefix and nothing writes them anywhere.
 
 > **Fixed 2026-08-19.** The queue window used to be `AI_BATCH_LIMIT × 5`. A
 > live run with `AI_BATCH_LIMIT=5` therefore evaluated 25 of its 50 fresh
@@ -635,7 +733,8 @@ AI processing and recovery:
 | `OPENAI_MAX_OUTPUT_TOKENS` | `2500` | Output token ceiling |
 | `OPENAI_MAX_ATTEMPTS` | `3` | Retries per post, within one run |
 | `OPENAI_RETRY_DELAY_SECONDS` | `5` | Base retry delay |
-| `AI_BATCH_LIMIT` | `20` | Max **OpenAI calls** per run. Never limits how many records are evaluated |
+| `AI_BATCH_LIMIT` | `20` | Max **records** sent to the model per run. Never limits how many records are evaluated, and is not a cap on HTTP requests |
+| `OPENAI_REQUEST_BUDGET` | `AI_BATCH_LIMIT × OPENAI_MAX_ATTEMPTS` | Hard ceiling on actual `responses.create()` calls for the whole run, retries included. `0` disables it |
 | `PREFILTER_SCAN_LIMIT` | `200` | Max **backlog** records pulled in for deterministic evaluation. Never limits the current run's own imports |
 | `MAX_POST_CHARS` | `8000` | Post text truncation |
 | `RETRY_AI_ERRORS` | `true` | Re-queue records whose last attempt failed |
