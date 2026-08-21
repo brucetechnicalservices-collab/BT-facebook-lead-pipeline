@@ -333,7 +333,16 @@ def test_dry_run_makes_no_airtable_writes(monkeypatch, capsys):
     assert created == []
     output = capsys.readouterr().out
     assert "[DRY RUN]" in output
-    assert "rec1" in output
+
+    # Changed deliberately on 2026-08-20. This used to assert the raw record
+    # ID "rec1" appeared in the output, which is the leak run 32334487910
+    # published for two hundred records. The dry-run listing now identifies
+    # a record by a keyed fingerprint, and the record ID must NOT be there.
+    # See tests/test_validation_safety.py for the full contract.
+    assert "rec1" not in output
+    assert "rec2" not in output
+    assert "facebook.com" not in output
+    assert "rec:" in output
 
 
 def test_dry_run_reports_the_intended_decision(monkeypatch, capsys):

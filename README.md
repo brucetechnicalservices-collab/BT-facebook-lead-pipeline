@@ -472,6 +472,108 @@ is the true worst case and the right default: it is a runaway stop, not a
 throttle. Set it **below** that product only when you want retries to eat into
 the record count, and set `0` to disable the ceiling entirely.
 
+### Bounding Airtable writes
+
+`AI_BATCH_LIMIT` and `OPENAI_REQUEST_BUDGET` bound what a run spends at
+OpenAI. Neither bounds what it **changes in Airtable**, because the
+deterministic paths write a rejection without ever calling the model.
+
+GitHub Actions run 32334487910 made this concrete: `AI_BATCH_LIMIT=5`, 200
+records queued, every one rejected as `STALE_POST` before any AI call, and
+zero requests billed. A write-enabled version of that run would have modified
+200 lead records, and nothing anywhere in the pipeline would have stopped it.
+
+`AIRTABLE_LEAD_UPDATE_BUDGET` is that ceiling.
+
+| Setting | Unit | Applies to |
+| --- | --- | --- |
+| `AI_BATCH_LIMIT` | Records sent to the model | The AI path only |
+| `OPENAI_REQUEST_BUDGET` | `responses.create()` calls, retries included | The AI path only |
+| `PREFILTER_SCAN_LIMIT` | Backlog records read for evaluation | Historical scanning only |
+| `AIRTABLE_LEAD_UPDATE_BUDGET` | **Lead records changed** | Every write path |
+
+**The unit is a record, not a request.** Updates flush to Airtable in batches
+of ten, so a budget of 25 means 25 records and three `PATCH` requests. Batching
+cannot hide anything from it.
+
+**Every lead-update path spends it**, not just the interesting ones:
+
+| Path | Costs one unit |
+| --- | --- |
+| Human `Reject` recorded | Yes |
+| Stale or otherwise non-overridable rejection | Yes |
+| Ordinary prefilter rejection | Yes |
+| Completed AI qualification | Yes |
+| AI-error state write | Yes |
+| Record skipped as already in the sales funnel | No — nothing is written |
+| Record skipped for exhausted AI retries | No — nothing is written |
+
+**A call is never paid for if its answer cannot be saved.** The budget is
+checked *before* `responses.create()`, so a run never buys a classification it
+has no room left to write down.
+
+**Exhaustion defers, it does not fail.** Remaining records are left exactly as
+they were and stay `Pending` for the next run. Deterministic evaluation
+continues (it is free regex), so the run still reports what it *would* have
+written. The summary separates the two:
+
+```
+  Records evaluated     200
+  Update candidates     200
+  Updates written       3
+  Deferred (no budget)  197  [BUDGET EXHAUSTED]
+  Deferred (AI limit)   0
+  Lead update budget    3
+```
+
+**A dry run never spends it.** Dry runs write nothing, so budgeting them would
+only shrink the queue you are trying to inspect. Under `DRY_RUN` every record
+is evaluated and every write is simulated and reported.
+
+**`0` or blank is unlimited**, which is the behaviour every scheduled run
+should keep. This is a validation control, not a throttle.
+
+Two further writes are *not* lead records and are therefore outside this
+budget. Each has its own switch, so a validation run can be narrowed to the
+lead table alone:
+
+| Switch | Default | Turns off |
+| --- | --- | --- |
+| `LOG_SCRAPER_RUNS` | `true` | The Facebook Post Scraper Runs upsert |
+| `UPDATE_GROUP_PERFORMANCE` | `true` | The Facebook Group Performance refresh |
+
+### What the logs may say
+
+Workflow logs are readable by anyone who can read the repository, and the
+posts belong to other people. Run 32334487910 printed complete Facebook post
+URLs, author names, and full Airtable record IDs for 200 records.
+
+The pipeline now prints, for each record, the **queue position** and a
+**fingerprint** — and nothing else that identifies it:
+
+```
+[7/200] Blocked before AI (STALE_POST) intent=BUSINESS_PAIN score=41 rec:5f2f6350
+```
+
+| Printed in full | Never printed |
+| --- | --- |
+| Queue position and totals | Post URL |
+| Intent type and Prefilter Score | Post text |
+| Rejection codes and disqualifiers | Author name |
+| Tier, score, qualified, outreach flags | Full Airtable record ID |
+| Apify run and dataset IDs | — |
+
+The fingerprint is a keyed BLAKE2s digest, so an unsalted hash of a known URL
+cannot be matched against it. The salt is **random per run** by default, which
+makes a published log unmatchable even by someone holding the source posts.
+Set `LOG_FINGERPRINT_SALT` to a fixed value when you need to follow one record
+across two runs.
+
+Exception text from Airtable, OpenAI, and Apify is scrubbed before it is
+printed: Facebook URLs, Airtable record IDs, and Airtable base and table IDs
+are replaced with fingerprints wherever they appear inside a message the
+pipeline did not compose itself.
+
 ### Writes that must not be replayed
 
 A retried `POST` creates a second record, or starts a second paid Apify run.
@@ -589,6 +691,12 @@ identical prefilter, ordering, and qualification path. Their IDs carry a
 > imports and never looked at the other 25 — one of which was a strong lead.
 > `PREFILTER_SCAN_LIMIT` is now a separate setting, and the current run is
 > never governed by it.
+
+**`PREFILTER_SCAN_LIMIT=0` turns historical scanning off.** Phases 3 and 4
+both reach backwards into the table for records this run did not import and
+nobody asked for by hand, and the scan limit governs both. At `0` the run
+evaluates this run's own imports and anything a person set `Human Decision`
+on, and nothing else.
 
 **`Prequalification` decides what is looked at, never what is sent to the
 model.** It is an Airtable formula computed from `Request Signal`,
@@ -735,7 +843,7 @@ AI processing and recovery:
 | `OPENAI_RETRY_DELAY_SECONDS` | `5` | Base retry delay |
 | `AI_BATCH_LIMIT` | `20` | Max **records** sent to the model per run. Never limits how many records are evaluated, and is not a cap on HTTP requests |
 | `OPENAI_REQUEST_BUDGET` | `AI_BATCH_LIMIT × OPENAI_MAX_ATTEMPTS` | Hard ceiling on actual `responses.create()` calls for the whole run, retries included. `0` disables it |
-| `PREFILTER_SCAN_LIMIT` | `200` | Max **backlog** records pulled in for deterministic evaluation. Never limits the current run's own imports |
+| `PREFILTER_SCAN_LIMIT` | `200` | Max **backlog** records pulled in for deterministic evaluation. Never limits the current run's own imports. `0` turns historical scanning off entirely |
 | `MAX_POST_CHARS` | `8000` | Post text truncation |
 | `RETRY_AI_ERRORS` | `true` | Re-queue records whose last attempt failed |
 | `AI_ERROR_MAX_ATTEMPTS` | `3` | Total attempts per record, across runs |
@@ -744,9 +852,11 @@ Reporting and safety:
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `AIRTABLE_LEAD_UPDATE_BUDGET` | `0` (unlimited) | Max lead **records** this run may change in Airtable, across every write path. Not consumed by a dry run |
 | `UPDATE_GROUP_PERFORMANCE` | `true` | Refresh group metrics after each run |
 | `AIRTABLE_GROUP_PERFORMANCE_TABLE` | `Facebook Group Performance` | Metrics table name |
 | `AIRTABLE_FORMULA_WAIT_SECONDS` | `15` | Pause after import |
+| `LOG_FINGERPRINT_SALT` | *(random per run)* | Pin the log fingerprint so one record can be correlated across two runs |
 | `DRY_RUN` | `false` | Read and score, but write nothing and start no paid run |
 
 All are read lazily. Importing `run_pipeline` requires no credentials, which
@@ -995,6 +1105,31 @@ new tier against your own judgement.
 
 Note that re-scoring costs one OpenAI call per record — the new rules need
 the structured signals, which cannot be derived from the old `Lead Score`.
+
+### A narrowly scoped validation run
+
+The controls above compose into a run that touches almost nothing, which is
+what you want when the question is "does this actually work against my base?"
+rather than "please process my backlog".
+
+Dispatch the workflow with:
+
+| Input | Value | Effect |
+| --- | --- | --- |
+| `dry_run` | unticked | Real writes, so the run proves something |
+| `prefilter_scan_limit` | `0` | No historical backlog. This run's imports and explicit human decisions only |
+| `airtable_lead_update_budget` | `3` | At most three lead records change, whatever happens |
+| `ai_batch_limit` | `3` | At most three records reach the model |
+| `update_group_performance` | unticked | No writes to the group metrics table |
+| `log_scraper_runs` | unticked | No writes to the scraper runs table |
+
+The worst case is three modified lead records and nine OpenAI requests. Read
+the run summary, confirm `Updates written` matches what you expected, then
+raise the limits.
+
+Run it as a dry run first if you want the evaluation without any write at all:
+a dry run does **not** spend `AIRTABLE_LEAD_UPDATE_BUDGET`, so every record in
+the selected queue is evaluated and every intended write is printed.
 
 ### When you are ready to write
 

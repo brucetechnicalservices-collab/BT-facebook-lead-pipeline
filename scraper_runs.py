@@ -35,6 +35,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import redaction
+
 # ---------------------------------------------------------------------------
 # Field names
 #
@@ -226,7 +228,8 @@ def upsert_scraper_run(
         updater([{"id": record_id, "fields": fields}])
 
         print(
-            f"Updated existing scraper run record {record_id} "
+            f"Updated existing scraper run record "
+            f"{redaction.redact_record_id(record_id)} "
             f"for Apify run {run.id}.",
             flush=True,
         )
@@ -246,7 +249,8 @@ def upsert_scraper_run(
         return None
 
     print(
-        f"Logged Apify run {run.id} as scraper run record {record_id}.",
+        f"Logged Apify run {run.id} as scraper run record "
+        f"{redaction.redact_record_id(record_id)}.",
         flush=True,
     )
     return ScraperRunRecord(

@@ -23,6 +23,26 @@ on:
         type: string
         default: ""
         required: false
+      prefilter_scan_limit:
+        description: "Historical backlog records pulled in for deterministic evaluation. Not AI requests, and not a cap on this run's own imports. 0 evaluates only this run's imports and explicit human decisions"
+        type: string
+        default: "200"
+        required: false
+      airtable_lead_update_budget:
+        description: "Maximum lead RECORDS this run may change in Airtable, across every path including stale rejections. Blank or 0 is unlimited, which is the normal production setting"
+        type: string
+        default: ""
+        required: false
+      update_group_performance:
+        description: "Refresh Facebook Group Performance at the end of the run (untick for a narrowly scoped validation run)"
+        type: boolean
+        default: true
+        required: false
+      log_scraper_runs:
+        description: "Write the Facebook Post Scraper Runs record for this Apify run (untick for a narrowly scoped validation run)"
+        type: boolean
+        default: true
+        required: false
       apify_run_id:
         description: "Import from one exact Apify run ID (leave blank for the last successful run)"
         type: string
@@ -150,6 +170,25 @@ jobs:
           AIRTABLE_FORMULA_WAIT_SECONDS: "15"
           ENFORCE_PYTHON_PREFILTER: "true"
           PREFILTER_PASS_SCORE: "30"
+
+          # How many historical backlog records get deterministic (free,
+          # regex) evaluation. This run's own imports are fetched by record
+          # ID and are NOT governed by it; neither is anything a person set
+          # Human Decision on. It caps neither AI requests nor Airtable
+          # writes -- see OPENAI_REQUEST_BUDGET and
+          # AIRTABLE_LEAD_UPDATE_BUDGET for those. 0 turns historical
+          # scanning off.
+          PREFILTER_SCAN_LIMIT: >-
+            ${{ github.event.inputs.prefilter_scan_limit || '200' }}
+
+          # Ceiling on lead RECORDS changed in Airtable this run, counted per
+          # record rather than per HTTP request. Blank means unlimited, which
+          # is the production behaviour. Set a small number to bound the
+          # blast radius of a validation run: deterministic rejections write
+          # records without ever calling OpenAI, so AI_BATCH_LIMIT does not
+          # bound them.
+          AIRTABLE_LEAD_UPDATE_BUDGET: >-
+            ${{ github.event.inputs.airtable_lead_update_budget || '' }}
           REQUIRE_AIRTABLE_PREQUALIFICATION: "false"
 
           # Bounded AI error recovery. A transient failure is retried on a
@@ -165,10 +204,22 @@ jobs:
             ${{ github.event.inputs.apify_run_id || '' }}
           APIFY_RUN_TIMEOUT_SECONDS: "900"
           APIFY_POLL_INTERVAL_SECONDS: "15"
-          LOG_SCRAPER_RUNS: "true"
+
+          # Writes outside the lead table, each independently switchable so a
+          # validation run can be narrowed to the lead records alone.
+          # AIRTABLE_LEAD_UPDATE_BUDGET does not cover these: they are not
+          # lead records.
+          #
+          # Both read github.event.inputs.*, which is always a STRING, and
+          # never the inputs.* context, which is a real boolean. With a real
+          # boolean, "${{ inputs.log_scraper_runs || 'true' }}" evaluates to
+          # 'true' when the box is unticked and the control does nothing.
+          LOG_SCRAPER_RUNS: >-
+            ${{ github.event.inputs.log_scraper_runs || 'true' }}
 
           # Feedback loop.
-          UPDATE_GROUP_PERFORMANCE: "true"
+          UPDATE_GROUP_PERFORMANCE: >-
+            ${{ github.event.inputs.update_group_performance || 'true' }}
           AIRTABLE_SCRAPER_RUNS_TABLE: "Facebook Post Scraper Runs"
           AIRTABLE_GROUP_PERFORMANCE_TABLE: "Facebook Group Performance"
         run: python run_pipeline.py

@@ -36,6 +36,7 @@ import ai_retry
 import apify_runs
 import group_performance
 import intent
+import redaction
 import scraper_runs
 from normalization import (
     build_seen_keys,
@@ -166,7 +167,20 @@ AI_BATCH_LIMIT = env_int("AI_BATCH_LIMIT", DEFAULT_AI_BATCH_LIMIT)
 #: see fetch_ai_queue. Before 2026-08-19 the queue window was
 #: ``AI_BATCH_LIMIT * 5``, so a live run with AI_BATCH_LIMIT=5 evaluated 25 of
 #: its 50 freshly imported posts and silently ignored the rest.
-PREFILTER_SCAN_LIMIT = env_int("PREFILTER_SCAN_LIMIT", 200)
+#:
+#: Set to 0 to switch historical scanning off entirely. The run then looks at
+#: this run's own imports and at records a person explicitly decided on, and
+#: at nothing else -- which is what you want for a narrowly scoped validation
+#: run against a table holding thousands of old posts.
+#:
+#: This is not a limit on AI requests (AI_BATCH_LIMIT and
+#: OPENAI_REQUEST_BUDGET are), and it is not a limit on Airtable writes
+#: (AIRTABLE_LEAD_UPDATE_BUDGET is).
+DEFAULT_PREFILTER_SCAN_LIMIT = 200
+
+PREFILTER_SCAN_LIMIT = env_int(
+    "PREFILTER_SCAN_LIMIT", DEFAULT_PREFILTER_SCAN_LIMIT
+)
 
 #: Minimum score for Qualified. Raised from 55 to 65.
 QUALIFICATION_THRESHOLD = env_int(
@@ -274,6 +288,30 @@ REQUIRE_AIRTABLE_PREQUALIFICATION = env_bool(
 
 #: Skip the AI call entirely for posts the deterministic prefilter rejects.
 ENFORCE_PYTHON_PREFILTER = env_bool("ENFORCE_PYTHON_PREFILTER", True)
+
+#: Hard ceiling on how many lead records one run may modify in Airtable.
+#:
+#: The unit is a *record mutation*, not an HTTP request and not a batch: one
+#: record changed is one unit, whether it was patched alone or as one of ten
+#: in a batch, and whether the change came from a human rejection, a stale
+#: rejection, an ordinary prefilter rejection, a completed AI qualification,
+#: or an AI-error state write. Every one of those paths spends it.
+#:
+#: 0 (or blank) means unlimited, which is the production behaviour this
+#: pipeline has always had and which every scheduled run should keep. It
+#: exists for validation: on 2026-08-20 a run queued two hundred records,
+#: rejected all two hundred as stale, and nothing at all in the pipeline
+#: would have stopped a write-enabled version of that run from touching two
+#: hundred records. AI_BATCH_LIMIT does not bound this, because deterministic
+#: rejections never reach the model.
+#:
+#: A dry run does not spend it. Dry runs write nothing, so budgeting them
+#: would only shrink the queue you are trying to inspect.
+DEFAULT_AIRTABLE_LEAD_UPDATE_BUDGET = 0
+
+AIRTABLE_LEAD_UPDATE_BUDGET = env_int(
+    "AIRTABLE_LEAD_UPDATE_BUDGET", DEFAULT_AIRTABLE_LEAD_UPDATE_BUDGET
+)
 
 #: Read from Apify and Airtable and call the AI as normal, but make no
 #: Airtable writes. Use this to see how the new rules score real records
@@ -560,6 +598,92 @@ def consume_openai_request() -> None:
         )
 
     _OPENAI_REQUESTS_MADE += 1
+
+
+# ---------------------------------------------------------------------------
+# Airtable lead-update budget
+#
+# AI_BATCH_LIMIT and OPENAI_REQUEST_BUDGET bound what a run spends at OpenAI.
+# Neither bounds what it changes in Airtable, because the deterministic paths
+# -- stale, prefiltered, human-rejected -- write a rejection without ever
+# calling the model. This is the ceiling for those.
+# ---------------------------------------------------------------------------
+
+class LeadUpdateBudgetExhausted(RuntimeError):
+    """The run has changed its whole AIRTABLE_LEAD_UPDATE_BUDGET of records."""
+
+
+#: Lead-record mutations this run has committed to, dry runs excluded.
+_LEAD_UPDATES_MADE = 0
+
+
+def lead_updates_made() -> int:
+    """How many lead records this run has changed so far."""
+    return _LEAD_UPDATES_MADE
+
+
+def reset_lead_update_budget() -> None:
+    """Zero the mutation counter. Used by tests and at the start of a run."""
+    global _LEAD_UPDATES_MADE
+    _LEAD_UPDATES_MADE = 0
+
+
+def lead_update_budget_remaining() -> int | None:
+    """
+    Mutations still available, or None when the budget is unlimited.
+
+    None rather than a large number, so a caller cannot accidentally treat
+    "unlimited" as a quantity and compare it.
+    """
+    if not AIRTABLE_LEAD_UPDATE_BUDGET or DRY_RUN:
+        return None
+
+    return max(AIRTABLE_LEAD_UPDATE_BUDGET - _LEAD_UPDATES_MADE, 0)
+
+
+def has_lead_update_budget(count: int = 1) -> bool:
+    """
+    Whether ``count`` more record mutations may be made.
+
+    Call this before spending anything expensive on a record -- an OpenAI
+    request above all -- so the run never pays for a result it has no room
+    left to save.
+    """
+    remaining = lead_update_budget_remaining()
+
+    return remaining is None or remaining >= count
+
+
+def consume_lead_update(count: int = 1) -> None:
+    """
+    Account for ``count`` lead-record mutations, refusing to exceed the budget.
+
+    Counted where the change to a record is decided, not where the HTTP
+    request is sent, so batching cannot hide anything: ten records patched in
+    one PATCH are ten units.
+
+    A dry run consumes nothing. It writes nothing, so there is nothing to
+    bound, and spending the budget on simulated writes would stop a dry run
+    from showing the whole queue.
+    """
+    global _LEAD_UPDATES_MADE
+
+    if DRY_RUN:
+        return
+
+    if not AIRTABLE_LEAD_UPDATE_BUDGET:
+        _LEAD_UPDATES_MADE += count
+        return
+
+    if _LEAD_UPDATES_MADE + count > AIRTABLE_LEAD_UPDATE_BUDGET:
+        raise LeadUpdateBudgetExhausted(
+            f"This run has changed its full budget of "
+            f"{AIRTABLE_LEAD_UPDATE_BUDGET} lead records "
+            f"(AIRTABLE_LEAD_UPDATE_BUDGET). Remaining records are left "
+            f"unchanged and stay Pending for the next run."
+        )
+
+    _LEAD_UPDATES_MADE += count
 
 
 # ---------------------------------------------------------------------------
@@ -1366,9 +1490,11 @@ def create_new_posts_in_airtable(
             f"Nothing written.",
             flush=True,
         )
-        for post in posts[:10]:
+        for position, post in enumerate(posts[:10], start=1):
+            canonical = normalize_facebook_url(post.get("url", ""))
             print(
-                f"[DRY RUN]   {normalize_facebook_url(post.get('url', ''))}",
+                f"[DRY RUN]   [{position}/{len(posts)}] "
+                f"{redaction.redact_url(canonical)}",
                 flush=True,
             )
         return []
@@ -1650,6 +1776,11 @@ def fetch_ai_queue(
     3. Every record the Airtable formula marks 'Send to AI'.
     4. The newest remaining unprocessed backlog, up to PREFILTER_SCAN_LIMIT.
 
+    Phases 3 and 4 are historical scanning and PREFILTER_SCAN_LIMIT=0 turns
+    both off. Phases 1 and 2 are not affected by it: this run's own imports
+    are always evaluated in full, and so is anything a person set Human
+    Decision on.
+
     Phase 1 is the one that matters for a live scrape, and it is unbounded on
     purpose. A run that imports 50 posts evaluates all 50. Before
     2026-08-19 there was no phase 1 at all: the whole queue was capped at
@@ -1698,16 +1829,28 @@ def fetch_ai_queue(
     if approved:
         print(f"Found {len(approved)} records a human approved.", flush=True)
 
-    prequalified = take(
-        list_airtable_records(
-            formula=build_prequalified_queue_formula(),
-            fields=AI_QUEUE_FIELDS,
+    # Phases 3 and 4 both reach backwards into the table for records this
+    # run did not import and nobody asked for by hand. PREFILTER_SCAN_LIMIT
+    # governs both: at 0 the run looks at this run's own imports and at
+    # records a person explicitly decided on, and at nothing else.
+    if PREFILTER_SCAN_LIMIT:
+        prequalified = take(
+            list_airtable_records(
+                formula=build_prequalified_queue_formula(),
+                fields=AI_QUEUE_FIELDS,
+            )
         )
-    )
-    if prequalified:
+        if prequalified:
+            print(
+                f"Found {len(prequalified)} records the Airtable formula "
+                f"marks 'Send to AI' (machine signal, not human approval).",
+                flush=True,
+            )
+    else:
         print(
-            f"Found {len(prequalified)} records the Airtable formula marks "
-            f"'Send to AI' (machine signal, not human approval).",
+            "Historical backlog scanning is off (PREFILTER_SCAN_LIMIT=0). "
+            "Evaluating this run's imports and explicit human decisions "
+            "only.",
             flush=True,
         )
 
@@ -2155,7 +2298,8 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
         for update in updates:
             fields = update.get("fields", {}) or {}
             print(
-                f"[DRY RUN] Would update {update.get('id')}: "
+                f"[DRY RUN] Would update "
+                f"{redaction.redact_record_id(update.get('id'))}: "
                 f"tier={fields.get(FIELD_LEAD_TIER)} "
                 f"score={fields.get(FIELD_LEAD_SCORE)} "
                 f"qualified={fields.get(FIELD_QUALIFIED)} "
@@ -2248,9 +2392,10 @@ def mark_ai_error(
     """Record an AI failure without destroying the record's lead fields."""
     if DRY_RUN:
         print(
-            f"[DRY RUN] Would mark {record_id} as Error "
+            f"[DRY RUN] Would mark "
+            f"{redaction.redact_record_id(record_id)} as Error "
             f"(attempt {attempts}, transient={transient}): "
-            f"{error_message[:120]}",
+            f"{redaction.scrub(error_message, limit=120)}",
             flush=True,
         )
         return
@@ -2365,6 +2510,31 @@ class RunSummary:
     rejected: int = 0
     outreach_ready: int = 0
 
+    # --- Airtable write accounting -----------------------------------
+    #
+    # Kept separate from the counters above on purpose. Those record what
+    # the pipeline *decided* about a record; these record what it actually
+    # changed. Before AIRTABLE_LEAD_UPDATE_BUDGET existed the two were the
+    # same number and nothing said so, which is how a run that rejected two
+    # hundred stale posts could have written two hundred records without
+    # anything in its output looking unusual.
+
+    #: Records the queue genuinely evaluated: everything except the ones
+    #: skipped for being in the sales funnel or out of AI retries.
+    records_evaluated: int = 0
+    #: Records that needed a lead-record mutation, budget or no budget.
+    update_candidates: int = 0
+    #: Mutations actually queued for Airtable, or simulated under DRY_RUN.
+    updates_written: int = 0
+    #: Update candidates left untouched because the budget was spent. These
+    #: records are unchanged and still Pending for a later run.
+    deferred_no_update_budget: int = 0
+    #: Prefilter-accepted records not sent to the model because
+    #: AI_BATCH_LIMIT was reached. Also unchanged and still Pending.
+    deferred_ai_batch_limit: int = 0
+    #: True when AIRTABLE_LEAD_UPDATE_BUDGET stopped at least one write.
+    lead_update_budget_exhausted: bool = False
+
     def render(self) -> str:
         return "\n".join(
             [
@@ -2399,6 +2569,27 @@ class RunSummary:
                 f"  Manual review         {self.manual_review}",
                 f"  Rejected              {self.rejected}",
                 f"  Outreach ready        {self.outreach_ready}",
+                "",
+                f"  Records evaluated     {self.records_evaluated}",
+                f"  Update candidates     {self.update_candidates}",
+                f"  Updates {'simulated' if DRY_RUN else 'written  '}     "
+                f"{self.updates_written}"
+                + ("  [DRY RUN: nothing written]" if DRY_RUN else ""),
+                f"  Deferred (no budget)  {self.deferred_no_update_budget}"
+                + (
+                    "  [BUDGET EXHAUSTED]"
+                    if self.lead_update_budget_exhausted
+                    else ""
+                ),
+                f"  Deferred (AI limit)   {self.deferred_ai_batch_limit}",
+                "  Lead update budget    "
+                + (
+                    "not spent (dry run)"
+                    if DRY_RUN
+                    else str(AIRTABLE_LEAD_UPDATE_BUDGET)
+                    if AIRTABLE_LEAD_UPDATE_BUDGET
+                    else "unlimited"
+                ),
                 "-" * 62,
             ]
         )
@@ -2425,6 +2616,7 @@ def process_ai_queue(
         return summary
 
     pending_updates: list[dict[str, Any]] = []
+    budget_notice_printed = False
 
     def flush(force: bool = False) -> None:
         nonlocal pending_updates
@@ -2432,11 +2624,52 @@ def process_ai_queue(
             update_airtable_records(pending_updates)
             pending_updates = []
 
+    def claim_update(position: int) -> bool:
+        """
+        Reserve one lead-record mutation for the record at ``position``.
+
+        Returns False when AIRTABLE_LEAD_UPDATE_BUDGET is spent, in which
+        case the caller must write nothing: the record keeps whatever it
+        already had, stays Pending, and is picked up by a later run.
+
+        The reservation is taken here, where the change to a record is
+        decided, rather than where the PATCH is sent. Ten records written in
+        one batched request are ten mutations, which is what an operator
+        capping the blast radius of a validation run means by "three".
+        """
+        nonlocal budget_notice_printed
+
+        summary.update_candidates += 1
+
+        try:
+            consume_lead_update()
+        except LeadUpdateBudgetExhausted as exc:
+            summary.deferred_no_update_budget += 1
+            summary.lead_update_budget_exhausted = True
+
+            if not budget_notice_printed:
+                budget_notice_printed = True
+                print(
+                    f"[{position}/{len(prioritized)}] {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return False
+
+        summary.updates_written += 1
+        return True
+
     for index, (record, prefilter) in enumerate(prioritized, start=1):
         record_id = record["id"]
         fields = record.get("fields", {}) or {}
-        author = fields.get(FIELD_USER_NAME, "")
-        post_url = fields.get(FIELD_URL, "")
+
+        # The only thing this loop prints about which record it is looking
+        # at. A keyed fingerprint is stable within the run, so two lines
+        # about one record can be matched up, and means nothing outside it.
+        # The post URL, the post text, and the author's name never reach a
+        # log line -- this workflow's logs are readable by anyone who can
+        # read the repository, and the posts belong to other people.
+        ref = redaction.redact_record_id(record_id)
 
         # Count what the deterministic classifier saw, whatever happens next.
         if prefilter.intent_type == intent.INTENT_PROVIDER_REQUEST:
@@ -2453,7 +2686,8 @@ def process_ai_queue(
             summary.skipped_in_funnel += 1
             print(
                 f"[{index}/{len(prioritized)}] Skipped: already "
-                f"{fields.get(FIELD_OUTREACH_STATUS)!r} in the funnel.",
+                f"{fields.get(FIELD_OUTREACH_STATUS)!r} in the funnel. "
+                f"{ref}",
                 flush=True,
             )
             continue
@@ -2463,10 +2697,14 @@ def process_ai_queue(
             summary.skipped_retry_exhausted += 1
             print(
                 f"[{index}/{len(prioritized)}] Skipped: "
-                f"{AI_ERROR_MAX_ATTEMPTS} failed AI attempts already.",
+                f"{AI_ERROR_MAX_ATTEMPTS} failed AI attempts already. "
+                f"{ref}",
                 flush=True,
             )
             continue
+
+        # Past the two skips above, this record genuinely gets evaluated.
+        summary.records_evaluated += 1
 
         # A human's explicit Approve overrides the intent heuristics only.
         # It is read from Human Decision, never from the machine-generated
@@ -2479,6 +2717,10 @@ def process_ai_queue(
         if is_human_rejected(fields):
             summary.human_rejected += 1
             summary.rejected += 1
+
+            if not claim_update(index):
+                continue
+
             pending_updates.append(
                 build_prefilter_rejection_update(
                     record_id,
@@ -2488,7 +2730,7 @@ def process_ai_queue(
             )
             print(
                 f"[{index}/{len(prioritized)}] Skipped: Human Decision is "
-                f"{HUMAN_DECISION_REJECT!r}. URL={post_url}",
+                f"{HUMAN_DECISION_REJECT!r}. {ref}",
                 flush=True,
             )
             flush()
@@ -2511,6 +2753,10 @@ def process_ai_queue(
                 summary.stale_skipped += 1
             summary.prefilter_rejected += 1
             summary.rejected += 1
+
+            if not claim_update(index):
+                continue
+
             pending_updates.append(
                 build_prefilter_rejection_update(record_id, prefilter)
             )
@@ -2518,7 +2764,7 @@ def process_ai_queue(
                 f"[{index}/{len(prioritized)}] Blocked before AI "
                 f"({', '.join(blocking_codes)}) "
                 f"intent={prefilter.intent_type} "
-                f"score={prefilter.score} URL={post_url}",
+                f"score={prefilter.score} {ref}",
                 flush=True,
             )
             flush()
@@ -2535,6 +2781,10 @@ def process_ai_queue(
         ):
             summary.prefilter_rejected += 1
             summary.rejected += 1
+
+            if not claim_update(index):
+                continue
+
             pending_updates.append(
                 build_prefilter_rejection_update(record_id, prefilter)
             )
@@ -2542,7 +2792,7 @@ def process_ai_queue(
                 f"[{index}/{len(prioritized)}] Prefiltered out "
                 f"(intent={prefilter.intent_type} "
                 f"service={prefilter.service_matched} "
-                f"score={prefilter.score}) URL={post_url}",
+                f"score={prefilter.score}) {ref}",
                 flush=True,
             )
             flush()
@@ -2551,6 +2801,32 @@ def process_ai_queue(
         summary.prefilter_accepted += 1
 
         if summary.ai_processed >= AI_BATCH_LIMIT:
+            summary.deferred_ai_batch_limit += 1
+            continue
+
+        # An OpenAI result is only worth paying for if there is somewhere to
+        # put it. Checking first means the budget can never be spent on a
+        # call whose answer is then thrown away -- the record is left exactly
+        # as it was, and the next run asks the model instead.
+        #
+        # The pipeline is single-threaded and nothing else consumes the
+        # budget between here and the write below, so this check is a valid
+        # reservation for the one mutation this record will make: either the
+        # qualification result, or the AI-error state if the call fails.
+        if not has_lead_update_budget():
+            summary.update_candidates += 1
+            summary.deferred_no_update_budget += 1
+            summary.lead_update_budget_exhausted = True
+
+            if not budget_notice_printed:
+                budget_notice_printed = True
+                print(
+                    f"[{index}/{len(prioritized)}] Lead update budget "
+                    f"({AIRTABLE_LEAD_UPDATE_BUDGET}) is spent. Not calling "
+                    f"OpenAI for records whose result could not be saved.",
+                    file=sys.stderr,
+                    flush=True,
+                )
             continue
 
         try:
@@ -2574,6 +2850,9 @@ def process_ai_queue(
             if decision.outreach_ready:
                 summary.outreach_ready += 1
 
+            if not claim_update(index):
+                continue
+
             pending_updates.append(
                 {
                     "id": record_id,
@@ -2593,7 +2872,7 @@ def process_ai_queue(
                 f"Intent={prefilter.intent_type} "
                 f"Qualified={decision.qualified} "
                 f"Outreach={decision.outreach_ready} "
-                f"Author={author!r} URL={post_url}",
+                f"{ref}",
                 flush=True,
             )
 
@@ -2637,11 +2916,15 @@ def process_ai_queue(
 
             print(
                 f"[{index}/{len(prioritized)}] AI processing failed for "
-                f"{record_id} (attempt {attempts}/{AI_ERROR_MAX_ATTEMPTS}, "
-                f"transient={transient}): {exc}",
+                f"{ref} (attempt {attempts}/{AI_ERROR_MAX_ATTEMPTS}, "
+                f"transient={transient}): "
+                f"{redaction.scrub(exc, limit=300)}",
                 file=sys.stderr,
                 flush=True,
             )
+
+            if not claim_update(index):
+                continue
 
             try:
                 mark_ai_error(
@@ -2652,7 +2935,8 @@ def process_ai_queue(
                 )
             except Exception as mark_exc:  # noqa: BLE001 - best effort
                 print(
-                    f"Could not mark {record_id} as Error: {mark_exc}",
+                    f"Could not mark {ref} as Error: "
+                    f"{redaction.scrub(mark_exc, limit=300)}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2862,6 +3146,7 @@ def main() -> None:
 
     summary = RunSummary()
     reset_openai_request_budget()
+    reset_lead_update_budget()
 
     if not DRY_RUN:
         validate_airtable_schema()

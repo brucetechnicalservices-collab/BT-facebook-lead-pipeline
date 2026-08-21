@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 import intent
+import redaction
 
 # ---------------------------------------------------------------------------
 # Field names
@@ -463,9 +464,11 @@ def refresh_group_performance(
         return aggregation
 
     if dry_run:
-        for update in updates:
+        for position, update in enumerate(updates, start=1):
             print(
-                f"[DRY RUN] Would update group {update['id']}: "
+                f"[DRY RUN] Would update group "
+                f"[{position}/{len(updates)}] "
+                f"{redaction.redact_record_id(update['id'])}: "
                 f"{update['fields']}",
                 flush=True,
             )

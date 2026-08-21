@@ -15,6 +15,75 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Added — validation safety, after run 32334487910
+
+That run succeeded and proved nothing. Fifty scraped items were all
+duplicates, 200 queued records were all rejected as `STALE_POST` before any
+OpenAI call, no newly scraped post was evaluated, and no record reached the
+model. Two things about it were worse than unhelpful.
+
+**The public log published the source data.** Complete Facebook post URLs,
+author names, and full Airtable record IDs for all 200 records, in a log
+readable by anyone who can read the repository, about posts belonging to other
+people. Every logging path in the pipeline now prints the queue position and a
+keyed fingerprint instead:
+
+```
+[7/200] Blocked before AI (STALE_POST) intent=BUSINESS_PAIN score=41 rec:5f2f6350
+```
+
+Intent, Prefilter Score, rejection codes, progress, and totals are unchanged —
+the operational content of the log is the same. The fingerprint is a keyed
+BLAKE2s digest whose salt is random per run unless `LOG_FINGERPRINT_SALT`
+pins it, so a published log cannot be matched back to a post by hashing a
+candidate URL. Exception text from Airtable, OpenAI, and Apify is scrubbed
+before printing, because a message the pipeline did not compose may carry an
+identifier it does not know about. The dry-run `Would update` and
+`Would create` listings, the group-performance dry-run listing, and the
+scraper-run log all went through the same treatment.
+
+**`AI_BATCH_LIMIT=5` bounded nothing that mattered.** Deterministic rejections
+never reach the model, so a write-enabled version of that run would have
+modified 200 lead records with no ceiling anywhere in the pipeline.
+`AIRTABLE_LEAD_UPDATE_BUDGET` is that ceiling. It counts **lead-record
+mutations** — not HTTP requests and not batches, so ten records in one `PATCH`
+count as ten — and every write path spends it: human rejection, stale
+rejection, ordinary prefilter rejection, completed AI qualification, and the
+AI-error state write. It is checked *before* `responses.create()`, so a run
+never pays for a classification it has no room left to save. When it runs out
+the remaining records are left exactly as they were and stay `Pending`;
+deterministic evaluation continues, because it is free, so the run still
+reports what it would have written. `0` or blank is unlimited, which is what
+every scheduled run should keep, and a dry run never spends it at all.
+
+The run summary now separates deciding from writing, which were the same
+number before and said so nowhere:
+
+```
+  Records evaluated     200
+  Update candidates     200
+  Updates written       3
+  Deferred (no budget)  197  [BUDGET EXHAUSTED]
+  Deferred (AI limit)   0
+```
+
+**`PREFILTER_SCAN_LIMIT` is now a workflow input.** The application default is
+unchanged at 200. `0` turns historical scanning off entirely: the run
+evaluates this run's own imports and anything a person set `Human Decision`
+on, and nothing else. It controls deterministic backlog evaluation only — not
+AI requests, not Airtable writes, and not this run's imports, which are
+fetched by record ID and evaluated in full however many there are.
+
+**The two writes that are not lead records got their own switches.**
+`UPDATE_GROUP_PERFORMANCE` and `LOG_SCRAPER_RUNS` are workflow inputs now,
+defaulting to on as before, so a validation run can be narrowed to the lead
+table alone. Both read `github.event.inputs.*` rather than the `inputs.*`
+context: `${{ inputs.x || 'true' }}` reads a real boolean, and an unticked box
+would make the fallback fire and the control silently do nothing.
+
+Composed, these give a run whose worst case is three modified lead records and
+nine OpenAI requests. The recipe is in README.md.
+
 ### Fixed — five reliability defects found reviewing this PR
 
 **An explicit service request could be thrown away for thin context.** "I need
