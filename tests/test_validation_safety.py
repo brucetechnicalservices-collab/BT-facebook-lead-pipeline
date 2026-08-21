@@ -24,7 +24,10 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
+import pathlib
+
 import pytest
+import yaml
 
 import apify_runs
 import group_performance
@@ -1009,7 +1012,17 @@ WORKFLOW = ".github/workflows/facebook-leads.yml"
 
 @pytest.fixture(scope="module")
 def workflow():
-    yaml = pytest.importorskip("yaml")
+    """
+    The parsed pipeline workflow.
+
+    PyYAML is imported at module scope, not with importorskip. It used to be
+    optional here, and PyYAML is not a runtime dependency, so on a CI runner
+    that installs only requirements-dev.txt every workflow assertion in this
+    file skipped and the job still went green. Run 32450727941 reported
+    "698 passed, 25 skipped" while the schedule-disabled check, the
+    entry-point check, and every input-wiring check quietly did not run.
+    A missing PyYAML must break collection instead.
+    """
     with open(WORKFLOW, encoding="utf-8") as handle:
         return yaml.safe_load(handle)
 
@@ -1249,6 +1262,126 @@ def test_the_readme_lists_what_the_logs_never_print(readme):
     assert "### What the logs may say" in readme
     for forbidden in ("Post URL", "Post text", "Author name"):
         assert forbidden in readme
+
+
+# ---------------------------------------------------------------------------
+# The workflow tests must actually run
+#
+# They parse the workflow through PyYAML, which is not a runtime dependency.
+# When that import was optional, a CI runner without PyYAML skipped all 25 of
+# them and the job reported success: run 32450727941 said "698 passed, 25
+# skipped" while the schedule-disabled check and every input-wiring check sat
+# out. A test that can silently not run is not a test.
+# ---------------------------------------------------------------------------
+
+DEV_REQUIREMENTS = "requirements-dev.txt"
+PROD_REQUIREMENTS = "requirements.txt"
+
+
+def _requirement_names(path: str) -> set[str]:
+    """Distribution names declared in a requirements file, lowercased."""
+    names = set()
+
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.split("#", 1)[0].strip()
+            if not line or line.startswith("-"):
+                continue
+            name = re.split(r"[<>=!~\[;]", line, maxsplit=1)[0]
+            names.add(name.strip().lower())
+
+    return names
+
+
+def test_pyyaml_is_a_declared_development_dependency():
+    assert "pyyaml" in _requirement_names(DEV_REQUIREMENTS)
+
+
+def test_pyyaml_is_pinned_below_the_next_major():
+    """A PyYAML 7 that changed safe_load would be caught, not absorbed."""
+    with open(DEV_REQUIREMENTS, encoding="utf-8") as handle:
+        text = handle.read()
+
+    assert "PyYAML>=6.0,<7.0" in text
+
+
+def test_pyyaml_is_not_a_production_dependency():
+    """
+    The pipeline itself never parses YAML. Fixing the CI gap must not put a
+    new package into the runtime environment.
+    """
+    assert "pyyaml" not in _requirement_names(PROD_REQUIREMENTS)
+
+
+def _optional_yaml_imports() -> list[str]:
+    """
+    Every ``importorskip`` in the test suite that would make YAML optional.
+
+    Walked as a syntax tree rather than grepped, so the explanatory comments
+    and docstrings that mention importorskip cannot satisfy this test.
+    """
+    import ast
+
+    found = []
+
+    for path in sorted(pathlib.Path("tests").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            func = node.func
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", "")
+            )
+            if name != "importorskip":
+                continue
+
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and "yaml" in str(
+                    arg.value
+                ).lower():
+                    found.append(f"{path}:{node.lineno}")
+
+    return found
+
+
+def test_no_test_module_treats_yaml_as_optional():
+    assert _optional_yaml_imports() == []
+
+
+def test_every_workflow_parsing_module_imports_yaml_at_module_scope():
+    """
+    The positive half of the rule above. A module that reads the workflow
+    must fail collection without PyYAML, not skip.
+    """
+    import ast
+
+    checked = 0
+
+    for path in sorted(pathlib.Path("tests").glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "yaml.safe_load" not in source:
+            continue
+
+        checked += 1
+        tree = ast.parse(source)
+        module_level = {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+
+        assert "yaml" in module_level, (
+            f"{path} parses YAML but does not import it at module scope, so "
+            f"a runner without PyYAML would skip its tests instead of failing"
+        )
+
+    assert checked == 2, "expected exactly two workflow-parsing test modules"
 
 
 # ---------------------------------------------------------------------------

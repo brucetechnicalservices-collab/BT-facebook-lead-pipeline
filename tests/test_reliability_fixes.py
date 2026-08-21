@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import requests
+import yaml
 
 import ai_retry
 import intent
@@ -786,7 +787,17 @@ WORKFLOW = ".github/workflows/facebook-leads.yml"
 
 @pytest.fixture(scope="module")
 def workflow():
-    yaml = pytest.importorskip("yaml")
+    """
+    The parsed pipeline workflow.
+
+    PyYAML is imported at module scope, not with importorskip. It used to be
+    optional here, and PyYAML is not a runtime dependency, so on a CI runner
+    that installs only requirements-dev.txt every workflow assertion in this
+    file skipped and the job still went green. Run 32450727941 reported
+    "698 passed, 25 skipped" while the schedule-disabled check, the
+    entry-point check, and every input-wiring check quietly did not run.
+    A missing PyYAML must break collection instead.
+    """
     with open(WORKFLOW, encoding="utf-8") as handle:
         return yaml.safe_load(handle)
 

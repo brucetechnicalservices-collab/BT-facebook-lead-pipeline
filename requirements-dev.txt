@@ -1,3 +1,10 @@
 # Development and CI dependencies.
 -r requirements.txt
 pytest>=8.0.0
+
+# Required, not optional. The workflow-configuration tests parse
+# .github/workflows/facebook-leads.yml to assert that the schedule is still
+# disabled, that the job still runs the real entry point, and that every
+# dispatch input reaches the pipeline. Those tests used to importorskip
+# PyYAML, so a runner without it skipped all 25 of them and reported success.
+PyYAML>=6.0,<7.0
