@@ -629,10 +629,12 @@ def test_the_create_budget_input_tells_the_operator_how_to_go_unlimited(
     assert "unlimited" in description
 
 
-def test_only_the_create_budget_input_is_required(workflow):
+def test_only_the_two_write_budgets_are_required(workflow):
     """
-    Marking every input required would make the form hostile. Exactly one is
-    required, because exactly one has a default that must be seen.
+    Changed deliberately on 2026-08-24, when the update budget joined the
+    create budget in being required. Marking every input required would
+    make the form hostile; these two are required because for both of them
+    the unlimited setting must be typed rather than reached by default.
     """
     required = {
         name
@@ -640,7 +642,10 @@ def test_only_the_create_budget_input_is_required(workflow):
         if spec.get("required")
     }
 
-    assert required == {"airtable_lead_create_budget"}
+    assert required == {
+        "airtable_lead_create_budget",
+        "airtable_lead_update_budget",
+    }
 
 
 def test_the_application_default_is_still_unlimited_for_compatibility():
@@ -839,3 +844,161 @@ def test_the_readme_documents_the_create_budget():
 
     assert f"`{rp.DEFAULT_AIRTABLE_LEAD_CREATE_BUDGET}`" in row
     assert "unlimited" in row.lower()
+
+
+# ===========================================================================
+# The complete safe manual-dispatch profile
+#
+# An untouched "Run workflow" click used to mean: real writes, an unlimited
+# update budget, a 200-record historical scan, 20 records to the model, a
+# derived 60-request OpenAI ceiling, and both auxiliary tables written. Every
+# one of those is a production setting reached by doing nothing.
+#
+# The form now pre-fills the validation profile instead. A write-enabled run
+# requires deliberately unticking "Dry run". These tests pin the whole shape,
+# not one field at a time, because the danger is a single default drifting
+# back while the others still look right.
+# ===========================================================================
+
+#: What a person sees pre-filled after clicking "Run workflow".
+SAFE_MANUAL_DISPATCH_PROFILE = {
+    "dry_run": True,
+    "start_new_apify_run": False,
+    "ai_batch_limit": "3",
+    "openai_request_budget": "3",
+    "prefilter_scan_limit": "0",
+    "airtable_lead_update_budget": "3",
+    "airtable_lead_create_budget": "3",
+    "update_group_performance": False,
+    "log_scraper_runs": False,
+    "apify_run_id": "",
+}
+
+
+def test_the_manual_dispatch_form_is_the_safe_profile(workflow):
+    inputs = _dispatch_inputs(workflow)
+    actual = {name: spec.get("default") for name, spec in inputs.items()}
+
+    assert actual == SAFE_MANUAL_DISPATCH_PROFILE
+
+
+def test_the_form_has_no_input_outside_the_profile(workflow):
+    """A new input must be given a deliberate default, not inherit one."""
+    assert set(_dispatch_inputs(workflow)) == set(
+        SAFE_MANUAL_DISPATCH_PROFILE
+    )
+
+
+def test_an_untouched_dispatch_is_a_dry_run(workflow):
+    assert _dispatch_inputs(workflow)["dry_run"]["default"] is True
+
+
+def test_an_untouched_dispatch_starts_no_paid_apify_run(workflow):
+    assert _dispatch_inputs(workflow)["start_new_apify_run"]["default"] is (
+        False
+    )
+
+
+def test_an_untouched_dispatch_writes_to_no_auxiliary_table(workflow):
+    inputs = _dispatch_inputs(workflow)
+
+    assert inputs["update_group_performance"]["default"] is False
+    assert inputs["log_scraper_runs"]["default"] is False
+
+
+def test_an_untouched_dispatch_scans_no_historical_backlog(workflow):
+    assert _dispatch_inputs(workflow)["prefilter_scan_limit"]["default"] == (
+        "0"
+    )
+
+
+def test_an_untouched_dispatch_caps_openai_at_three_requests(workflow):
+    """
+    Both AI limits are 3, so the worst case is 3 requests rather than the
+    derived 3 x OPENAI_MAX_ATTEMPTS.
+    """
+    inputs = _dispatch_inputs(workflow)
+
+    assert inputs["ai_batch_limit"]["default"] == "3"
+    assert inputs["openai_request_budget"]["default"] == "3"
+
+
+def test_neither_write_budget_can_be_unlimited_by_default(workflow):
+    """Unlimited has to be typed as 0 for both, never reached by default."""
+    inputs = _dispatch_inputs(workflow)
+
+    for name in (
+        "airtable_lead_create_budget",
+        "airtable_lead_update_budget",
+    ):
+        spec = inputs[name]
+        assert spec["required"] is True
+        assert int(spec["default"]) > 0
+
+
+def test_the_form_defaults_are_stricter_than_the_application_defaults():
+    """
+    The point of the split. Nothing about run_pipeline's own defaults
+    changed; the form is simply a safer starting position.
+    """
+    assert rp.DEFAULT_AI_BATCH_LIMIT == 20
+    assert rp.DEFAULT_PREFILTER_SCAN_LIMIT == 200
+    assert rp.DEFAULT_AIRTABLE_LEAD_CREATE_BUDGET == 0
+    assert rp.DEFAULT_AIRTABLE_LEAD_UPDATE_BUDGET == 0
+    assert rp.DRY_RUN is False
+    assert rp.env_bool("UPDATE_GROUP_PERFORMANCE", True) is True
+    assert rp.env_bool("LOG_SCRAPER_RUNS", True) is True
+
+
+def test_the_env_fallbacks_still_carry_the_production_values(workflow):
+    """
+    The fallbacks fire only when github.event.inputs is null, which a
+    workflow_dispatch never is. They govern non-manual triggers, so
+    re-enabling the schedule resumes production behaviour rather than
+    running a no-op dry run every morning.
+    """
+    env = _pipeline_env(workflow)
+
+    assert "|| 'false'" in env["DRY_RUN"]
+    assert "|| '20'" in env["AI_BATCH_LIMIT"]
+    assert "|| '200'" in env["PREFILTER_SCAN_LIMIT"]
+    assert "|| ''" in env["AIRTABLE_LEAD_UPDATE_BUDGET"]
+    assert "|| ''" in env["OPENAI_REQUEST_BUDGET"]
+    assert "|| 'true'" in env["UPDATE_GROUP_PERFORMANCE"]
+    assert "|| 'true'" in env["LOG_SCRAPER_RUNS"]
+
+
+def test_every_input_still_reaches_the_pipeline(workflow):
+    """A safe default is worthless if the value never arrives."""
+    env = _pipeline_env(workflow)
+    wiring = {
+        "dry_run": "DRY_RUN",
+        "start_new_apify_run": "RUN_APIFY_TASK",
+        "ai_batch_limit": "AI_BATCH_LIMIT",
+        "openai_request_budget": "OPENAI_REQUEST_BUDGET",
+        "prefilter_scan_limit": "PREFILTER_SCAN_LIMIT",
+        "airtable_lead_update_budget": "AIRTABLE_LEAD_UPDATE_BUDGET",
+        "airtable_lead_create_budget": "AIRTABLE_LEAD_CREATE_BUDGET",
+        "update_group_performance": "UPDATE_GROUP_PERFORMANCE",
+        "log_scraper_runs": "LOG_SCRAPER_RUNS",
+        "apify_run_id": "APIFY_RUN_ID",
+    }
+
+    for input_name, env_name in wiring.items():
+        assert f"github.event.inputs.{input_name}" in env[env_name]
+
+
+def test_the_safe_profile_did_not_wake_the_schedule(workflow):
+    triggers = workflow.get("on") or workflow.get(True)
+
+    assert "schedule" not in triggers
+    assert set(triggers) == {"workflow_dispatch"}
+
+
+def test_the_safe_profile_did_not_change_the_entry_point(workflow):
+    steps = workflow["jobs"]["run-pipeline"]["steps"]
+
+    assert "python run_pipeline.py" in [
+        step.get("run", "") for step in steps
+    ]
+    assert workflow["jobs"]["run-pipeline"]["needs"] == "test"

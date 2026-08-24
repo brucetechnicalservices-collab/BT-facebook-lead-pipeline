@@ -15,6 +15,41 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Changed — the manual dispatch form is the safe profile
+
+The create budget stopped an untouched manual run from adding 214 rows.
+Everything else about an untouched manual run was still production
+configuration reached by doing nothing: writes enabled, an unlimited update
+budget, a 200-record historical scan, 20 records to the model, a derived
+60-request OpenAI ceiling, and both auxiliary tables written.
+
+Every workflow_dispatch default is now the validation profile. Clicking "Run
+workflow" and changing nothing gives a dry run that writes nothing, scans no
+backlog, sends at most 3 records to the model for at most 3 requests, and
+leaves Facebook Group Performance and Facebook Post Scraper Runs alone. A
+write-enabled run requires deliberately unticking "Dry run", and both write
+budgets are required inputs, so unlimited has to be typed as 0 rather than
+reached by leaving a field blank.
+
+The application defaults did not move. run_pipeline still defaults to
+DRY_RUN false, AI_BATCH_LIMIT 20, PREFILTER_SCAN_LIMIT 200, both write
+budgets unlimited, and both auxiliary switches on. So do the `|| '...'`
+fallbacks in the job env, which fire only when github.event.inputs is null --
+something a workflow_dispatch never is. They govern non-manual triggers, so
+re-enabling the schedule resumes production behaviour rather than running a
+no-op dry run every morning. The form and the fallback are two layers with
+deliberately different values, and separate tests now assert each.
+
+Five existing tests asserted the old form defaults and were updated in place
+with the reason recorded, and the drift protection they provided was moved to
+the fallback layer rather than dropped: the assertion that the workflow and
+the application agree on AI_BATCH_LIMIT=20 and PREFILTER_SCAN_LIMIT=200 now
+reads the env expression, which is where those numbers still belong.
+
+The whole profile is asserted as one dictionary rather than field by field,
+because the danger is a single default drifting back while the rest still
+look right.
+
 ### Added — a ceiling on record creation, after dry run 32658122909
 
 That dry run read Apify run `IPOHKRCznDcvYgnyx`, dataset `KFiSxm6fiXVSAY0kK`:

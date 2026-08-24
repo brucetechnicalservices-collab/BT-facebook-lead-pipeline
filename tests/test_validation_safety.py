@@ -1060,13 +1060,20 @@ def test_the_workflow_passes_the_scan_limit_to_the_pipeline(workflow):
     )
 
 
-def test_the_scan_limit_default_matches_the_application_default(workflow):
+def test_the_scan_limit_form_default_is_zero_and_the_fallback_is_two_hundred(
+    workflow,
+):
+    """
+    Changed deliberately on 2026-08-24. The form default was the
+    application default of 200; a manual run now defaults to 0, so an
+    untouched dispatch never scans the historical backlog. The env fallback
+    still carries 200 and still guards against drift, because it is what a
+    non-manual trigger would use.
+    """
     inputs = _dispatch_inputs(workflow)
     env = _pipeline_env(workflow)
 
-    assert int(inputs["prefilter_scan_limit"]["default"]) == (
-        rp.DEFAULT_PREFILTER_SCAN_LIMIT
-    )
+    assert int(inputs["prefilter_scan_limit"]["default"]) == 0
     assert f"'{rp.DEFAULT_PREFILTER_SCAN_LIMIT}'" in (
         env["PREFILTER_SCAN_LIMIT"]
     )
@@ -1090,11 +1097,24 @@ def test_the_workflow_offers_the_lead_update_budget_as_an_input(workflow):
     assert "airtable_lead_update_budget" in _dispatch_inputs(workflow)
 
 
-def test_the_lead_update_budget_input_defaults_to_blank(workflow):
-    """Blank is unlimited, which is what production has always done."""
-    assert _dispatch_inputs(workflow)["airtable_lead_update_budget"][
-        "default"
-    ] == ""
+def test_the_lead_update_budget_input_defaults_to_three_and_is_required(
+    workflow,
+):
+    """
+    Changed deliberately on 2026-08-24. This used to assert a blank
+    default, which the application reads as unlimited -- so an untouched
+    dispatch could change every record in the queue. Unlimited now has to
+    be typed as 0, exactly like the create budget.
+    """
+    spec = _dispatch_inputs(workflow)["airtable_lead_update_budget"]
+
+    assert spec["default"] == "3"
+    assert spec["required"] is True
+
+
+def test_the_lead_update_budget_env_fallback_is_still_unlimited(workflow):
+    """A non-manual trigger keeps the production behaviour."""
+    assert "|| ''" in _pipeline_env(workflow)["AIRTABLE_LEAD_UPDATE_BUDGET"]
 
 
 def test_the_lead_update_budget_input_says_it_counts_records(workflow):
@@ -1122,11 +1142,24 @@ def test_the_workflow_offers_both_unrelated_write_switches(workflow):
     assert "log_scraper_runs" in inputs
 
 
-def test_both_write_switches_keep_their_current_defaults(workflow):
+def test_both_write_switches_default_off_for_a_manual_run(workflow):
+    """
+    Changed deliberately on 2026-08-24. Both used to pre-fill ticked. A
+    manual run now leaves the two auxiliary tables alone unless someone
+    ticks them, so a validation dispatch is confined to the lead table.
+    """
     inputs = _dispatch_inputs(workflow)
 
-    assert inputs["update_group_performance"]["default"] is True
-    assert inputs["log_scraper_runs"]["default"] is True
+    assert inputs["update_group_performance"]["default"] is False
+    assert inputs["log_scraper_runs"]["default"] is False
+
+
+def test_both_write_switches_stay_on_for_a_non_manual_trigger(workflow):
+    """The env fallbacks are the production path and are unchanged."""
+    env = _pipeline_env(workflow)
+
+    assert "|| 'true'" in env["UPDATE_GROUP_PERFORMANCE"]
+    assert "|| 'true'" in env["LOG_SCRAPER_RUNS"]
 
 
 def test_both_write_switches_reach_the_pipeline(workflow):

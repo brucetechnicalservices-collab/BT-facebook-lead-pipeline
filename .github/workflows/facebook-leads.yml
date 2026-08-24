@@ -1,12 +1,26 @@
 name: BruceTech Facebook Leads
 
 on:
+  # MANUAL-RUN DEFAULTS ARE THE SAFE VALIDATION PROFILE.
+  #
+  # Every `default:` below is what a person sees pre-filled after clicking
+  # "Run workflow". Left untouched they produce a narrow DRY RUN: nothing is
+  # written, the backlog is not scanned, at most 3 records reach the model,
+  # and the two auxiliary tables are left alone. A write-enabled run requires
+  # deliberately unticking "Dry run".
+  #
+  # The `|| '...'` fallbacks in the job env are a DIFFERENT layer. They fire
+  # only when github.event.inputs is null, which a workflow_dispatch never
+  # is, so they govern non-manual triggers only. Those keep the production
+  # values (dry_run false, unlimited update budget, scan limit 200, batch
+  # limit 20) so that re-enabling the schedule resumes normal operation
+  # rather than silently running a no-op dry run every morning.
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run: score records but make no Airtable writes"
+        description: "Dry run: score records but make no Airtable writes. ON by default. Untick deliberately to allow writes"
         type: boolean
-        default: false
+        default: true
         required: false
       start_new_apify_run:
         description: "Start a fresh Apify run instead of reading the last one"
@@ -14,25 +28,25 @@ on:
         default: false
         required: false
       ai_batch_limit:
-        description: "Maximum records evaluated by AI this run (lower this when testing)"
+        description: "Maximum records evaluated by AI this run. Defaults to 3 for a manual run; the application default is 20"
         type: string
-        default: "20"
+        default: "3"
         required: false
       openai_request_budget:
-        description: "Maximum OpenAI API requests this run, retries included. Blank uses ai_batch_limit x OPENAI_MAX_ATTEMPTS. 0 disables the ceiling"
+        description: "Maximum OpenAI API requests this run, retries included. Defaults to 3 for a manual run. Blank derives ai_batch_limit x OPENAI_MAX_ATTEMPTS. 0 disables the ceiling"
         type: string
-        default: ""
+        default: "3"
         required: false
       prefilter_scan_limit:
         description: "Historical backlog records pulled in for deterministic evaluation. Not AI requests, and not a cap on this run's own imports. 0 evaluates only this run's imports and explicit human decisions"
         type: string
-        default: "200"
+        default: "0"
         required: false
       airtable_lead_update_budget:
-        description: "Maximum lead RECORDS this run may change in Airtable, across every path including stale rejections. Blank or 0 is unlimited, which is the normal production setting"
+        description: "Maximum lead RECORDS this run may change in Airtable, across every path including stale rejections. Defaults to 3 for a manual run. Enter 0 for unlimited, which is the production setting"
         type: string
-        default: ""
-        required: false
+        default: "3"
+        required: true
       airtable_lead_create_budget:
         description: "Maximum NEW lead records this run may create in Airtable. Defaults to 3 so a manual run is safe as dispatched. Enter 0 for unlimited. Deferred posts stay importable: re-run the same pinned Apify run to import the next batch"
         type: string
@@ -41,12 +55,12 @@ on:
       update_group_performance:
         description: "Refresh Facebook Group Performance at the end of the run (untick for a narrowly scoped validation run)"
         type: boolean
-        default: true
+        default: false
         required: false
       log_scraper_runs:
         description: "Write the Facebook Post Scraper Runs record for this Apify run (untick for a narrowly scoped validation run)"
         type: boolean
-        default: true
+        default: false
         required: false
       apify_run_id:
         description: "Import from one exact Apify run ID (leave blank for the last successful run)"

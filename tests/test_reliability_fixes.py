@@ -874,19 +874,32 @@ def _readme_normal_run_row() -> str:
     raise AssertionError("README has no 'Normal daily run' recommendation row")
 
 
-def test_the_workflow_default_matches_the_application_default(workflow):
+def test_the_workflow_default_is_the_safe_manual_value(workflow):
     """
-    Three places name this number: the dispatch input, the Python default,
-    and the README recommendation. They drifted once (workflow 40 vs
-    application 20), so they are asserted equal rather than trusted.
+    Changed deliberately on 2026-08-24. This used to assert the dispatch
+    default equalled the application default of 20. The manual form now
+    pre-fills the safe validation profile instead, so the two layers are
+    asserted separately: the form default below, and the env fallback in
+    the next test, which is what still guards against drift from the
+    application default.
     """
-    workflow_default = _dispatch_inputs(workflow)["ai_batch_limit"]["default"]
+    workflow_default = int(
+        _dispatch_inputs(workflow)["ai_batch_limit"]["default"]
+    )
 
-    assert int(workflow_default) == rp.DEFAULT_AI_BATCH_LIMIT
+    assert workflow_default == 3
+    assert workflow_default < rp.DEFAULT_AI_BATCH_LIMIT, (
+        "the manual form must be stricter than the application default"
+    )
 
 
 def test_the_workflow_env_fallback_matches_the_application_default(workflow):
-    """The `|| '20'` fallback must not drift from the input default either."""
+    """
+    The `|| '20'` fallback fires only when github.event.inputs is null,
+    which a workflow_dispatch never is -- so it governs non-manual triggers
+    and must stay at the application default. This is the assertion that
+    catches drift now that the form default is deliberately different.
+    """
     expression = _pipeline_env(workflow)["AI_BATCH_LIMIT"]
 
     assert f"'{rp.DEFAULT_AI_BATCH_LIMIT}'" in expression

@@ -1199,28 +1199,44 @@ the structured signals, which cannot be derived from the old `Lead Score`.
 
 ### A narrowly scoped validation run
 
-The controls above compose into a run that touches almost nothing, which is
-what you want when the question is "does this actually work against my base?"
-rather than "please process my backlog".
+You no longer have to build one. **The manual dispatch form is already it.**
 
-Dispatch the workflow with:
+Click "Run workflow" on **BruceTech Facebook Leads**, change nothing, and the
+pre-filled values give you a narrow dry run:
 
-| Input | Value | Effect |
+| Input | Pre-filled | Effect |
 | --- | --- | --- |
-| `dry_run` | unticked | Real writes, so the run proves something |
+| `dry_run` | **ticked** | Nothing is written anywhere |
+| `start_new_apify_run` | unticked | No paid Apify run is started |
+| `ai_batch_limit` | `3` | At most 3 records reach the model |
+| `openai_request_budget` | `3` | At most 3 API requests, retries included |
 | `prefilter_scan_limit` | `0` | No historical backlog. This run's imports and explicit human decisions only |
-| `airtable_lead_update_budget` | `3` | At most three lead records change, whatever happens |
-| `ai_batch_limit` | `3` | At most three records reach the model |
-| `update_group_performance` | unticked | No writes to the group metrics table |
-| `log_scraper_runs` | unticked | No writes to the scraper runs table |
+| `airtable_lead_update_budget` | `3` | At most 3 existing records changed |
+| `airtable_lead_create_budget` | `3` | At most 3 new records created |
+| `update_group_performance` | unticked | Facebook Group Performance untouched |
+| `log_scraper_runs` | unticked | Facebook Post Scraper Runs untouched |
+| `apify_run_id` | blank | Reads the last successful run; pin it to repeat exactly |
 
-The worst case is three modified lead records and nine OpenAI requests. Read
-the run summary, confirm `Updates written` matches what you expected, then
-raise the limits.
+**A write-enabled run requires deliberately unticking "Dry run".** Both write
+budgets are marked *required*, so unlimited has to be typed as `0` rather than
+reached by leaving a field alone.
 
-Run it as a dry run first if you want the evaluation without any write at all:
-a dry run does **not** spend `AIRTABLE_LEAD_UPDATE_BUDGET`, so every record in
-the selected queue is evaluated and every intended write is printed.
+The worst case for a manual run with the dry-run box unticked and nothing else
+changed is **3 new rows, 3 changed rows, and 3 OpenAI requests**.
+
+#### The form defaults are not the application defaults
+
+Two layers, deliberately different:
+
+| Layer | Governs | Values |
+| --- | --- | --- |
+| `workflow_dispatch` input `default:` | What a person sees pre-filled on a manual run | The safe profile above |
+| `\|\| '...'` fallback in the job `env` | Non-manual triggers only, because `github.event.inputs` is never null on a dispatch | The production values: `dry_run` false, unlimited budgets, scan limit 200, batch limit 20, both switches on |
+| `run_pipeline.py` | Anything importing or running the pipeline directly | Unchanged; see [Environment variables](#environment-variables) |
+
+The split matters if the schedule is ever re-enabled: a scheduled run takes
+the fallback layer and resumes normal operation, rather than silently
+performing a no-op dry run every morning.
 
 ### When you are ready to write
 
