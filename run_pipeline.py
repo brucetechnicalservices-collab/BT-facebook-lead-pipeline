@@ -313,6 +313,39 @@ AIRTABLE_LEAD_UPDATE_BUDGET = env_int(
     "AIRTABLE_LEAD_UPDATE_BUDGET", DEFAULT_AIRTABLE_LEAD_UPDATE_BUDGET
 )
 
+#: Hard ceiling on how many NEW lead records one run may create in Airtable.
+#:
+#: Deliberately separate from AIRTABLE_LEAD_UPDATE_BUDGET. That one bounds
+#: changes to records the base already holds; this one bounds how many rows
+#: the scrape may add. They are different blast radii, they are reached by
+#: different code paths, and a validation run usually wants a small number of
+#: each rather than one shared pool.
+#:
+#: The unit is a *record created*, not an HTTP request and not a batch: ten
+#: records POSTed together are ten units.
+#:
+#: 0 (or blank) means unlimited, which is the production behaviour this
+#: pipeline has always had. It exists for validation: the dry run of
+#: 2026-08-23 (Actions run 32658122909, Apify run IPOHKRCznDcvYgnyx) found
+#: 214 new unique leads in one 217-item dataset, and a write-enabled version
+#: of that run would have created all 214 rows with nothing anywhere in the
+#: pipeline able to stop it.
+#:
+#: Deferring a creation loses nothing. Imports are deduplicated against the
+#: live base by post ID, canonical URL, and fingerprint, so a post left
+#: uncreated is simply "new" again on the next run of the same dataset and is
+#: imported then. Re-running a pinned Apify run until the queue drains is a
+#: supported way to import a large scrape a few rows at a time.
+#:
+#: A dry run does not spend it. Dry runs create nothing, and budgeting them
+#: would hide the true size of the scrape, which is the one thing a dry run
+#: over a fresh dataset exists to show.
+DEFAULT_AIRTABLE_LEAD_CREATE_BUDGET = 0
+
+AIRTABLE_LEAD_CREATE_BUDGET = env_int(
+    "AIRTABLE_LEAD_CREATE_BUDGET", DEFAULT_AIRTABLE_LEAD_CREATE_BUDGET
+)
+
 #: Read from Apify and Airtable and call the AI as normal, but make no
 #: Airtable writes. Use this to see how the new rules score real records
 #: before letting the pipeline modify the base.
@@ -684,6 +717,157 @@ def consume_lead_update(count: int = 1) -> None:
         )
 
     _LEAD_UPDATES_MADE += count
+
+
+# ---------------------------------------------------------------------------
+# Airtable lead-create budget
+#
+# The update budget above bounds changes to rows the base already holds. It
+# does not bound how many rows the scrape adds, and those are different
+# risks: 214 new records from one dataset is not 214 edits to records someone
+# has already looked at.
+# ---------------------------------------------------------------------------
+
+class LeadCreateBudgetExhausted(RuntimeError):
+    """The run has created its whole AIRTABLE_LEAD_CREATE_BUDGET of records."""
+
+
+#: Lead records this run has committed to creating, dry runs excluded.
+_LEAD_CREATES_MADE = 0
+
+
+def lead_creates_made() -> int:
+    """How many lead records this run has created so far."""
+    return _LEAD_CREATES_MADE
+
+
+def reset_lead_create_budget() -> None:
+    """Zero the creation counter. Used by tests and at the start of a run."""
+    global _LEAD_CREATES_MADE
+    _LEAD_CREATES_MADE = 0
+
+
+def lead_create_budget_remaining() -> int | None:
+    """Creations still available, or None when the budget is unlimited."""
+    if not AIRTABLE_LEAD_CREATE_BUDGET or DRY_RUN:
+        return None
+
+    return max(AIRTABLE_LEAD_CREATE_BUDGET - _LEAD_CREATES_MADE, 0)
+
+
+def has_lead_create_budget(count: int = 1) -> bool:
+    """Whether ``count`` more records may be created."""
+    remaining = lead_create_budget_remaining()
+
+    return remaining is None or remaining >= count
+
+
+def consume_lead_create(count: int = 1) -> None:
+    """
+    Account for ``count`` record creations, refusing to exceed the budget.
+
+    Counted per record admitted to a create batch, not per POST, so ten rows
+    written in one request are ten units.
+
+    A dry run consumes nothing, because a dry run creates nothing.
+    """
+    global _LEAD_CREATES_MADE
+
+    if DRY_RUN:
+        return
+
+    if not AIRTABLE_LEAD_CREATE_BUDGET:
+        _LEAD_CREATES_MADE += count
+        return
+
+    if _LEAD_CREATES_MADE + count > AIRTABLE_LEAD_CREATE_BUDGET:
+        raise LeadCreateBudgetExhausted(
+            f"This run has created its full budget of "
+            f"{AIRTABLE_LEAD_CREATE_BUDGET} lead records "
+            f"(AIRTABLE_LEAD_CREATE_BUDGET). The remaining posts are not "
+            f"imported and stay importable: the next run of the same Apify "
+            f"dataset deduplicates against what landed and creates the next "
+            f"batch."
+        )
+
+    _LEAD_CREATES_MADE += count
+
+
+class ConfigurationError(RuntimeError):
+    """A setting is invalid. The run stops before it touches anything."""
+
+
+#: Write ceilings whose "0 means unlimited" convention makes a negative value
+#: ambiguous rather than merely wrong. A negative budget does not read as
+#: "unlimited" and it does not read as a number of records: it silently
+#: refuses every single write, so the run reports success having done nothing
+#: and the operator has no idea why. Both are rejected outright instead.
+NON_NEGATIVE_BUDGET_SETTINGS = (
+    "AIRTABLE_LEAD_CREATE_BUDGET",
+    "AIRTABLE_LEAD_UPDATE_BUDGET",
+)
+
+
+def validate_budget_configuration() -> None:
+    """
+    Fail on a nonsensical write budget before the run touches anything.
+
+    Called first thing in main(), ahead of the Airtable schema preflight, the
+    Apify run resolution, and any OpenAI client, so a typo costs nothing but
+    a clear message.
+    """
+    invalid = [
+        (name, value)
+        for name, value in (
+            (name, globals()[name]) for name in NON_NEGATIVE_BUDGET_SETTINGS
+        )
+        if value < 0
+    ]
+
+    if not invalid:
+        return
+
+    details = ", ".join(f"{name}={value}" for name, value in invalid)
+
+    raise ConfigurationError(
+        f"Invalid configuration: {details}. A write budget counts records "
+        f"and cannot be negative. Use 0 (or leave it blank) for unlimited, "
+        f"or a positive number to cap it. Nothing was read or written."
+    )
+
+
+def admit_posts_within_create_budget(
+    posts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Split posts into the ones this run may create and the ones it defers.
+
+    The budget is claimed here, before a post is added to any create batch,
+    so nothing is mapped or POSTed that the run has no room for. Order is
+    preserved, so the deferred tail is a stable suffix of the scrape rather
+    than an arbitrary subset.
+
+    Returns ``(admitted, deferred)``. A dry run admits everything.
+    """
+    admitted: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+
+    for post in posts:
+        if deferred:
+            # Once the budget is gone it stays gone. Keep the split
+            # contiguous rather than skipping ahead to a cheaper post.
+            deferred.append(post)
+            continue
+
+        try:
+            consume_lead_create()
+        except LeadCreateBudgetExhausted:
+            deferred.append(post)
+            continue
+
+        admitted.append(post)
+
+    return admitted, deferred
 
 
 # ---------------------------------------------------------------------------
@@ -1472,18 +1656,31 @@ def create_new_posts_in_airtable(
     *,
     apify_run_id: str = "",
     scraper_run_record_id: str = "",
+    summary: "RunSummary | None" = None,
 ) -> list[str]:
     """
     Create new Airtable records and return their record IDs.
 
     Every record created here carries the ID of the Apify run that produced
     it and, when the scraper run was logged, a link to that run's record.
+
+    AIRTABLE_LEAD_CREATE_BUDGET caps how many rows this may add. The budget
+    is claimed before a post is mapped or batched, so a deferred post is
+    never POSTed and never partially written. Deferring costs nothing: the
+    next run of the same dataset deduplicates against what landed and
+    imports the rest.
     """
+    if summary is not None:
+        summary.creation_candidates += len(posts)
+
     if not posts:
         print("No new Facebook posts to create in Airtable.", flush=True)
         return []
 
     if DRY_RUN:
+        # A dry run creates nothing, so it spends no budget and defers
+        # nothing. Reporting the whole scrape is the point: run 32658122909
+        # is only informative because it said 214 rather than a budgeted 3.
         print(
             f"[DRY RUN] Would create {len(posts)} new Airtable records "
             f"attributed to Apify run {apify_run_id or 'unknown'}. "
@@ -1497,6 +1694,29 @@ def create_new_posts_in_airtable(
                 f"{redaction.redact_url(canonical)}",
                 flush=True,
             )
+
+        if summary is not None:
+            summary.creations_written += len(posts)
+        return []
+
+    admitted, deferred = admit_posts_within_create_budget(posts)
+
+    if deferred:
+        if summary is not None:
+            summary.creations_deferred += len(deferred)
+            summary.lead_create_budget_exhausted = True
+
+        print(
+            f"Lead create budget ({AIRTABLE_LEAD_CREATE_BUDGET}) reached: "
+            f"importing {len(admitted)} of {len(posts)} new posts. The "
+            f"remaining {len(deferred)} are not written and stay importable "
+            f"-- re-run the same Apify run and deduplication will skip what "
+            f"landed and create the next batch.",
+            flush=True,
+        )
+
+    if not admitted:
+        print("No new Facebook posts to create in Airtable.", flush=True)
         return []
 
     mapped = [
@@ -1507,7 +1727,7 @@ def create_new_posts_in_airtable(
                 scraper_run_record_id=scraper_run_record_id,
             )
         }
-        for post in posts
+        for post in admitted
     ]
 
     try:
@@ -1515,14 +1735,18 @@ def create_new_posts_in_airtable(
     except AmbiguousWriteError as exc:
         # The POST may or may not have landed. Reconcile against Airtable
         # rather than replaying it, which is what would duplicate records.
+        # Only the admitted posts were ever sent, so only those are in doubt.
         raise AmbiguousWriteError(
             f"{exc} Reconciling before anything else happens: "
-            f"{reconcile_import(posts)}"
+            f"{reconcile_import(admitted)}"
         ) from exc
 
     created_record_ids = [
         record["id"] for record in created_records if record.get("id")
     ]
+
+    if summary is not None:
+        summary.creations_written += len(created_record_ids)
 
     print(
         f"Airtable import complete: {len(created_record_ids)} created, "
@@ -2535,6 +2759,16 @@ class RunSummary:
     #: True when AIRTABLE_LEAD_UPDATE_BUDGET stopped at least one write.
     lead_update_budget_exhausted: bool = False
 
+    #: New posts this run offered to Airtable for creation.
+    creation_candidates: int = 0
+    #: Records actually created, or simulated under DRY_RUN.
+    creations_written: int = 0
+    #: New posts left uncreated because AIRTABLE_LEAD_CREATE_BUDGET was
+    #: spent. Not lost: deduplication makes them new again next run.
+    creations_deferred: int = 0
+    #: True when AIRTABLE_LEAD_CREATE_BUDGET stopped at least one creation.
+    lead_create_budget_exhausted: bool = False
+
     def render(self) -> str:
         return "\n".join(
             [
@@ -2569,6 +2803,25 @@ class RunSummary:
                 f"  Manual review         {self.manual_review}",
                 f"  Rejected              {self.rejected}",
                 f"  Outreach ready        {self.outreach_ready}",
+                "",
+                f"  Creation candidates   {self.creation_candidates}",
+                f"  Creations {'simulated' if DRY_RUN else 'written  '}   "
+                f"{self.creations_written}"
+                + ("  [DRY RUN: nothing written]" if DRY_RUN else ""),
+                f"  Creations deferred    {self.creations_deferred}"
+                + (
+                    "  [BUDGET EXHAUSTED]"
+                    if self.lead_create_budget_exhausted
+                    else ""
+                ),
+                "  Lead create budget    "
+                + (
+                    "not spent (dry run)"
+                    if DRY_RUN
+                    else str(AIRTABLE_LEAD_CREATE_BUDGET)
+                    if AIRTABLE_LEAD_CREATE_BUDGET
+                    else "unlimited"
+                ),
                 "",
                 f"  Records evaluated     {self.records_evaluated}",
                 f"  Update candidates     {self.update_candidates}",
@@ -3119,6 +3372,10 @@ def refresh_group_performance() -> None:
 
 
 def main() -> None:
+    # Before anything at all: a bad budget must not cost an Airtable read,
+    # an Apify resolution, or an OpenAI client.
+    validate_budget_configuration()
+
     started_at = datetime.now(timezone.utc)
 
     print(
@@ -3147,6 +3404,7 @@ def main() -> None:
     summary = RunSummary()
     reset_openai_request_budget()
     reset_lead_update_budget()
+    reset_lead_create_budget()
 
     if not DRY_RUN:
         validate_airtable_schema()
@@ -3185,6 +3443,7 @@ def main() -> None:
         new_posts,
         apify_run_id=run.id,
         scraper_run_record_id=scraper_run.record_id if scraper_run else "",
+        summary=summary,
     )
 
     if created_record_ids:

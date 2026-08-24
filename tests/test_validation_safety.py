@@ -1381,7 +1381,10 @@ def test_every_workflow_parsing_module_imports_yaml_at_module_scope():
             f"a runner without PyYAML would skip its tests instead of failing"
         )
 
-    assert checked == 2, "expected exactly two workflow-parsing test modules"
+    assert checked == 3, (
+        "expected exactly three workflow-parsing test modules; a new one "
+        "must import yaml at module scope like the others"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,11 @@ on:
         type: string
         default: ""
         required: false
+      airtable_lead_create_budget:
+        description: "Maximum NEW lead records this run may create in Airtable. Defaults to 3 so a manual run is safe as dispatched. Enter 0 for unlimited. Deferred posts stay importable: re-run the same pinned Apify run to import the next batch"
+        type: string
+        default: "3"
+        required: true
       update_group_performance:
         description: "Refresh Facebook Group Performance at the end of the run (untick for a narrowly scoped validation run)"
         type: boolean
@@ -189,6 +194,26 @@ jobs:
           # bound them.
           AIRTABLE_LEAD_UPDATE_BUDGET: >-
             ${{ github.event.inputs.airtable_lead_update_budget || '' }}
+
+          # Ceiling on NEW lead records created this run, counted per record
+          # rather than per HTTP request. Separate from the update budget on
+          # purpose: the dry run of 2026-08-23 found 214 new posts in one
+          # dataset, and adding 214 rows is a different risk from editing 214
+          # existing ones. Deferred posts are not lost -- imports deduplicate
+          # against the live base, so re-running the same pinned Apify run
+          # imports the next batch and never duplicates what already landed.
+          #
+          # This is the one setting whose workflow default is NOT the
+          # application default. run_pipeline defaults to 0 (unlimited) for
+          # backward compatibility; a manual dispatch defaults to 3, so
+          # clicking "Run workflow" without touching the field cannot create
+          # 214 rows. Unlimited creation has to be typed: enter 0.
+          #
+          # The fallback below only fires when github.event.inputs is null,
+          # which a workflow_dispatch never is. It exists so the value is 3
+          # rather than empty if this workflow is ever triggered another way.
+          AIRTABLE_LEAD_CREATE_BUDGET: >-
+            ${{ github.event.inputs.airtable_lead_create_budget || '3' }}
           REQUIRE_AIRTABLE_PREQUALIFICATION: "false"
 
           # Bounded AI error recovery. A transient failure is retried on a

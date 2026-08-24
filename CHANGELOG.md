@@ -15,6 +15,62 @@ The previous release's deterministic qualification work is preserved intact —
 the 65-point threshold, the scoring weights, the tiers, the hard rejections,
 and all 125 of its tests are unchanged.
 
+### Added — a ceiling on record creation, after dry run 32658122909
+
+That dry run read Apify run `IPOHKRCznDcvYgnyx`, dataset `KFiSxm6fiXVSAY0kK`:
+217 items, 214 new unique leads, 3 duplicates. It wrote nothing, because it
+was a dry run. A write-enabled version of exactly that run would have created
+214 Facebook Raw Signal rows in one pass, and no setting anywhere in the
+pipeline would have stopped it.
+
+`AIRTABLE_LEAD_UPDATE_BUDGET` does not cover this and was never meant to. It
+bounds changes to rows the base already holds; adding 214 rows is a different
+path and a different risk from editing 214 records a person has already looked
+at. `AIRTABLE_LEAD_CREATE_BUDGET` is the ceiling for creation, kept as a
+second setting rather than a shared pool so a validation run can allow a
+little of each.
+
+The unit is a record created, not an HTTP request and not a batch: creates
+flush in tens, so a budget of 25 is 25 records and three POSTs. The budget is
+claimed **before** a post is added to a create batch, so a deferred post is
+never mapped to Airtable fields and never appears in a payload -- there is no
+partial write to reason about, and an ambiguous POST reconciles only the posts
+that were actually sent. The admitted set is a contiguous head of the scrape
+in dataset order, so the deferred remainder is a stable tail rather than an
+arbitrary subset.
+
+Deferring loses nothing, which is what makes a small budget usable rather than
+merely safe. Imports deduplicate against the live base by post ID, canonical
+URL, and fingerprint, so a post left uncreated is simply new again next time.
+Re-running the *same pinned* Apify run drains a large scrape a few rows at a
+time: ten posts at budget 3 import as 3, 3, 3, 1 across four runs, with no
+duplicates and no gaps. A test asserts exactly that sequence and that the
+union of the four runs is the original ten.
+
+A dry run neither spends the budget nor is limited by it, matching the update
+budget. A dry run creates nothing, and budgeting one would have reported a
+tidy 3 instead of 214 -- hiding the very number that made run 32658122909
+worth running.
+
+0 or blank is unlimited, the behaviour production has always had, so an
+existing deployment that sets nothing is unaffected. The *workflow* default is
+deliberately different: the dispatch input is required and arrives pre-filled
+with 3, because clicking "Run workflow" without touching the field must not be
+able to create 214 rows. Unlimited creation now has to be typed as an explicit
+0. The env fallback carries the same 3, so the value can never resolve to
+empty.
+
+A negative budget is rejected outright. -5 is neither "unlimited" nor a record
+count: it made the first claim fail, so every post deferred and the run
+reported success having written nothing. validate_budget_configuration() runs
+as the first statement in main(), before the schema preflight, the Apify run
+resolution, and any OpenAI client, and names the offending setting and value.
+AIRTABLE_LEAD_UPDATE_BUDGET is covered by the same check, having had the
+identical failure mode.
+
+The run summary now reports creation candidates, creations written or
+simulated, and creations deferred, separately from the update accounting.
+
 ### Added — validation safety, after run 32334487910
 
 That run succeeded and proved nothing. Fifty scraped items were all

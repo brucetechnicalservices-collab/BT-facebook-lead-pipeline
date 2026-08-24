@@ -490,7 +490,8 @@ zero requests billed. A write-enabled version of that run would have modified
 | `AI_BATCH_LIMIT` | Records sent to the model | The AI path only |
 | `OPENAI_REQUEST_BUDGET` | `responses.create()` calls, retries included | The AI path only |
 | `PREFILTER_SCAN_LIMIT` | Backlog records read for evaluation | Historical scanning only |
-| `AIRTABLE_LEAD_UPDATE_BUDGET` | **Lead records changed** | Every write path |
+| `AIRTABLE_LEAD_UPDATE_BUDGET` | **Lead records changed** | Every update path |
+| `AIRTABLE_LEAD_CREATE_BUDGET` | **Lead records created** | The import path |
 
 **The unit is a record, not a request.** Updates flush to Airtable in batches
 of ten, so a budget of 25 means 25 records and three `PATCH` requests. Batching
@@ -541,6 +542,93 @@ lead table alone:
 | --- | --- | --- |
 | `LOG_SCRAPER_RUNS` | `true` | The Facebook Post Scraper Runs upsert |
 | `UPDATE_GROUP_PERFORMANCE` | `true` | The Facebook Group Performance refresh |
+
+### Bounding new records
+
+`AIRTABLE_LEAD_UPDATE_BUDGET` bounds changes to rows the base already holds.
+It does not bound how many rows the scrape **adds**, and those are different
+risks: 214 new records is not 214 edits to records a person has already
+looked at.
+
+Dry run 32658122909 made this concrete. Apify run `IPOHKRCznDcvYgnyx`,
+dataset `KFiSxm6fiXVSAY0kK`, 217 items, **214 new unique leads** and 3
+duplicates. It wrote nothing, because it was a dry run. A write-enabled
+version of exactly that run would have created 214 Facebook Raw Signal rows
+in one pass, and no setting anywhere in the pipeline would have stopped it.
+
+`AIRTABLE_LEAD_CREATE_BUDGET` is that ceiling. It is deliberately a second
+setting rather than a shared pool: creation and update are reached by
+different code paths, and a validation run usually wants a small number of
+each.
+
+**The unit is a record created**, not a request and not a batch. Creates
+flush in batches of ten, so a budget of 25 means 25 records and three `POST`
+requests.
+
+**The budget is claimed before a post is added to a create batch.** A
+deferred post is never mapped to Airtable fields and never appears in any
+payload, so there is no partial write to reason about. The split is a
+contiguous tail of the scrape, in dataset order.
+
+**Deferring loses nothing.** Imports are deduplicated against the live base
+by post ID, canonical URL, and fingerprint. A post left uncreated is simply
+"new" again next time, so re-running the *same pinned Apify run* imports the
+next batch:
+
+```
+run 1   apify_run_id=<id>  budget 3   ->  3 created, 7 deferred
+run 2   apify_run_id=<id>  budget 3   ->  3 created, 4 deferred
+run 3   apify_run_id=<id>  budget 3   ->  3 created, 1 deferred
+run 4   apify_run_id=<id>  budget 3   ->  1 created, 0 deferred
+```
+
+Ten posts, four runs, no duplicates and no gaps. Pinning `apify_run_id` is
+what makes this repeatable; without it the run resolves whatever the newest
+successful Apify run is.
+
+**A dry run neither spends it nor is limited by it**, exactly as with the
+update budget. A dry run creates nothing, and budgeting one would hide the
+size of the scrape, which over a fresh dataset is the single most useful
+thing a dry run reports.
+
+#### Two different defaults, on purpose
+
+This is the one setting whose workflow default is **not** the application
+default.
+
+| Layer | Default | Why |
+| --- | --- | --- |
+| `run_pipeline.py` | `0` — unlimited | Backward compatibility. A deployment that sets nothing behaves exactly as it did before this budget existed |
+| `workflow_dispatch` input | `3` — capped, and **required** | Safety. Clicking "Run workflow" without touching the field must not be able to create 214 rows |
+
+`0` still means unlimited wherever it appears, so nothing about the
+application's contract changed. What changed is that **unlimited creation now
+has to be typed**: the field is required, it arrives pre-filled with `3`, and
+an operator who wants the old behaviour enters `0` deliberately. The env
+fallback in the workflow carries the same `3`, so the value can never resolve
+to empty.
+
+**A negative budget is a configuration error.** `-5` is neither "unlimited"
+nor a number of records; before this check it silently refused every write
+and the run reported success having done nothing. `validate_budget_configuration()`
+now runs as the first statement in `main()` — ahead of the schema preflight,
+the Apify run resolution, and any OpenAI client — and stops the run with a
+message naming the setting and its value. The same check covers
+`AIRTABLE_LEAD_UPDATE_BUDGET`, which had the identical failure mode.
+
+The run summary separates the two write kinds:
+
+```
+  Creation candidates   214
+  Creations written     3
+  Creations deferred    211  [BUDGET EXHAUSTED]
+  Lead create budget    3
+
+  Records evaluated     3
+  Update candidates     3
+  Updates written       3
+  Deferred (no budget)  0
+```
 
 ### What the logs may say
 
@@ -670,7 +758,9 @@ Each run fetches candidates in four phases:
 
 Phase 1 is unbounded on purpose: a run that imports 50 posts evaluates all 50,
 and a run that imports 300 evaluates all 300. Fetching by record ID also means
-no Airtable page boundary or result ordering can hide one of them.
+no Airtable page boundary or result ordering can hide one of them. What it
+evaluates is what it *imported*, so a run holding `AIRTABLE_LEAD_CREATE_BUDGET`
+down evaluates the rows it created and picks up the rest on a later run.
 
 Phases 2 and 3 exist so neither your approvals nor the formula's selection is
 lost behind an arbitrary page of the backlog. Phase 2 ignores
@@ -853,6 +943,7 @@ Reporting and safety:
 | Variable | Default | Purpose |
 |---|---|---|
 | `AIRTABLE_LEAD_UPDATE_BUDGET` | `0` (unlimited) | Max lead **records** this run may change in Airtable, across every write path. Not consumed by a dry run |
+| `AIRTABLE_LEAD_CREATE_BUDGET` | `0` (unlimited) — but the workflow sends `3` | Max **new** lead records this run may create. Separate from the update budget. Deferred posts stay importable. Not consumed by a dry run |
 | `UPDATE_GROUP_PERFORMANCE` | `true` | Refresh group metrics after each run |
 | `AIRTABLE_GROUP_PERFORMANCE_TABLE` | `Facebook Group Performance` | Metrics table name |
 | `AIRTABLE_FORMULA_WAIT_SECONDS` | `15` | Pause after import |
