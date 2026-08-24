@@ -2,6 +2,657 @@
 
 All notable changes to the BruceTech Facebook lead pipeline.
 
+## [Unreleased] — Intent classification, run attribution, and precision
+
+Branch: `agent/facebook-pipeline-v2-intent-attribution`
+Qualification version: `facebook-v2`
+
+This release does two things: it stops the pipeline treating "a business owner
+has a problem" as "a BruceTech sales opportunity", and it makes every imported
+post traceable to the exact Apify run that produced it.
+
+The previous release's deterministic qualification work is preserved intact —
+the 65-point threshold, the scoring weights, the tiers, the hard rejections,
+and all 125 of its tests are unchanged.
+
+### Changed — the manual dispatch form is the safe profile
+
+The create budget stopped an untouched manual run from adding 214 rows.
+Everything else about an untouched manual run was still production
+configuration reached by doing nothing: writes enabled, an unlimited update
+budget, a 200-record historical scan, 20 records to the model, a derived
+60-request OpenAI ceiling, and both auxiliary tables written.
+
+Every workflow_dispatch default is now the validation profile. Clicking "Run
+workflow" and changing nothing gives a dry run that writes nothing, scans no
+backlog, sends at most 3 records to the model for at most 3 requests, and
+leaves Facebook Group Performance and Facebook Post Scraper Runs alone. A
+write-enabled run requires deliberately unticking "Dry run", and both write
+budgets are required inputs, so unlimited has to be typed as 0 rather than
+reached by leaving a field blank.
+
+The application defaults did not move. run_pipeline still defaults to
+DRY_RUN false, AI_BATCH_LIMIT 20, PREFILTER_SCAN_LIMIT 200, both write
+budgets unlimited, and both auxiliary switches on. So do the `|| '...'`
+fallbacks in the job env, which fire only when github.event.inputs is null --
+something a workflow_dispatch never is. They govern non-manual triggers, so
+re-enabling the schedule resumes production behaviour rather than running a
+no-op dry run every morning. The form and the fallback are two layers with
+deliberately different values, and separate tests now assert each.
+
+Five existing tests asserted the old form defaults and were updated in place
+with the reason recorded, and the drift protection they provided was moved to
+the fallback layer rather than dropped: the assertion that the workflow and
+the application agree on AI_BATCH_LIMIT=20 and PREFILTER_SCAN_LIMIT=200 now
+reads the env expression, which is where those numbers still belong.
+
+The whole profile is asserted as one dictionary rather than field by field,
+because the danger is a single default drifting back while the rest still
+look right.
+
+### Added — a ceiling on record creation, after dry run 32658122909
+
+That dry run read Apify run `IPOHKRCznDcvYgnyx`, dataset `KFiSxm6fiXVSAY0kK`:
+217 items, 214 new unique leads, 3 duplicates. It wrote nothing, because it
+was a dry run. A write-enabled version of exactly that run would have created
+214 Facebook Raw Signal rows in one pass, and no setting anywhere in the
+pipeline would have stopped it.
+
+`AIRTABLE_LEAD_UPDATE_BUDGET` does not cover this and was never meant to. It
+bounds changes to rows the base already holds; adding 214 rows is a different
+path and a different risk from editing 214 records a person has already looked
+at. `AIRTABLE_LEAD_CREATE_BUDGET` is the ceiling for creation, kept as a
+second setting rather than a shared pool so a validation run can allow a
+little of each.
+
+The unit is a record created, not an HTTP request and not a batch: creates
+flush in tens, so a budget of 25 is 25 records and three POSTs. The budget is
+claimed **before** a post is added to a create batch, so a deferred post is
+never mapped to Airtable fields and never appears in a payload -- there is no
+partial write to reason about, and an ambiguous POST reconciles only the posts
+that were actually sent. The admitted set is a contiguous head of the scrape
+in dataset order, so the deferred remainder is a stable tail rather than an
+arbitrary subset.
+
+Deferring loses nothing, which is what makes a small budget usable rather than
+merely safe. Imports deduplicate against the live base by post ID, canonical
+URL, and fingerprint, so a post left uncreated is simply new again next time.
+Re-running the *same pinned* Apify run drains a large scrape a few rows at a
+time: ten posts at budget 3 import as 3, 3, 3, 1 across four runs, with no
+duplicates and no gaps. A test asserts exactly that sequence and that the
+union of the four runs is the original ten.
+
+A dry run neither spends the budget nor is limited by it, matching the update
+budget. A dry run creates nothing, and budgeting one would have reported a
+tidy 3 instead of 214 -- hiding the very number that made run 32658122909
+worth running.
+
+0 or blank is unlimited, the behaviour production has always had, so an
+existing deployment that sets nothing is unaffected. The *workflow* default is
+deliberately different: the dispatch input is required and arrives pre-filled
+with 3, because clicking "Run workflow" without touching the field must not be
+able to create 214 rows. Unlimited creation now has to be typed as an explicit
+0. The env fallback carries the same 3, so the value can never resolve to
+empty.
+
+A negative budget is rejected outright. -5 is neither "unlimited" nor a record
+count: it made the first claim fail, so every post deferred and the run
+reported success having written nothing. validate_budget_configuration() runs
+as the first statement in main(), before the schema preflight, the Apify run
+resolution, and any OpenAI client, and names the offending setting and value.
+AIRTABLE_LEAD_UPDATE_BUDGET is covered by the same check, having had the
+identical failure mode.
+
+The run summary now reports creation candidates, creations written or
+simulated, and creations deferred, separately from the update accounting.
+
+### Added — validation safety, after run 32334487910
+
+That run succeeded and proved nothing. Fifty scraped items were all
+duplicates, 200 queued records were all rejected as `STALE_POST` before any
+OpenAI call, no newly scraped post was evaluated, and no record reached the
+model. Two things about it were worse than unhelpful.
+
+**The public log published the source data.** Complete Facebook post URLs,
+author names, and full Airtable record IDs for all 200 records, in a log
+readable by anyone who can read the repository, about posts belonging to other
+people. Every logging path in the pipeline now prints the queue position and a
+keyed fingerprint instead:
+
+```
+[7/200] Blocked before AI (STALE_POST) intent=BUSINESS_PAIN score=41 rec:5f2f6350
+```
+
+Intent, Prefilter Score, rejection codes, progress, and totals are unchanged —
+the operational content of the log is the same. The fingerprint is a keyed
+BLAKE2s digest whose salt is random per run unless `LOG_FINGERPRINT_SALT`
+pins it, so a published log cannot be matched back to a post by hashing a
+candidate URL. Exception text from Airtable, OpenAI, and Apify is scrubbed
+before printing, because a message the pipeline did not compose may carry an
+identifier it does not know about. The dry-run `Would update` and
+`Would create` listings, the group-performance dry-run listing, and the
+scraper-run log all went through the same treatment.
+
+**`AI_BATCH_LIMIT=5` bounded nothing that mattered.** Deterministic rejections
+never reach the model, so a write-enabled version of that run would have
+modified 200 lead records with no ceiling anywhere in the pipeline.
+`AIRTABLE_LEAD_UPDATE_BUDGET` is that ceiling. It counts **lead-record
+mutations** — not HTTP requests and not batches, so ten records in one `PATCH`
+count as ten — and every write path spends it: human rejection, stale
+rejection, ordinary prefilter rejection, completed AI qualification, and the
+AI-error state write. It is checked *before* `responses.create()`, so a run
+never pays for a classification it has no room left to save. When it runs out
+the remaining records are left exactly as they were and stay `Pending`;
+deterministic evaluation continues, because it is free, so the run still
+reports what it would have written. `0` or blank is unlimited, which is what
+every scheduled run should keep, and a dry run never spends it at all.
+
+The run summary now separates deciding from writing, which were the same
+number before and said so nowhere:
+
+```
+  Records evaluated     200
+  Update candidates     200
+  Updates written       3
+  Deferred (no budget)  197  [BUDGET EXHAUSTED]
+  Deferred (AI limit)   0
+```
+
+**`PREFILTER_SCAN_LIMIT` is now a workflow input.** The application default is
+unchanged at 200. `0` turns historical scanning off entirely: the run
+evaluates this run's own imports and anything a person set `Human Decision`
+on, and nothing else. It controls deterministic backlog evaluation only — not
+AI requests, not Airtable writes, and not this run's imports, which are
+fetched by record ID and evaluated in full however many there are.
+
+**The two writes that are not lead records got their own switches.**
+`UPDATE_GROUP_PERFORMANCE` and `LOG_SCRAPER_RUNS` are workflow inputs now,
+defaulting to on as before, so a validation run can be narrowed to the lead
+table alone. Both read `github.event.inputs.*` rather than the `inputs.*`
+context: `${{ inputs.x || 'true' }}` reads a real boolean, and an unticked box
+would make the fallback fire and the control silently do nothing.
+
+Composed, these give a run whose worst case is three modified lead records and
+nine OpenAI requests. The recipe is in README.md.
+
+### Fixed — five reliability defects found reviewing this PR
+
+**An explicit service request could be thrown away for thin context.** "I need
+help with GoHighLevel. Any recommendations? I need an expert." was
+hard-rejected as `NO_BUSINESS_CONTEXT` in the 2026-08-19 smoke test, because
+the post says nothing about the business behind it. It is still an
+unmistakable request for a service BruceTech sells. When the intent is a
+provider or implementation request and the service is *named* rather than
+inferred, thin context now routes the record to Manual Review instead of the
+bin. The waiver lifts nothing else, and never produces automatic outreach.
+
+**Non-idempotent POSTs were replayed after ambiguous failures.** A read
+timeout or a 500 on an Airtable create looks identical to a network blip and
+is not: the write may already have landed. `request_with_retry` now treats
+POST as write-once, retrying only where a replay is provably safe (a connect
+timeout, or a 429), and raising `AmbiguousWriteError` otherwise. An ambiguous
+Airtable create is reconciled — the pipeline re-reads the identity keys and
+reports how many of the batch landed — rather than resent. The same guard
+covers the Apify run-start POST, where a duplicate is a duplicate invoice.
+
+**A dry run ignored the scrape it had just read.** New posts have no record
+IDs in a dry run, and the queue is fetched by ID, so they vanished before the
+prefilter: the run reported on the stale backlog and said nothing about
+today's posts. They are now evaluated as in-memory records through the
+identical path, with `dryrun-` IDs that nothing writes anywhere.
+
+**A failed reprocess left stale outreach live.** The failure payload was
+deliberately narrow so a transient error could not blank a record's lead
+data. That also left `Outreach Ready = true` and a populated DM from an
+earlier decision the pipeline could no longer reproduce. It now withdraws
+outreach eligibility and blanks both copy fields while preserving
+`Lead Score`, `Qualified`, `Lead Tier`, `Lead Summary`, and `Evidence`, and
+records `outreach_suspended` in the diagnostics. The next successful run
+restores it.
+
+**`AI_BATCH_LIMIT` was not a spend limit.** It counts records; each record can
+cost up to `OPENAI_MAX_ATTEMPTS` requests, so a limit of 5 permitted 15 billed
+calls. `OPENAI_REQUEST_BUDGET` is a new run-level ceiling on actual
+`responses.create()` calls, charged before every request including retries,
+defaulting to `AI_BATCH_LIMIT × OPENAI_MAX_ATTEMPTS`. When it runs out the
+queue stops rather than burning every remaining record's retry budget, and the
+run summary reports the true request count.
+
+Both limits are exposed as `workflow_dispatch` inputs, and the record limit is
+now described as "maximum records evaluated by AI" rather than "max AI calls",
+which is the wording that caused the confusion. README documents recommended
+pairings.
+
+The `NO_BUSINESS_CONTEXT` waiver reads a new `PrefilterResult
+.strong_service_match` rather than inferring strength from `match_basis`. A
+basis of `named` also covers a match assembled from two weak categories
+("our payment system"), which is far too soft to waive a hard rejection on;
+only an unambiguous term the author typed earns it.
+
+A failed reprocess also resets `Recommended channel` to `do_not_contact`.
+`Outreach Ready` is the gate this pipeline enforces, but outreach itself is
+performed by a person reading the row, and a leftover `direct_message` on a
+superseded decision reads as an instruction.
+
+### Added — Suggested Comment for Outreach Ready leads
+
+Every Outreach Ready lead now gets a short public Facebook comment alongside
+the private DM, from the **same** model response. There is no second OpenAI
+call: `suggested_comment` was added to the existing structured schema.
+
+The comment is not the pitch. It acknowledges one specific detail from the
+post, runs 12 to 35 words, carries no link, no pricing, and no mention of
+BruceTech, and ends by offering to send a DM with the closing varied across
+leads. BruceTech opens the DM, so "DM me" is avoided unless it genuinely reads
+better for that post.
+
+`Suggested Comment` (`fldFYDjbtu6gLPT1B`) is wired through the field
+constants, the writable set, `EXTENDED_FIELDS`, the schema preflight, the
+decision payload, and the pre-AI rejection payload. It is AI-owned output like
+`Suggested DM`, not a protected human field, and is regenerated under exactly
+the same conditions.
+
+**Both fields obey one gate.** `Outreach Ready = false` blanks both, without
+exception: tool research, manual review, rejected, stale, promotional,
+`do_not_contact`, and every hard rejection. Copy the model wrote anyway is
+kept in `AI Output` under `outreach_copy` for diagnostics, alongside a
+`written` flag recording whether it reached Airtable.
+
+### Added — no em dashes in outreach copy, enforced twice
+
+No outreach copy this pipeline writes may contain an em dash (`—`). The
+model instructions ban it with examples, and
+`normalization.sanitize_outreach_copy` guarantees it before the Airtable
+write, because an instruction is a request and this is an invariant.
+
+Every em dash becomes `", "`. A comma is used uniformly rather than guessing
+between a comma and a period per sentence: guessing wrong the other way
+produces a fragment ("That setup can work well. Especially if…"), which reads
+worse than a comma splice.
+
+The sanitiser does not rewrite good copy. It touches nothing but the dash and
+the whitespace around it, so URLs, hyphens, and number ranges survive intact.
+A spaced en dash is normalised as a sentence break; a tight one is a range
+(`Mon–Fri`) and is left alone.
+
+### Fixed — TOOL_RESEARCH could become Qualified on score alone
+
+A live Blue Collar record, a pool contractor comparing Pool Studio, Vip3D and
+JobTread, scored 76 and was written to Airtable as `Qualified` while
+simultaneously being `do_not_contact` with a blank DM. That row contradicts
+itself for whoever reads it.
+
+`TOOL_RESEARCH` is now capped at `Manual Review`. Someone comparing products
+has not asked for an implementer, however well the model scores the post. A
+clean research record is written as Manual Review, not qualified, not outreach
+ready, blank DM, blank comment, `do_not_contact`.
+
+Hard rejections still win: `TOOL_RESEARCH` plus `PROMOTIONAL_POST` is
+`Rejected`, not Manual Review. Nothing changes for `PROVIDER_REQUEST`,
+`IMPLEMENTATION_REQUEST`, or `BUSINESS_PAIN`. No score, weight, or threshold
+moved, and the model's full analysis is preserved in `AI Output`.
+
+### Fixed — a spend limit was rationing free deterministic evaluation
+
+Found by the Blue Collar Millionaire live run, Apify run `BnHEoWoDCZDPnM8iY`
+(dataset `MiUEsgX1KSeiGuUyH`, 50 posts) on 2026-08-19. Attribution and
+scraper-run linkage were correct on all 50. Only **25** received deterministic
+Python evaluation, and one of the 25 left unevaluated was a strong lead.
+
+`fetch_ai_queue` sized its window as `AI_BATCH_LIMIT * 5`. The run set
+`AI_BATCH_LIMIT=5`, so the window was 25. A limit that exists to cap OpenAI
+spend was silently rationing evaluation, which costs nothing but regex.
+
+The architecture is now explicit:
+
+```
+every current-run record
+    → deterministic Python evaluation   (free, unbounded for this run)
+    → eligible candidates sorted by intent and score
+    → AI_BATCH_LIMIT caps OPENAI CALLS ONLY
+```
+
+`PREFILTER_SCAN_LIMIT` (default 200) is a new, separate setting that bounds
+the *backlog* read. The current run's own imports are fetched by record ID in
+chunks and evaluated in full however many there are, so neither the scan limit
+nor an Airtable page boundary nor result ordering can hide one.
+
+`AI_BATCH_LIMIT` is unchanged in meaning and still caps calls at 5 when set
+to 5 — now over a queue of 50 rather than a queue of 25.
+
+### Fixed — four Blue Collar misclassifications
+
+**Deliberation was not an implementation request.** An electrical contractor
+"looking at ways to systemize my customer and job intake" who was "considering
+setting up some workflows and forms" through Microsoft 365 — naming
+`microsoft_365`, `workflow_automation`, and `crm` — classified as `UNRELATED`
+with `NO_BUYING_INTENT`. Every implementation pattern required a decision
+already made. `IMPLEMENTATION_EXPLORATION_PATTERNS` now recognise deliberation,
+gated on operator context and checked after every explicit intent so research
+stays research. Isolated "forms", "workflow", or "system" are never enough.
+
+**An owner who could not sell had no intent.** A surface-restoration startup
+whose founders were "not in a position to properly market and sell" and were
+"leaning towards paid lead generation" had no intent at all.
+`GROWTH_PAIN_PATTERNS` classify this as `BUSINESS_PAIN`, but only alongside
+adjacent-growth evidence *and* operator context — all three, or nothing.
+
+**Business telephony did not exist.** A telephony denial-of-service attack
+against a RingCentral IVR matched no BruceTech service. A new
+`business_telephony` category covers RingCentral, 8x8, Dialpad, Nextiva,
+Vonage, VoIP, SIP trunking, PBX, IVR, auto attendants, and call routing, with
+IT-incident language (spoofing, denial of service, "under attack", "keep
+getting fake calls") added to `BUSINESS_PAIN_PATTERNS`. Consumer-grade
+phrasing — "spam calls", "robocall" — sits in the weak tier and needs
+corroboration, so a personal phone complaint is not a lead.
+
+**Software comparison held.** The pool builder comparing JobTread, Pool Studio
+and Vip3D stays `TOOL_RESEARCH`: research outranks the new deliberation path,
+and tool research is never auto-contacted.
+
+All twelve correctly-rejected Blue Collar posts — financing, tax, licensing,
+bonuses, business sales, insurance, equity, growth chat, promotions, equipment
+— are fixtures asserting they stay rejected.
+
+### Fixed — qualification recall was too low to find real leads
+
+Found by the first fresh scrape, Apify run `Q3Ix6zmHrEDhgiQGf` (dataset
+`rVjOEFf81ZIT23RWl`, 50 posts) on 2026-08-19. Attribution and scraper-run
+logging were correct — all 50 Raw Signals carried the run ID and linked to the
+right Scraper Run record — but effectively nothing reached the model, several
+credible business problems and two explicit provider requests included.
+
+Four recall defects, each fixed narrowly:
+
+**Operational failure described in plain English was invisible.** A med spa
+manager with "200 units missing" and "no systems in place" classified as
+`UNRELATED` with no service match. `OPERATIONS_PAIN_PATTERNS` now recognises
+absent systems, inventory and reconciliation failures, and scheduling or
+booking breakdowns — as *problems*, never as nouns. "Inventory" alone matches
+nothing. Gated on commercial context, so a consumer grumble stays `UNRELATED`.
+
+**"We offer" made a post promotional.** Describing what a business sells is
+not advertising it. `PROMOTIONAL_TERMS` now holds only seller-to-audience
+evidence — "DM me", "book now", "limited time", "for sale". Self-description
+moved to `PROMOTIONAL_SELF_DESCRIPTION_TERMS` and is promotional only
+alongside a call to action; on its own it is recorded in the diagnostics and
+rejects nothing.
+
+**Marketing provider requests had no path.** "A marketing agency to get me
+patients" is not a website request, but digital client acquisition is
+delivered through the site, SEO, booking flow, CRM, and follow-up automation
+underneath it. A narrow `adjacent` path requires an explicit provider ask,
+a measurable acquisition goal, and commercial context; it credits only the
+categories BruceTech would deliver, flags itself `needs_ai_confirmation`, and
+leaves real fit to the model. Requests for influencers, content creators,
+photographers, PR, branding, or print media are excluded outright unless
+something BruceTech builds is named alongside.
+
+**Software comparisons were not tool research.** "Mangomint or boulevard POS
+system and why?" classified as `UNRELATED`. Named either/or over a *software*
+noun, and switching language, now classify as `TOOL_RESEARCH` — which is
+AI-eligible but never auto-contacted.
+
+The counterweight is a physical-goods guard. A medical spa group discusses
+lasers, syringes, and treatment chairs constantly, and those posts are full of
+words like "system", "platform", and "device". A post shopping for physical or
+clinical goods now gets no weak-signal service match at all. IT hardware is
+deliberately outside the guard: a dead printer is BruceTech work.
+
+Every record now records `match_basis` — `named`, `described`, `adjacent`, or
+`none` — so an operator can tell a stated requirement from an inferred one.
+
+No scoring weight, threshold, or gate changed. The stale gate, `Human
+Decision` behaviour, deduplication, attribution, retry architecture, and write
+protection are untouched, each asserted by a test.
+
+### Changed — operator-visible Airtable intent formulas
+
+`airtable_formulas.py` holds pasteable sources for `Provider Intent Signal`,
+`Research Intent Signal`, and `Intent Type`, closing the gaps the fresh run
+showed: a marketing-agency provider request read as "Other" with
+`Provider Intent Signal = 0`.
+
+These decide nothing. `intent.py` remains authoritative, a test asserts
+`run_pipeline` never imports the module, and applying them to the base is a
+manual step the pipeline does not depend on.
+
+### Fixed — an Airtable formula was acting as human approval, and stale posts were reaching the model
+
+Found by the first production run of this branch,
+[32198160409](https://github.com/brucetechnicalservices-collab/BT-facebook-lead-pipeline/actions/runs/32198160409)
+on 2026-08-18. Five posts dated 2026-07-24 to 2026-08-01 — 17 to 25 days old
+against `MAX_POST_AGE_DAYS=5` — were sent to `gpt-5-mini`. All five came back
+hard-rejected with `STALE_POST`. The rejections were correct; paying for them
+was not.
+
+`is_human_flagged()` read the Airtable `Prequalification` field and treated
+`Send to AI` as a human's reviewed selection. `Prequalification` is a
+**formula**. It is computed from `Request Signal`, `Service Signal`, and
+`Promotion Signal`, and knows nothing about post age, intent, or human
+review. Because the pipeline read it as human judgement, the six records
+carrying it skipped the deterministic prefilter entirely and went straight to
+the model.
+
+Two rules replace it:
+
+**`Human Decision = Approve` is the only human override.** `Prequalification`
+survives as what it always was — a machine eligibility hint that chooses which
+records to fetch and breaks ties in the queue order. It overrides nothing.
+`Review` is not a decision and changes nothing. `Reject` now stops a record
+before the AI call rather than after it.
+
+**A non-overridable gate runs before the AI queue.** `prefilter_post` now
+returns machine-readable `rejection_codes`, and any code in
+`NON_OVERRIDABLE_HARD_REJECTIONS` — `STALE_POST`, `NO_SERVICE_MATCH`,
+`PROMOTIONAL_POST`, `JOB_SEEKER`, `ALREADY_RESOLVED`, `POST_TOO_SHORT` —
+rejects the record deterministically, before `get_openai_client()` is called.
+Nothing lifts it: not an `Approve`, not the formula, not
+`ENFORCE_PYTHON_PREFILTER=false`, which turns off the *heuristic* prefilter
+and never covered the age check.
+
+`Approve` now lifts exactly `NO_BUYING_INTENT`, `FUNDING_OR_FINANCE_REQUEST`,
+and `HIRING_UNRELATED`, applied by filtering the finished code list against
+`HUMAN_OVERRIDABLE_HARD_REJECTIONS`. A rejection code added later is
+non-overridable until someone deliberately lists it.
+
+Pre-AI rejections now write their codes to `Disqualifiers`, so a record
+rejected before the model says `STALE_POST` in the same column a post-AI
+rejection would.
+
+`MAX_POST_AGE_DAYS` is unchanged at 5.
+
+### Fixed — `"working capital"` registered as an API integration lead
+
+The prefilter matched service keywords by substring:
+
+```python
+>>> "api" in "working capital"
+True
+```
+
+An excavation-financing post therefore recorded a BruceTech service match and
+was sent to the model. The same flaw affected `pos`, `seo`, `ai`, and every
+other short token in the list.
+
+Every service term is now compiled to a word-boundary-anchored regex in
+`intent.compile_term`, so `api` matches "integrating an API" and never
+"capital". Plural matching is preserved via an optional trailing `s`.
+
+The live Airtable `Service Signal` formula was fixed the same way. Python does
+not rely on that fix: formula values calculate asynchronously and cannot be
+unit-tested, so both layers enforce the rule independently.
+
+### Fixed — the pipeline could import another Apify run's posts
+
+`/actor-tasks/{id}/runs/last/dataset/items` returns items with no run identity
+attached. When a manual Apify run finished between the scheduled scrape and
+this read, the pipeline imported that run's posts while believing it had read
+its own — and recorded no run ID either way.
+
+`apify_runs.resolve_run` now resolves exactly one **run object** before any
+dataset is touched, and reads that run's own `defaultDatasetId`. Three modes:
+pinned (`APIFY_RUN_ID`), start-and-poll (`RUN_APIFY_TASK=true`), or resolve the
+last successful run as an object. The `runs/last/dataset/items` shortcut is
+gone from the codebase and a test asserts it.
+
+The Apify token also moved from a `?token=` query parameter to an
+`Authorization` header, so it can no longer appear in a logged URL or an
+exception message.
+
+### Added — deterministic intent classification (`intent.py`)
+
+Six types: `PROVIDER_REQUEST`, `IMPLEMENTATION_REQUEST`, `BUSINESS_PAIN`,
+`TOOL_RESEARCH`, `GENERAL_ADVICE`, `UNRELATED`.
+
+Intent and service match are independent axes and the prefilter requires
+**both**, which is what blocks solution hopping. "Looking for a reliable
+virtual assistant" is a genuine provider request that matches no BruceTech
+service, so it is rejected without an AI call.
+
+General advice and unrelated posts never reach the model. Tool research may
+reach Manual Review but can never produce automatic outreach.
+
+### Added — two-tier service matching
+
+- **Strong terms** (`wordpress`, `crm`, `api`, `gohighlevel`, `pen and paper`)
+  establish a match on their own.
+- **Weak terms** (`network`, `security`, `payment`, `software`, `system`) need
+  corroboration: two distinct weak categories, or one weak term plus technical
+  context.
+
+"Our office network keeps dropping" is a managed IT lead. "Trying to grow my
+network" and "is a security deposit normal?" are not.
+
+### Added — exact run attribution in Airtable
+
+- One record per Apify run in **Facebook Post Scraper Runs**, upserted on
+  `Apify Run ID` so the same run is never logged twice.
+- Every imported Raw Signal is written with `Apify Run ID` and a `Scraper Run`
+  linked record.
+- `Cost`, `Run Input`, `Duration`, and `Dataset URL` are written **only when
+  Apify supplies them**. A missing value is omitted from the payload rather
+  than written as zero, so a blank cell means "not reported" and any existing
+  manual value survives.
+
+### Added — Facebook Group Performance aggregation
+
+Operational counts recomputed from Raw Signals after each run: Posts Scraped,
+AI Candidates, System Qualified, Provider Requests, Outreach Ready, Contacted,
+Replies, Meetings, Proposals, Won, Last Run.
+
+`Tier`, `Status`, `Revenue`, and `Notes` are human-owned and never written —
+enforced by an assertion in `GroupMetrics.to_fields`, not just by convention.
+
+The legacy `Contacted` checkbox is preserved and counted only when
+`Outreach Status` is empty, so migrated records are not double-counted.
+
+`Lost` counts as contacted and replied but not as a meeting or proposal: a
+deal can be lost at any stage.
+
+### Added — Outreach Ready is now strictly narrower than Qualified
+
+Qualified means strong commercial fit. Outreach Ready additionally requires a
+personalised DM, a contactable channel, `classification_confidence` ≥
+`MIN_OUTREACH_CONFIDENCE` (0.55), an outreach-eligible intent, and — for
+business pain specifically — a score of at least
+`BUSINESS_PAIN_OUTREACH_MIN_SCORE` (70).
+
+Business pain is inferred rather than requested, so it carries a higher bar
+than someone who explicitly asked to hire.
+
+### Added — six Python-only hard rejection codes
+
+`NO_BUYING_INTENT`, `FUNDING_OR_FINANCE_REQUEST`, `HIRING_UNRELATED`,
+`SUPPRESSED_AUTHOR`, `DISALLOWED_GROUP`, `HUMAN_REJECTED`.
+
+These are decided in Python and deliberately excluded from the model's JSON
+schema enum. `STALE_POST` was moved to the same category — it was previously
+offered to the model despite being computed in Python.
+
+### Added — bounded AI error recovery
+
+A transient failure (timeout, rate limit, 5xx, connection reset) consumes one
+attempt and the record is re-queued on a later run. A permanent failure
+consumes the whole budget at once. After `AI_ERROR_MAX_ATTEMPTS` the record is
+retired from the queue.
+
+The attempt count lives in `AI Output` as JSON, and only on records that
+actually failed. A failure never blanks `Lead Score`, `Qualified`, or
+`Suggested DM`.
+
+### Added — `Qualification Version`
+
+Every record this release evaluates is stamped `facebook-v2`. Historical
+records are never mass-reprocessed and keep their legacy scores, so the two
+populations stay comparable.
+
+### Added — Airtable write safety
+
+- `strip_read_only_fields` is applied to every payload before it is sent, so
+  formula fields and human-owned fields cannot be written even by mistake.
+- `Human Decision` and `Outreach Status` are read and respected, never
+  written. A record past `Not Contacted` skips classification entirely.
+- A metadata-API preflight fails the run with the missing field names before
+  any record is modified. It is skipped with a note when the token lacks the
+  `schema.bases:read` scope. No Airtable field is ever created, renamed, or
+  deleted.
+
+### Added — `AI Output` is now populated
+
+Previously declared in the schema but never written. It now holds the model's
+raw signals plus the Python assessment — intent type, prefilter score and
+breakdown, score breakdown. The deterministic intent lives here because
+Airtable's `Intent Type` column is a formula and cannot be written to.
+
+### Changed — queue ordering favours intent over recency
+
+New order: human-flagged → imported this run → provider request →
+implementation request → Prefilter Score → newest → least comment competition.
+
+Recency previously outranked everything below it, which let a stale backlog of
+weak posts consume the whole `AI_BATCH_LIMIT` before the day's real leads were
+reached.
+
+### Changed — `MAX_POST_AGE_DAYS` default 45 → 5
+
+The scraper works a roughly 3-day window, and a Facebook request older than a
+work week has usually been answered. Override via the workflow env when
+deliberately working a backlog.
+
+### Changed — Prefilter Score is documented and intent-driven
+
+A 0–100 prioritisation number with every component published in README.md:
+intent base, service match, freshness band, commercial context, length,
+comment competition, and named penalties. It gates the AI call and orders the
+queue; it is not the Lead Score.
+
+### Changed — anti-solution-hopping instructions to the model
+
+The system prompt now names the failure explicitly, with worked examples for
+the virtual-assistant, financing, CRM-research, and GoHighLevel cases, and
+forbids inventing business details, urgency, budget, location, or service
+requirements.
+
+### Tests
+
+125 → **308 passing**. New files: `tests/test_intent.py` (65),
+`tests/test_attribution.py` (24), `tests/test_group_performance.py` (30),
+`tests/test_pipeline_v2.py` (64), and `tests/fixtures.py` holding the five
+sanitised production fixtures.
+
+All 125 pre-existing tests pass unmodified. No test starts a paid Apify run,
+writes to Airtable, or makes an OpenAI request.
+
+### Not verified live
+
+No live Apify, Airtable, or OpenAI call was made from this branch — the
+session had no credentials and no network access to those hosts. Everything is
+covered by mocked tests against recorded payload shapes. See
+`docs/PIPELINE_AUDIT.md` §9 for the full list and the remaining limitations.
+
+---
+
 ## [Unreleased] — Deterministic qualification and the 65-point threshold
 
 Branch: `agent/improve-lead-qualification`

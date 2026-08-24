@@ -3,13 +3,17 @@ BruceTech Facebook lead pipeline.
 
 Flow:
 
-1.  Pull posts from Apify (either the last successful run, or a fresh task
-    run started and awaited by this script).
+1.  Resolve exactly ONE Apify run, log it to Facebook Post Scraper Runs, and
+    read that run's own dataset.
 2.  Deduplicate against Airtable using post ID, canonical URL, and text
-    fingerprint, then import only genuinely new posts.
-3.  Screen the backlog with a deterministic Python prefilter.
-4.  Ask the AI to extract *structured signals only*.
+    fingerprint, then import only genuinely new posts -- each linked back to
+    the run that produced it.
+3.  Classify intent and match BruceTech services deterministically, then
+    screen the backlog with the Python prefilter.
+4.  Ask the AI to extract *structured signals only*, best leads first.
 5.  Score, tier, and qualify in Python. The AI never decides qualification.
+6.  Refresh Facebook Group Performance so lead quality is measurable per
+    group.
 
 Environment variables are read lazily so this module can be imported by the
 test suite without any credentials present.
@@ -21,26 +25,47 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from urllib.parse import quote
 
 import requests
 
+import ai_retry
+import apify_runs
+import group_performance
+import intent
+import redaction
+import scraper_runs
 from normalization import (
     build_seen_keys,
     deduplicate_posts,
+    identity_from_apify,
+    is_duplicate,
     normalize_facebook_url,
 )
 from qualification import (
+    CHANNEL_DO_NOT_CONTACT,
+    DEFAULT_BUSINESS_PAIN_OUTREACH_SCORE,
     DEFAULT_HOT_THRESHOLD,
     DEFAULT_MANUAL_REVIEW_THRESHOLD,
     DEFAULT_MAX_POST_AGE_DAYS,
+    DEFAULT_MIN_OUTREACH_CONFIDENCE,
+    DEFAULT_PREFILTER_PASS_SCORE,
     DEFAULT_QUALIFICATION_THRESHOLD,
+    HARD_REJECTION_REASONS,
     KNOWN_DISQUALIFIER_CODES,
+    NON_OVERRIDABLE_HARD_REJECTIONS,
+    REJECT_DISALLOWED_GROUP,
+    REJECT_HUMAN_REJECTED,
+    REJECT_STALE_POST,
+    REJECT_SUPPRESSED_AUTHOR,
     SERVICE_CATEGORIES,
     TIER_MANUAL_REVIEW,
+    TIER_REJECTED,
     LeadDecision,
+    PrefilterResult,
     evaluate_lead,
     parse_post_timestamp,
     prefilter_post,
@@ -81,6 +106,30 @@ def env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        print(
+            f"Invalid number for {name}={raw!r}; using {default}.",
+            flush=True,
+        )
+        return default
+
+
+def env_csv(name: str) -> frozenset[str]:
+    """Read a comma-separated env var into a lowercased set."""
+    raw = os.getenv(name, "")
+
+    return frozenset(
+        part.strip().lower() for part in str(raw).split(",") if part.strip()
+    )
+
+
 def require_env(name: str) -> str:
     """Return a required environment variable or fail with a clear message."""
     value = os.getenv(name, "").strip()
@@ -93,7 +142,45 @@ def require_env(name: str) -> str:
 
 OPENAI_MODEL = env_str("OPENAI_MODEL", "gpt-5-mini")
 
-AI_BATCH_LIMIT = env_int("AI_BATCH_LIMIT", 20)
+#: How many RECORDS one run may send to the model. This is a *spend* limit
+#: and nothing else: it caps records, never how many records are evaluated.
+#:
+#: It is not a cap on HTTP requests. Each record may cost up to
+#: OPENAI_MAX_ATTEMPTS requests when the model errors or returns an
+#: incomplete response, so the worst case here is
+#: AI_BATCH_LIMIT * OPENAI_MAX_ATTEMPTS. See OPENAI_REQUEST_BUDGET.
+#: The application default, named so the workflow, the README, and the
+#: consistency test can all agree on one number instead of three literals.
+DEFAULT_AI_BATCH_LIMIT = 20
+
+AI_BATCH_LIMIT = env_int("AI_BATCH_LIMIT", DEFAULT_AI_BATCH_LIMIT)
+
+#: How many historical backlog records to pull in for deterministic
+#: evaluation each run.
+#:
+#: Deterministic evaluation is regex over post text -- effectively free. This
+#: limit exists only to bound the Airtable read against a table that now holds
+#: thousands of records, and is deliberately independent of AI_BATCH_LIMIT.
+#:
+#: Records imported by the current run are NOT governed by this limit. They
+#: are fetched by record ID and evaluated in full, however many there are --
+#: see fetch_ai_queue. Before 2026-08-19 the queue window was
+#: ``AI_BATCH_LIMIT * 5``, so a live run with AI_BATCH_LIMIT=5 evaluated 25 of
+#: its 50 freshly imported posts and silently ignored the rest.
+#:
+#: Set to 0 to switch historical scanning off entirely. The run then looks at
+#: this run's own imports and at records a person explicitly decided on, and
+#: at nothing else -- which is what you want for a narrowly scoped validation
+#: run against a table holding thousands of old posts.
+#:
+#: This is not a limit on AI requests (AI_BATCH_LIMIT and
+#: OPENAI_REQUEST_BUDGET are), and it is not a limit on Airtable writes
+#: (AIRTABLE_LEAD_UPDATE_BUDGET is).
+DEFAULT_PREFILTER_SCAN_LIMIT = 200
+
+PREFILTER_SCAN_LIMIT = env_int(
+    "PREFILTER_SCAN_LIMIT", DEFAULT_PREFILTER_SCAN_LIMIT
+)
 
 #: Minimum score for Qualified. Raised from 55 to 65.
 QUALIFICATION_THRESHOLD = env_int(
@@ -107,24 +194,157 @@ MAX_POST_AGE_DAYS = env_int("MAX_POST_AGE_DAYS", DEFAULT_MAX_POST_AGE_DAYS)
 
 AIRTABLE_FORMULA_WAIT_SECONDS = env_int("AIRTABLE_FORMULA_WAIT_SECONDS", 15)
 OPENAI_MAX_OUTPUT_TOKENS = env_int("OPENAI_MAX_OUTPUT_TOKENS", 2500)
-OPENAI_MAX_ATTEMPTS = env_int("OPENAI_MAX_ATTEMPTS", 3)
+#: How many requests one record may cost when the model errors or truncates.
+DEFAULT_OPENAI_MAX_ATTEMPTS = 3
+
+OPENAI_MAX_ATTEMPTS = env_int(
+    "OPENAI_MAX_ATTEMPTS", DEFAULT_OPENAI_MAX_ATTEMPTS
+)
+
+#: Hard ceiling on responses.create() calls for the whole run.
+#:
+#: AI_BATCH_LIMIT counts records; this counts actual API requests, which is
+#: what the invoice counts. With the defaults a run of 20 records that all
+#: retried twice would issue 60 requests, and before this existed nothing
+#: stopped it. Set to 0 to disable the ceiling.
+#:
+#: The default is deliberately generous -- it is a runaway stop, not a
+#: throttle -- and is computed from the two settings above so that lowering
+#: AI_BATCH_LIMIT for a test lowers the ceiling with it.
+OPENAI_REQUEST_BUDGET = env_int(
+    "OPENAI_REQUEST_BUDGET", AI_BATCH_LIMIT * OPENAI_MAX_ATTEMPTS
+)
 OPENAI_RETRY_DELAY_SECONDS = env_int("OPENAI_RETRY_DELAY_SECONDS", 5)
 MAX_POST_CHARS = env_int("MAX_POST_CHARS", 8000)
 
 #: When true, start a fresh Apify task run and use that exact run's dataset.
-APIFY_START_NEW_RUN = env_bool("APIFY_START_NEW_RUN", False)
-APIFY_RUN_TIMEOUT_SECONDS = env_int("APIFY_RUN_TIMEOUT_SECONDS", 900)
-APIFY_RUN_POLL_SECONDS = env_int("APIFY_RUN_POLL_SECONDS", 15)
+#: RUN_APIFY_TASK is the documented name; APIFY_START_NEW_RUN is kept as an
+#: alias so existing workflow configuration keeps working.
+APIFY_START_NEW_RUN = env_bool(
+    "RUN_APIFY_TASK", env_bool("APIFY_START_NEW_RUN", False)
+)
 
-#: The Airtable Prequalification formula is undocumented and easy to break.
-#: Python prefiltering is now authoritative; set this to true to additionally
-#: require the Airtable formula to say "Send to AI".
+#: Pin the pipeline to one exact Apify run. Overrides RUN_APIFY_TASK. Use it
+#: to re-import a specific scrape or to reproduce a bad import.
+APIFY_RUN_ID = env_str("APIFY_RUN_ID", "")
+
+APIFY_RUN_TIMEOUT_SECONDS = env_int("APIFY_RUN_TIMEOUT_SECONDS", 900)
+APIFY_RUN_POLL_SECONDS = env_int(
+    "APIFY_POLL_INTERVAL_SECONDS", env_int("APIFY_RUN_POLL_SECONDS", 15)
+)
+
+#: Write one Facebook Post Scraper Runs record per Apify run, and link every
+#: imported Raw Signal to it.
+LOG_SCRAPER_RUNS = env_bool("LOG_SCRAPER_RUNS", True)
+
+#: Recompute Facebook Group Performance counts at the end of each run.
+UPDATE_GROUP_PERFORMANCE = env_bool("UPDATE_GROUP_PERFORMANCE", True)
+
+#: Stamped on every record this release evaluates, so legacy and new
+#: qualification results can be compared. Historical records are never
+#: rewritten -- a record only gets a version when the queue processes it.
+QUALIFICATION_VERSION = env_str("QUALIFICATION_VERSION", "facebook-v2")
+
+#: Re-queue records whose last AI attempt failed with a transient error.
+RETRY_AI_ERRORS = env_bool("RETRY_AI_ERRORS", True)
+
+#: Total AI attempts allowed per record ACROSS runs. Prevents a permanently
+#: broken record from consuming the batch every night.
+AI_ERROR_MAX_ATTEMPTS = env_int("AI_ERROR_MAX_ATTEMPTS", 3)
+
+#: Minimum Prefilter Score before a post is worth an AI call.
+PREFILTER_PASS_SCORE = env_int(
+    "PREFILTER_PASS_SCORE", DEFAULT_PREFILTER_PASS_SCORE
+)
+
+#: Send tool-research posts to the AI. They can reach Manual Review but never
+#: automatic outreach. Set false to stop spending tokens on them entirely.
+ALLOW_TOOL_RESEARCH_TO_AI = env_bool("ALLOW_TOOL_RESEARCH_TO_AI", True)
+
+#: Minimum classification_confidence before automatic outreach is allowed.
+MIN_OUTREACH_CONFIDENCE = env_float(
+    "MIN_OUTREACH_CONFIDENCE", DEFAULT_MIN_OUTREACH_CONFIDENCE
+)
+
+#: Business-pain leads must clear this score before automatic outreach.
+BUSINESS_PAIN_OUTREACH_MIN_SCORE = env_int(
+    "BUSINESS_PAIN_OUTREACH_MIN_SCORE", DEFAULT_BUSINESS_PAIN_OUTREACH_SCORE
+)
+
+#: Authors and groups excluded from outreach entirely. Comma-separated.
+SUPPRESSED_AUTHORS = env_csv("SUPPRESSED_AUTHORS")
+DISALLOWED_GROUPS = env_csv("DISALLOWED_GROUPS")
+
+#: The Airtable Prequalification formula is machine generated: it derives
+#: "Send to AI" from the Request, Service, and Promotion signal columns and
+#: knows nothing about post age, human review, or intent. It is an
+#: informational eligibility hint only -- Python is authoritative for pre-AI
+#: eligibility, and no code path may treat this field as human approval.
+#: Set this to true to additionally *narrow* the queue to records the formula
+#: already likes; it can never widen what Python allows through.
 REQUIRE_AIRTABLE_PREQUALIFICATION = env_bool(
     "REQUIRE_AIRTABLE_PREQUALIFICATION", False
 )
 
 #: Skip the AI call entirely for posts the deterministic prefilter rejects.
 ENFORCE_PYTHON_PREFILTER = env_bool("ENFORCE_PYTHON_PREFILTER", True)
+
+#: Hard ceiling on how many lead records one run may modify in Airtable.
+#:
+#: The unit is a *record mutation*, not an HTTP request and not a batch: one
+#: record changed is one unit, whether it was patched alone or as one of ten
+#: in a batch, and whether the change came from a human rejection, a stale
+#: rejection, an ordinary prefilter rejection, a completed AI qualification,
+#: or an AI-error state write. Every one of those paths spends it.
+#:
+#: 0 (or blank) means unlimited, which is the production behaviour this
+#: pipeline has always had and which every scheduled run should keep. It
+#: exists for validation: on 2026-08-20 a run queued two hundred records,
+#: rejected all two hundred as stale, and nothing at all in the pipeline
+#: would have stopped a write-enabled version of that run from touching two
+#: hundred records. AI_BATCH_LIMIT does not bound this, because deterministic
+#: rejections never reach the model.
+#:
+#: A dry run does not spend it. Dry runs write nothing, so budgeting them
+#: would only shrink the queue you are trying to inspect.
+DEFAULT_AIRTABLE_LEAD_UPDATE_BUDGET = 0
+
+AIRTABLE_LEAD_UPDATE_BUDGET = env_int(
+    "AIRTABLE_LEAD_UPDATE_BUDGET", DEFAULT_AIRTABLE_LEAD_UPDATE_BUDGET
+)
+
+#: Hard ceiling on how many NEW lead records one run may create in Airtable.
+#:
+#: Deliberately separate from AIRTABLE_LEAD_UPDATE_BUDGET. That one bounds
+#: changes to records the base already holds; this one bounds how many rows
+#: the scrape may add. They are different blast radii, they are reached by
+#: different code paths, and a validation run usually wants a small number of
+#: each rather than one shared pool.
+#:
+#: The unit is a *record created*, not an HTTP request and not a batch: ten
+#: records POSTed together are ten units.
+#:
+#: 0 (or blank) means unlimited, which is the production behaviour this
+#: pipeline has always had. It exists for validation: the dry run of
+#: 2026-08-23 (Actions run 32658122909, Apify run IPOHKRCznDcvYgnyx) found
+#: 214 new unique leads in one 217-item dataset, and a write-enabled version
+#: of that run would have created all 214 rows with nothing anywhere in the
+#: pipeline able to stop it.
+#:
+#: Deferring a creation loses nothing. Imports are deduplicated against the
+#: live base by post ID, canonical URL, and fingerprint, so a post left
+#: uncreated is simply "new" again on the next run of the same dataset and is
+#: imported then. Re-running a pinned Apify run until the queue drains is a
+#: supported way to import a large scrape a few rows at a time.
+#:
+#: A dry run does not spend it. Dry runs create nothing, and budgeting them
+#: would hide the true size of the scrape, which is the one thing a dry run
+#: over a fresh dataset exists to show.
+DEFAULT_AIRTABLE_LEAD_CREATE_BUDGET = 0
+
+AIRTABLE_LEAD_CREATE_BUDGET = env_int(
+    "AIRTABLE_LEAD_CREATE_BUDGET", DEFAULT_AIRTABLE_LEAD_CREATE_BUDGET
+)
 
 #: Read from Apify and Airtable and call the AI as normal, but make no
 #: Airtable writes. Use this to see how the new rules score real records
@@ -156,33 +376,187 @@ FIELD_SERVICE_MATCH = "Service Match"
 FIELD_LEAD_SUMMARY = "Lead Summary"
 FIELD_REJECTION_REASON = "Rejection Reason"
 FIELD_SUGGESTED_DM = "Suggested DM"
+#: Short public Facebook comment that bridges the post into a DM. AI-owned
+#: output, written under exactly the same outreach gate as Suggested DM.
+FIELD_SUGGESTED_COMMENT = "Suggested Comment"
 FIELD_RECOMMENDED_CHANNEL = "Recommended channel"
 FIELD_EVIDENCE = "Evidence"
 
-# Fields added by this release. Create these in Airtable before deploying;
-# see README.md. If they are missing, writes fall back to the core fields.
+FIELD_AI_OUTPUT = "AI Output"
+
+# Tiering fields, added by the deterministic-qualification release.
 FIELD_LEAD_TIER = "Lead Tier"
 FIELD_MANUAL_REVIEW = "Manual Review"
 FIELD_OUTREACH_READY = "Outreach Ready"
 FIELD_DISQUALIFIERS = "Disqualifiers"
 FIELD_PREFILTER_SCORE = "Prefilter Score"
 
+# Run attribution and feedback-loop fields, added by this release.
+FIELD_QUALIFICATION_VERSION = "Qualification Version"
+FIELD_APIFY_RUN_ID = "Apify Run ID"
+FIELD_SCRAPER_RUN = "Scraper Run"
+
+# Human-owned fields. READ ONLY for this pipeline -- a classification run must
+# never overwrite a person's decision or a recorded sales outcome.
+FIELD_HUMAN_DECISION = "Human Decision"
+FIELD_OUTREACH_STATUS = "Outreach Status"
+FIELD_LAST_CONTACTED = "Last Contacted"
+FIELD_CONTACTED_LEGACY = "Contacted"
+
+# Airtable formula fields. NEVER written -- Airtable computes them, and a
+# write attempt is an API error.
+FIELD_REQUEST_SIGNAL = "Request Signal"
+FIELD_SERVICE_SIGNAL = "Service Signal"
+FIELD_PROMOTION_SIGNAL = "Promotion Signal"
+FIELD_PROVIDER_INTENT_SIGNAL = "Provider Intent Signal"
+FIELD_RESEARCH_INTENT_SIGNAL = "Research Intent Signal"
+FIELD_INTENT_TYPE = "Intent Type"
+
+#: Guard rail. Every Airtable payload is checked against this set before it is
+#: sent, so a formula field or a human-owned field can never be written by
+#: accident. Airtable rejects formula writes anyway; the human-owned fields it
+#: would happily overwrite, which is the dangerous case.
+READ_ONLY_FIELDS = frozenset(
+    {
+        FIELD_REQUEST_SIGNAL,
+        FIELD_SERVICE_SIGNAL,
+        FIELD_PROMOTION_SIGNAL,
+        FIELD_PROVIDER_INTENT_SIGNAL,
+        FIELD_RESEARCH_INTENT_SIGNAL,
+        FIELD_INTENT_TYPE,
+        FIELD_PREQUALIFICATION,
+        FIELD_HUMAN_DECISION,
+        FIELD_OUTREACH_STATUS,
+        FIELD_LAST_CONTACTED,
+        FIELD_CONTACTED_LEGACY,
+    }
+)
+
+#: Facebook Post Scraper Runs has no formula or human-owned columns, and
+#: shares no column names with Raw Signals. Declared explicitly so the guard
+#: is a deliberate choice per table rather than an inherited default.
+SCRAPER_RUNS_PROTECTED_FIELDS: frozenset[str] = frozenset()
+
 EXTENDED_FIELDS = (
+    FIELD_SUGGESTED_COMMENT,
     FIELD_LEAD_TIER,
     FIELD_MANUAL_REVIEW,
     FIELD_OUTREACH_READY,
     FIELD_DISQUALIFIERS,
     FIELD_PREFILTER_SCORE,
+    FIELD_QUALIFICATION_VERSION,
+    FIELD_APIFY_RUN_ID,
+    FIELD_SCRAPER_RUN,
+)
+
+#: Airtable field IDs for fields where the ID is known and worth pinning.
+#:
+#: The preflight matches on name, which is what an operator sees. An ID match
+#: is accepted as a fallback so renaming a column in Airtable does not fail a
+#: run for a field that is demonstrably still there.
+KNOWN_FIELD_IDS: dict[str, str] = {
+    FIELD_SUGGESTED_COMMENT: "fldFYDjbtu6gLPT1B",
+}
+
+#: Every Raw Signals field the pipeline writes.
+#:
+#: The preflight validates this whole set, not a subset. A field missing from
+#: here but present in a payload fails mid-batch with UNKNOWN_FIELD_NAME
+#: instead of failing clearly before anything is modified -- and AI Output in
+#: particular now carries the cross-run retry counter, so losing it silently
+#: breaks error recovery.
+REQUIRED_RAW_SIGNAL_FIELDS = (
+    # Written on import.
+    FIELD_URL,
+    FIELD_FACEBOOK_URL,
+    FIELD_TIME,
+    FIELD_USER_ID,
+    FIELD_USER_NAME,
+    FIELD_TEXT,
+    FIELD_GROUP_TITLE,
+    FIELD_INPUT_URL,
+    FIELD_LIKES,
+    FIELD_COMMENTS,
+    FIELD_SHARES,
+    FIELD_APIFY_RUN_ID,
+    FIELD_SCRAPER_RUN,
+    # Written after qualification.
+    FIELD_AI_STATUS,
+    FIELD_QUALIFIED,
+    FIELD_LEAD_SCORE,
+    FIELD_SERVICE_MATCH,
+    FIELD_LEAD_SUMMARY,
+    FIELD_REJECTION_REASON,
+    FIELD_SUGGESTED_DM,
+    FIELD_SUGGESTED_COMMENT,
+    FIELD_RECOMMENDED_CHANNEL,
+    FIELD_EVIDENCE,
+    FIELD_AI_OUTPUT,
+    FIELD_LEAD_TIER,
+    FIELD_MANUAL_REVIEW,
+    FIELD_OUTREACH_READY,
+    FIELD_DISQUALIFIERS,
+    FIELD_PREFILTER_SCORE,
+    FIELD_QUALIFICATION_VERSION,
+)
+
+#: Airtable table names. Only AIRTABLE_TABLE_NAME is a required secret; the
+#: other two default to their live names.
+SCRAPER_RUNS_TABLE = env_str(
+    "AIRTABLE_SCRAPER_RUNS_TABLE", "Facebook Post Scraper Runs"
+)
+GROUP_PERFORMANCE_TABLE = env_str(
+    "AIRTABLE_GROUP_PERFORMANCE_TABLE", "Facebook Group Performance"
 )
 
 
-def airtable_url() -> str:
+def airtable_table_url(table: str) -> str:
+    """Build the Airtable REST URL for one table in the configured base."""
     base_id = require_env("AIRTABLE_BASE_ID")
-    table = require_env("AIRTABLE_TABLE_NAME")
     return (
         "https://api.airtable.com/v0/"
         f"{base_id}/{quote(table, safe='')}"
     )
+
+
+def airtable_url() -> str:
+    """The Facebook Raw Signals table."""
+    # Base ID is resolved first so a missing base reports the base, not the
+    # table, as the thing that is not configured.
+    require_env("AIRTABLE_BASE_ID")
+    return airtable_table_url(require_env("AIRTABLE_TABLE_NAME"))
+
+
+def strip_read_only_fields(
+    fields: dict[str, Any],
+    protected: frozenset[str] = READ_ONLY_FIELDS,
+) -> dict[str, Any]:
+    """
+    Remove fields the pipeline must never write.
+
+    Airtable rejects formula writes with an error, but it would happily
+    overwrite Human Decision or Outreach Status. This is the last line of
+    defence before any PATCH or POST leaves the process.
+
+    ``protected`` is per-table and must be passed explicitly for anything
+    other than Facebook Raw Signals. Column names are not unique across the
+    base: "Contacted" is a read-only checkbox on Raw Signals and a computed
+    count on Facebook Group Performance, so applying the Raw Signals set to
+    the group table would silently drop a metric the pipeline owns.
+    """
+    removed = sorted(set(fields) & protected)
+
+    if removed:
+        print(
+            f"Refusing to write read-only Airtable fields: "
+            f"{', '.join(removed)}. This is a bug; the fields were dropped.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return {
+        key: value for key, value in fields.items() if key not in protected
+    }
 
 
 def airtable_headers() -> dict[str, str]:
@@ -218,6 +592,282 @@ def reset_openai_client() -> None:
     """Drop the cached client. Used by tests."""
     global _OPENAI_CLIENT
     _OPENAI_CLIENT = None
+
+
+class OpenAIBudgetExhausted(RuntimeError):
+    """The run has issued its whole OPENAI_REQUEST_BUDGET of API requests."""
+
+
+#: Actual responses.create() calls issued by this run, retries included.
+_OPENAI_REQUESTS_MADE = 0
+
+
+def openai_requests_made() -> int:
+    """How many API requests this run has issued so far."""
+    return _OPENAI_REQUESTS_MADE
+
+
+def reset_openai_request_budget() -> None:
+    """Zero the request counter. Used by tests and at the start of a run."""
+    global _OPENAI_REQUESTS_MADE
+    _OPENAI_REQUESTS_MADE = 0
+
+
+def consume_openai_request() -> None:
+    """
+    Account for one API request, refusing to exceed the run budget.
+
+    Called immediately before every responses.create(), so retries are
+    counted the same as first attempts. AI_BATCH_LIMIT caps records; this
+    caps requests, which is what actually gets billed.
+    """
+    global _OPENAI_REQUESTS_MADE
+
+    if OPENAI_REQUEST_BUDGET and _OPENAI_REQUESTS_MADE >= OPENAI_REQUEST_BUDGET:
+        raise OpenAIBudgetExhausted(
+            f"This run has issued its full budget of "
+            f"{OPENAI_REQUEST_BUDGET} OpenAI requests "
+            f"(OPENAI_REQUEST_BUDGET). No further requests will be made."
+        )
+
+    _OPENAI_REQUESTS_MADE += 1
+
+
+# ---------------------------------------------------------------------------
+# Airtable lead-update budget
+#
+# AI_BATCH_LIMIT and OPENAI_REQUEST_BUDGET bound what a run spends at OpenAI.
+# Neither bounds what it changes in Airtable, because the deterministic paths
+# -- stale, prefiltered, human-rejected -- write a rejection without ever
+# calling the model. This is the ceiling for those.
+# ---------------------------------------------------------------------------
+
+class LeadUpdateBudgetExhausted(RuntimeError):
+    """The run has changed its whole AIRTABLE_LEAD_UPDATE_BUDGET of records."""
+
+
+#: Lead-record mutations this run has committed to, dry runs excluded.
+_LEAD_UPDATES_MADE = 0
+
+
+def lead_updates_made() -> int:
+    """How many lead records this run has changed so far."""
+    return _LEAD_UPDATES_MADE
+
+
+def reset_lead_update_budget() -> None:
+    """Zero the mutation counter. Used by tests and at the start of a run."""
+    global _LEAD_UPDATES_MADE
+    _LEAD_UPDATES_MADE = 0
+
+
+def lead_update_budget_remaining() -> int | None:
+    """
+    Mutations still available, or None when the budget is unlimited.
+
+    None rather than a large number, so a caller cannot accidentally treat
+    "unlimited" as a quantity and compare it.
+    """
+    if not AIRTABLE_LEAD_UPDATE_BUDGET or DRY_RUN:
+        return None
+
+    return max(AIRTABLE_LEAD_UPDATE_BUDGET - _LEAD_UPDATES_MADE, 0)
+
+
+def has_lead_update_budget(count: int = 1) -> bool:
+    """
+    Whether ``count`` more record mutations may be made.
+
+    Call this before spending anything expensive on a record -- an OpenAI
+    request above all -- so the run never pays for a result it has no room
+    left to save.
+    """
+    remaining = lead_update_budget_remaining()
+
+    return remaining is None or remaining >= count
+
+
+def consume_lead_update(count: int = 1) -> None:
+    """
+    Account for ``count`` lead-record mutations, refusing to exceed the budget.
+
+    Counted where the change to a record is decided, not where the HTTP
+    request is sent, so batching cannot hide anything: ten records patched in
+    one PATCH are ten units.
+
+    A dry run consumes nothing. It writes nothing, so there is nothing to
+    bound, and spending the budget on simulated writes would stop a dry run
+    from showing the whole queue.
+    """
+    global _LEAD_UPDATES_MADE
+
+    if DRY_RUN:
+        return
+
+    if not AIRTABLE_LEAD_UPDATE_BUDGET:
+        _LEAD_UPDATES_MADE += count
+        return
+
+    if _LEAD_UPDATES_MADE + count > AIRTABLE_LEAD_UPDATE_BUDGET:
+        raise LeadUpdateBudgetExhausted(
+            f"This run has changed its full budget of "
+            f"{AIRTABLE_LEAD_UPDATE_BUDGET} lead records "
+            f"(AIRTABLE_LEAD_UPDATE_BUDGET). Remaining records are left "
+            f"unchanged and stay Pending for the next run."
+        )
+
+    _LEAD_UPDATES_MADE += count
+
+
+# ---------------------------------------------------------------------------
+# Airtable lead-create budget
+#
+# The update budget above bounds changes to rows the base already holds. It
+# does not bound how many rows the scrape adds, and those are different
+# risks: 214 new records from one dataset is not 214 edits to records someone
+# has already looked at.
+# ---------------------------------------------------------------------------
+
+class LeadCreateBudgetExhausted(RuntimeError):
+    """The run has created its whole AIRTABLE_LEAD_CREATE_BUDGET of records."""
+
+
+#: Lead records this run has committed to creating, dry runs excluded.
+_LEAD_CREATES_MADE = 0
+
+
+def lead_creates_made() -> int:
+    """How many lead records this run has created so far."""
+    return _LEAD_CREATES_MADE
+
+
+def reset_lead_create_budget() -> None:
+    """Zero the creation counter. Used by tests and at the start of a run."""
+    global _LEAD_CREATES_MADE
+    _LEAD_CREATES_MADE = 0
+
+
+def lead_create_budget_remaining() -> int | None:
+    """Creations still available, or None when the budget is unlimited."""
+    if not AIRTABLE_LEAD_CREATE_BUDGET or DRY_RUN:
+        return None
+
+    return max(AIRTABLE_LEAD_CREATE_BUDGET - _LEAD_CREATES_MADE, 0)
+
+
+def has_lead_create_budget(count: int = 1) -> bool:
+    """Whether ``count`` more records may be created."""
+    remaining = lead_create_budget_remaining()
+
+    return remaining is None or remaining >= count
+
+
+def consume_lead_create(count: int = 1) -> None:
+    """
+    Account for ``count`` record creations, refusing to exceed the budget.
+
+    Counted per record admitted to a create batch, not per POST, so ten rows
+    written in one request are ten units.
+
+    A dry run consumes nothing, because a dry run creates nothing.
+    """
+    global _LEAD_CREATES_MADE
+
+    if DRY_RUN:
+        return
+
+    if not AIRTABLE_LEAD_CREATE_BUDGET:
+        _LEAD_CREATES_MADE += count
+        return
+
+    if _LEAD_CREATES_MADE + count > AIRTABLE_LEAD_CREATE_BUDGET:
+        raise LeadCreateBudgetExhausted(
+            f"This run has created its full budget of "
+            f"{AIRTABLE_LEAD_CREATE_BUDGET} lead records "
+            f"(AIRTABLE_LEAD_CREATE_BUDGET). The remaining posts are not "
+            f"imported and stay importable: the next run of the same Apify "
+            f"dataset deduplicates against what landed and creates the next "
+            f"batch."
+        )
+
+    _LEAD_CREATES_MADE += count
+
+
+class ConfigurationError(RuntimeError):
+    """A setting is invalid. The run stops before it touches anything."""
+
+
+#: Write ceilings whose "0 means unlimited" convention makes a negative value
+#: ambiguous rather than merely wrong. A negative budget does not read as
+#: "unlimited" and it does not read as a number of records: it silently
+#: refuses every single write, so the run reports success having done nothing
+#: and the operator has no idea why. Both are rejected outright instead.
+NON_NEGATIVE_BUDGET_SETTINGS = (
+    "AIRTABLE_LEAD_CREATE_BUDGET",
+    "AIRTABLE_LEAD_UPDATE_BUDGET",
+)
+
+
+def validate_budget_configuration() -> None:
+    """
+    Fail on a nonsensical write budget before the run touches anything.
+
+    Called first thing in main(), ahead of the Airtable schema preflight, the
+    Apify run resolution, and any OpenAI client, so a typo costs nothing but
+    a clear message.
+    """
+    invalid = [
+        (name, value)
+        for name, value in (
+            (name, globals()[name]) for name in NON_NEGATIVE_BUDGET_SETTINGS
+        )
+        if value < 0
+    ]
+
+    if not invalid:
+        return
+
+    details = ", ".join(f"{name}={value}" for name, value in invalid)
+
+    raise ConfigurationError(
+        f"Invalid configuration: {details}. A write budget counts records "
+        f"and cannot be negative. Use 0 (or leave it blank) for unlimited, "
+        f"or a positive number to cap it. Nothing was read or written."
+    )
+
+
+def admit_posts_within_create_budget(
+    posts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Split posts into the ones this run may create and the ones it defers.
+
+    The budget is claimed here, before a post is added to any create batch,
+    so nothing is mapped or POSTed that the run has no room for. Order is
+    preserved, so the deferred tail is a stable suffix of the scrape rather
+    than an arbitrary subset.
+
+    Returns ``(admitted, deferred)``. A dry run admits everything.
+    """
+    admitted: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+
+    for post in posts:
+        if deferred:
+            # Once the budget is gone it stays gone. Keep the split
+            # contiguous rather than skipping ahead to a cheaper post.
+            deferred.append(post)
+            continue
+
+        try:
+            consume_lead_create()
+        except LeadCreateBudgetExhausted:
+            deferred.append(post)
+            continue
+
+        admitted.append(post)
+
+    return admitted, deferred
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +913,45 @@ You do NOT decide whether a lead is qualified. You do NOT produce a score.
 You observe the post and report structured signals. A separate deterministic
 system applies the scoring and qualification rules.
 
-Analyze only the supplied public Facebook post and metadata. Never invent
-business names, locations, urgency, budgets, website problems, or technical
-details that are not present in the post.
+Analyze only the supplied public Facebook post and metadata. Use ONLY
+evidence contained in the post and context supplied. Never invent:
+
+- business names or business details
+- urgency
+- budget
+- location
+- service requirements
+- website, system, or technical problems
 
 If the post does not support a signal, report the lowest or "unknown" value.
 Do not guess upward. Under-reporting is safer than over-reporting.
+
+DO NOT SOLUTION-HOP
+
+Do NOT report a service match merely because BruceTech could theoretically
+provide an alternative solution to the author's situation. The need the
+author expressed must directly align with a BruceTech service, or clearly
+describe implementation work or operational pain that BruceTech solves.
+
+  "I need a virtual assistant."
+    -> NOT a BruceTech need. Do not reason "BruceTech could automate this
+       instead". service_categories = [] unless they explicitly ask about
+       automation or AI.
+
+  "I need business financing for another truck."
+    -> NOT a BruceTech need. Do not reason "BruceTech could improve their
+       systems". service_categories = [].
+
+  "Who has used a good CRM?"
+    -> Research, not a request for an implementer. intent_strength is at
+       most "weak" and purchase_signal at most "researching".
+
+  "Looking for someone to set up GoHighLevel with SMS and email sequences."
+    -> A genuine provider request. Report it at full strength.
+
+A Python classifier has already decided the post's intent type and whether it
+matches a BruceTech service. Contradicting the post to be helpful does not
+create a lead; it only wastes a human's time.
 
 SIGNAL GUIDANCE
 
@@ -332,16 +1015,57 @@ evidence - short quotes or specifics from the post supporting your signals.
 
 service_match - a short human-readable label, or "None".
 
-suggested_dm - only write one when the post genuinely supports a specific,
-  personalised message:
+NEVER USE AN EM DASH
+
+Do not use the em dash character "—" anywhere in suggested_dm or
+suggested_comment. Use a comma, a period, a colon, a semicolon, parentheses,
+or two separate sentences instead. A standard hyphen inside a compound word
+("well-structured") is fine.
+
+  BAD:  "Hi Matt — I saw your post about lead generation."
+  GOOD: "Hi Matt, I saw your post about lead generation."
+
+  BAD:  "That setup can work well — especially with a CRM."
+  GOOD: "That setup can work well, especially with a CRM."
+
+  BAD:  "You have the operations side figured out — acquisition is next."
+  GOOD: "You have the operations side figured out. Acquisition is next."
+
+This applies to every message you write, without exception.
+
+suggested_dm - the PRIVATE message. Only write one when the post genuinely
+  supports a specific, personalised message:
   - under 80 words, natural, no marketing voice
   - reference only details actually present in the post
   - include brucetech.ca naturally
   - end with one simple question
   - never mention scraping, monitoring, tracking, or AI analysis
   - never claim BruceTech reviewed their website or systems
+  - no em dash
   If you cannot write a genuinely specific message, return an empty string.
   Never write a generic template. A blank DM is correct and expected.
+
+suggested_comment - the PUBLIC Facebook comment, written to bridge the
+  conversation from the post into a private DM. This is not the pitch; it is
+  the reason someone would welcome the DM.
+  - 12 to 35 words, at most two short sentences
+  - acknowledge one specific detail, problem, or request from the post
+  - warm, natural, and human, like a real comment in a group
+  - useful enough that it does not read as spam
+  - end by offering to send a DM, and vary the wording across posts:
+      "I'll send you a quick DM with a couple ideas."
+      "I'll shoot you a quick DM with a few thoughts."
+      "I'll send you a DM with how I'd approach this."
+      "I'll message you directly with a couple options."
+  - BruceTech opens the DM. Avoid "DM me" unless it is genuinely more
+    natural for that specific post.
+  - never include a URL, a link, brucetech.ca, a phone number, or pricing
+  - never explain the whole solution publicly
+  - never use generic filler: "Great post", "Thanks for sharing",
+    "We can help"
+  - no em dash
+  Write one only when you also wrote a suggested_dm. If the DM is blank,
+  return an empty string here too.
 
 recommended_channel - do_not_contact whenever outreach would be unwelcome,
   intrusive, or unsupported by the post. This is respected as-is and is
@@ -417,6 +1141,7 @@ LEAD_SCHEMA: dict[str, Any] = {
         "lead_summary": {"type": "string"},
         "evidence": {"type": "string"},
         "suggested_dm": {"type": "string"},
+        "suggested_comment": {"type": "string"},
         "recommended_channel": _enum(
             ("direct_message", "public_reply_then_dm", "do_not_contact")
         ),
@@ -445,6 +1170,7 @@ LEAD_SCHEMA: dict[str, Any] = {
         "lead_summary",
         "evidence",
         "suggested_dm",
+        "suggested_comment",
         "recommended_channel",
     ],
     "additionalProperties": False,
@@ -460,13 +1186,59 @@ def chunks(items: list[Any], size: int) -> Iterator[list[Any]]:
         yield items[index:index + size]
 
 
+class AmbiguousWriteError(RuntimeError):
+    """
+    A non-idempotent request failed in a way that cannot be resolved locally.
+
+    The request may or may not have been accepted by the server. Retrying it
+    would risk creating a second record or starting a second paid Apify run,
+    so the pipeline stops and lets the caller reconcile against reality.
+    """
+
+
+#: HTTP methods that are safe to replay. A retried POST creates a second
+#: resource; a retried GET or PATCH-by-record-id does not.
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"})
+
+
+def _is_pre_send_failure(exc: Exception) -> bool:
+    """
+    Did this failure happen before the server could have accepted the request?
+
+    Only a connect timeout proves it: the TCP connection was never
+    established, so no bytes reached the server. A read timeout is the
+    dangerous one -- the request was sent and the *response* was lost, which
+    looks identical to a network blip and is not.
+    """
+    return isinstance(exc, requests.ConnectTimeout)
+
+
 def request_with_retry(
     method: str,
     url: str,
     *,
     max_attempts: int = 5,
+    idempotent: bool | None = None,
     **kwargs: Any,
 ) -> requests.Response:
+    """
+    Send an HTTP request, retrying only where a replay is actually safe.
+
+    Idempotent methods retry on network errors and on 429/5xx as before.
+
+    Non-idempotent methods (POST) are treated as write-once. They retry only
+    when the failure provably happened *before* the server saw the request:
+    a connect timeout, or a 429, which means the request was rejected rather
+    than processed. Anything else -- a read timeout, a dropped connection
+    mid-flight, a 500 -- is ambiguous, and raises AmbiguousWriteError instead
+    of being replayed.
+
+    This is the difference between a duplicated Airtable record and a clear
+    failure the operator can reconcile.
+    """
+    if idempotent is None:
+        idempotent = method.upper() in IDEMPOTENT_METHODS
+
     last_error: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
@@ -474,6 +1246,14 @@ def request_with_retry(
             response = requests.request(method, url, timeout=120, **kwargs)
         except requests.RequestException as exc:
             last_error = exc
+
+            if not idempotent and not _is_pre_send_failure(exc):
+                raise AmbiguousWriteError(
+                    f"{method.upper()} {url} failed after the request was "
+                    f"sent ({exc}). It may have been accepted. Not retrying: "
+                    f"a replay could duplicate the write."
+                ) from exc
+
             if attempt == max_attempts:
                 break
 
@@ -489,6 +1269,15 @@ def request_with_retry(
             return response
 
         if response.status_code in {429, 500, 502, 503, 504}:
+            # 429 means the request was rejected before it was processed, so
+            # replaying it is safe for any method. A 5xx is ambiguous.
+            if not idempotent and response.status_code != 429:
+                raise AmbiguousWriteError(
+                    f"{method.upper()} {url} returned "
+                    f"{response.status_code}. The write may have been "
+                    f"applied. Not retrying: a replay could duplicate it."
+                )
+
             if attempt == max_attempts:
                 response.raise_for_status()
 
@@ -516,160 +1305,71 @@ def request_with_retry(
     )
 
 
-APIFY_DATASET_FIELDS = (
-    "legacyId,url,time,text,user,groupTitle,"
-    "facebookUrl,inputUrl,likesCount,"
-    "commentsCount,sharesCount,error,errorDescription"
-)
-
-
-def _valid_apify_posts(data: Any) -> list[dict[str, Any]]:
-    if not isinstance(data, list):
-        raise RuntimeError("Apify returned an unexpected response.")
-
-    posts = [
-        item
-        for item in data
-        if isinstance(item, dict)
-        and item.get("url")
-        and not item.get("error")
-    ]
-
-    print(
-        f"Fetched {len(data)} Apify items; {len(posts)} valid posts.",
-        flush=True,
-    )
-    return posts
-
-
 # ---------------------------------------------------------------------------
 # Apify
+#
+# Run resolution and dataset retrieval live in apify_runs.py. This section
+# only supplies credentials and configuration.
+#
+# The old implementation read `/actor-tasks/{id}/runs/last/dataset/items`,
+# which returns items with no run identity attached. If a manual Apify run
+# finished between the scheduled scrape and this read, the pipeline imported
+# that run's posts while believing it had read its own -- and recorded no run
+# ID either way. Every path now resolves one exact run object first.
 # ---------------------------------------------------------------------------
 
-def fetch_latest_apify_posts() -> list[dict[str, Any]]:
-    """Read the dataset from the task's last successful run."""
-    task_id = require_env("APIFY_TASK_ID")
-
-    url = (
-        "https://api.apify.com/v2/actor-tasks/"
-        f"{task_id}/runs/last/dataset/items"
-    )
-
-    params = {
-        "token": require_env("APIFY_TOKEN"),
-        "status": "SUCCEEDED",
-        "format": "json",
-        "clean": "true",
-        "fields": APIFY_DATASET_FIELDS,
-    }
-
-    response = request_with_retry("GET", url, params=params)
-    return _valid_apify_posts(response.json())
+APIFY_DATASET_FIELDS = apify_runs.DATASET_FIELDS
 
 
-def start_apify_task_run() -> dict[str, Any]:
-    """Start a fresh Apify task run and return the run object."""
-    task_id = require_env("APIFY_TASK_ID")
-    token = require_env("APIFY_TOKEN")
-
-    url = f"https://api.apify.com/v2/actor-tasks/{task_id}/runs"
-
-    response = request_with_retry("POST", url, params={"token": token})
-    run = (response.json() or {}).get("data") or {}
-
-    run_id = run.get("id")
-    if not run_id:
-        raise RuntimeError("Apify did not return a run ID.")
-
-    print(f"Started Apify run {run_id}.", flush=True)
-    return run
-
-
-def wait_for_apify_run(
-    run_id: str,
+def resolve_apify_run(
     *,
-    timeout_seconds: int | None = None,
-    poll_seconds: int | None = None,
-) -> dict[str, Any]:
-    """Poll an Apify run until it reaches a terminal state."""
-    token = require_env("APIFY_TOKEN")
-    timeout = timeout_seconds or APIFY_RUN_TIMEOUT_SECONDS
-    interval = max(poll_seconds or APIFY_RUN_POLL_SECONDS, 1)
-
-    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.monotonic() + timeout
-
-    while True:
-        response = request_with_retry("GET", url, params={"token": token})
-        run = (response.json() or {}).get("data") or {}
-        status = run.get("status")
-
-        if status == "SUCCEEDED":
-            print(f"Apify run {run_id} succeeded.", flush=True)
-            return run
-
-        if status in {"FAILED", "ABORTED", "TIMED-OUT", "TIMED_OUT"}:
-            raise RuntimeError(
-                f"Apify run {run_id} finished with status {status}."
-            )
-
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"Apify run {run_id} did not finish within {timeout}s "
-                f"(last status: {status})."
-            )
-
-        print(
-            f"Apify run {run_id} status={status}; "
-            f"checking again in {interval}s...",
-            flush=True,
-        )
-        time.sleep(interval)
-
-
-def fetch_apify_dataset_items(dataset_id: str) -> list[dict[str, Any]]:
-    """Read items from one specific Apify dataset."""
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-
-    params = {
-        "token": require_env("APIFY_TOKEN"),
-        "format": "json",
-        "clean": "true",
-        "fields": APIFY_DATASET_FIELDS,
-    }
-
-    response = request_with_retry("GET", url, params=params)
-    return _valid_apify_posts(response.json())
-
-
-def collect_apify_posts() -> list[dict[str, Any]]:
+    start_new_run: bool | None = None,
+) -> apify_runs.ApifyRun:
     """
-    Return Apify posts using the configured strategy.
+    Resolve the single Apify run this execution will import from.
 
-    With APIFY_START_NEW_RUN enabled, a fresh run is started, awaited, and
-    that exact run's dataset is read -- avoiding the race where
-    ``runs/last`` returns a previous run's data.
+    ``start_new_run`` overrides the configured mode. main() passes False in
+    dry-run mode so a validation pass never starts a paid actor run.
     """
-    if not APIFY_START_NEW_RUN:
-        return fetch_latest_apify_posts()
-
-    run = start_apify_task_run()
-    finished = wait_for_apify_run(str(run.get("id")))
-
-    dataset_id = finished.get("defaultDatasetId") or run.get(
-        "defaultDatasetId"
+    return apify_runs.resolve_run(
+        request_with_retry,
+        token=require_env("APIFY_TOKEN"),
+        task_id=require_env("APIFY_TASK_ID"),
+        start_new_run=(
+            APIFY_START_NEW_RUN if start_new_run is None else start_new_run
+        ),
+        run_id=APIFY_RUN_ID,
+        timeout_seconds=APIFY_RUN_TIMEOUT_SECONDS,
+        poll_seconds=APIFY_RUN_POLL_SECONDS,
     )
-    if not dataset_id:
-        raise RuntimeError("Apify run did not expose a default dataset ID.")
 
-    return fetch_apify_dataset_items(str(dataset_id))
+
+def collect_apify_posts(
+    run: apify_runs.ApifyRun,
+) -> list[dict[str, Any]]:
+    """Read the posts belonging to one exact resolved run."""
+    return apify_runs.collect_posts(
+        request_with_retry,
+        token=require_env("APIFY_TOKEN"),
+        run=run,
+    )
+
+
+def fetch_apify_run_input(run: apify_runs.ApifyRun) -> Any:
+    """Read the exact input the run was started with, if Apify stored one."""
+    return apify_runs.fetch_run_input(
+        request_with_retry,
+        token=require_env("APIFY_TOKEN"),
+        run=run,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Airtable reads and deduplication
 # ---------------------------------------------------------------------------
 
-def list_airtable_records(
+def list_table_records(
+    url: str,
     *,
     formula: str | None = None,
     fields: list[str] | None = None,
@@ -678,7 +1378,7 @@ def list_airtable_records(
     sort_direction: str = "desc",
 ) -> list[dict[str, Any]]:
     """
-    Page through Airtable records.
+    Page through the records of any table in the base.
 
     ``sort_field`` matters whenever ``max_records`` is set: without a sort,
     Airtable returns records in the table's own order, so truncating gives an
@@ -686,7 +1386,6 @@ def list_airtable_records(
     """
     records: list[dict[str, Any]] = []
     offset: str | None = None
-    url = airtable_url()
     headers = airtable_headers()
 
     while True:
@@ -723,6 +1422,87 @@ def list_airtable_records(
         time.sleep(0.25)
 
     return records
+
+
+def list_airtable_records(**kwargs: Any) -> list[dict[str, Any]]:
+    """Page through the Facebook Raw Signals table."""
+    return list_table_records(airtable_url(), **kwargs)
+
+
+def list_scraper_run_records(**kwargs: Any) -> list[dict[str, Any]]:
+    """Page through the Facebook Post Scraper Runs table."""
+    return list_table_records(
+        airtable_table_url(SCRAPER_RUNS_TABLE), **kwargs
+    )
+
+
+def list_group_performance_records(**kwargs: Any) -> list[dict[str, Any]]:
+    """Page through the Facebook Group Performance table."""
+    return list_table_records(
+        airtable_table_url(GROUP_PERFORMANCE_TABLE), **kwargs
+    )
+
+
+def create_table_records(
+    url: str,
+    records: list[dict[str, Any]],
+    *,
+    protected: frozenset[str] = READ_ONLY_FIELDS,
+) -> list[dict[str, Any]]:
+    """Create records in any table, ten at a time, and return what Airtable made."""
+    created: list[dict[str, Any]] = []
+    headers = airtable_headers()
+
+    for batch in chunks(records, 10):
+        payload = [
+            {
+                **record,
+                "fields": strip_read_only_fields(
+                    record.get("fields", {}), protected
+                ),
+            }
+            for record in batch
+        ]
+
+        response = request_with_retry(
+            "POST",
+            url,
+            headers=headers,
+            json={"records": payload, "typecast": True},
+        )
+        created.extend(response.json().get("records", []))
+        time.sleep(0.25)
+
+    return created
+
+
+def update_table_records(
+    url: str,
+    updates: list[dict[str, Any]],
+    *,
+    protected: frozenset[str] = READ_ONLY_FIELDS,
+) -> None:
+    """Patch records in any table, ten at a time."""
+    headers = airtable_headers()
+
+    for batch in chunks(updates, 10):
+        payload = [
+            {
+                **update,
+                "fields": strip_read_only_fields(
+                    update.get("fields", {}), protected
+                ),
+            }
+            for update in batch
+        ]
+
+        request_with_retry(
+            "PATCH",
+            url,
+            headers=headers,
+            json={"records": payload, "typecast": True},
+        )
+        time.sleep(0.25)
 
 
 def fetch_existing_identity_keys() -> set[str]:
@@ -767,7 +1547,19 @@ def select_new_posts(
     return result.unique
 
 
-def map_apify_to_airtable(post: dict[str, Any]) -> dict[str, Any]:
+def map_apify_to_airtable(
+    post: dict[str, Any],
+    *,
+    apify_run_id: str = "",
+    scraper_run_record_id: str = "",
+) -> dict[str, Any]:
+    """
+    Map one Apify post onto Airtable fields.
+
+    ``apify_run_id`` and ``scraper_run_record_id`` are what make a post
+    traceable: the raw ID for querying, and the linked record for navigating
+    from a lead to the scrape that found it (and to its cost).
+    """
     user = post.get("user") or {}
 
     mapped: dict[str, Any] = {
@@ -786,55 +1578,179 @@ def map_apify_to_airtable(post: dict[str, Any]) -> dict[str, Any]:
     if post.get("time"):
         mapped[FIELD_TIME] = post["time"]
 
+    if apify_run_id:
+        mapped[FIELD_APIFY_RUN_ID] = apify_run_id
+
+    if scraper_run_record_id:
+        # Linked-record fields take a list of Airtable record IDs.
+        mapped[FIELD_SCRAPER_RUN] = [scraper_run_record_id]
+
     return mapped
 
 
-def create_new_posts_in_airtable(posts: list[dict[str, Any]]) -> list[str]:
-    """Create new Airtable records and return their record IDs."""
+#: Prefix for the synthetic record IDs used only in dry-run mode. These never
+#: reach Airtable: DRY_RUN blocks every write path before one could.
+DRY_RUN_RECORD_PREFIX = "dryrun-"
+
+
+def build_dry_run_records(
+    posts: list[dict[str, Any]],
+    *,
+    apify_run_id: str = "",
+    scraper_run_record_id: str = "",
+) -> list[dict[str, Any]]:
+    """
+    Shape this run's new posts as in-memory records for a dry run.
+
+    A dry run creates nothing, so the newly scraped posts have no Airtable
+    record IDs and used to vanish before the prefilter -- the run reported on
+    the backlog and said nothing at all about the scrape it had just read.
+    That is the opposite of what a dry run is for.
+
+    These carry the same fields the real import would write, so they go
+    through the identical prefilter, queue ordering, and qualification path.
+    Their IDs are synthetic and clearly marked; nothing writes them anywhere.
+    """
+    return [
+        {
+            "id": f"{DRY_RUN_RECORD_PREFIX}{index:04d}",
+            "fields": map_apify_to_airtable(
+                post,
+                apify_run_id=apify_run_id,
+                scraper_run_record_id=scraper_run_record_id,
+            ),
+        }
+        for index, post in enumerate(posts)
+    ]
+
+
+def reconcile_import(posts: list[dict[str, Any]]) -> str:
+    """
+    After an ambiguous create, report which of these posts are now in Airtable.
+
+    Reads the identity keys back and counts how many of the batch landed. The
+    pipeline does not retry the write: the next run deduplicates against these
+    same keys, so whatever arrived is kept and whatever did not is imported
+    then. This exists so the operator sees the real state instead of guessing.
+    """
+    try:
+        seen = fetch_existing_identity_keys()
+    except Exception as exc:  # noqa: BLE001 - reconciliation is best effort
+        return f"could not re-read Airtable to reconcile ({exc})"
+
+    landed = sum(
+        1
+        for post in posts
+        if is_duplicate(identity_from_apify(post), seen)
+    )
+
+    return (
+        f"{landed} of {len(posts)} posts from this batch are present in "
+        f"Airtable. Nothing was retried. The next run will import the "
+        f"remainder and skip the rest by deduplication."
+    )
+
+
+def create_new_posts_in_airtable(
+    posts: list[dict[str, Any]],
+    *,
+    apify_run_id: str = "",
+    scraper_run_record_id: str = "",
+    summary: "RunSummary | None" = None,
+) -> list[str]:
+    """
+    Create new Airtable records and return their record IDs.
+
+    Every record created here carries the ID of the Apify run that produced
+    it and, when the scraper run was logged, a link to that run's record.
+
+    AIRTABLE_LEAD_CREATE_BUDGET caps how many rows this may add. The budget
+    is claimed before a post is mapped or batched, so a deferred post is
+    never POSTed and never partially written. Deferring costs nothing: the
+    next run of the same dataset deduplicates against what landed and
+    imports the rest.
+    """
+    if summary is not None:
+        summary.creation_candidates += len(posts)
+
     if not posts:
         print("No new Facebook posts to create in Airtable.", flush=True)
         return []
 
     if DRY_RUN:
+        # A dry run creates nothing, so it spends no budget and defers
+        # nothing. Reporting the whole scrape is the point: run 32658122909
+        # is only informative because it said 214 rather than a budgeted 3.
         print(
-            f"[DRY RUN] Would create {len(posts)} new Airtable records. "
+            f"[DRY RUN] Would create {len(posts)} new Airtable records "
+            f"attributed to Apify run {apify_run_id or 'unknown'}. "
             f"Nothing written.",
             flush=True,
         )
-        for post in posts[:10]:
+        for position, post in enumerate(posts[:10], start=1):
+            canonical = normalize_facebook_url(post.get("url", ""))
             print(
-                f"[DRY RUN]   {normalize_facebook_url(post.get('url', ''))}",
+                f"[DRY RUN]   [{position}/{len(posts)}] "
+                f"{redaction.redact_url(canonical)}",
                 flush=True,
             )
+
+        if summary is not None:
+            summary.creations_written += len(posts)
         return []
 
-    created_record_ids: list[str] = []
-    mapped = [{"fields": map_apify_to_airtable(post)} for post in posts]
-    url = airtable_url()
-    headers = airtable_headers()
+    admitted, deferred = admit_posts_within_create_budget(posts)
 
-    for batch_number, batch in enumerate(chunks(mapped, 10), start=1):
-        response = request_with_retry(
-            "POST",
-            url,
-            headers=headers,
-            json={"records": batch, "typecast": True},
-        )
-
-        created_records = response.json().get("records", [])
-        created_record_ids.extend(
-            record["id"] for record in created_records if record.get("id")
-        )
+    if deferred:
+        if summary is not None:
+            summary.creations_deferred += len(deferred)
+            summary.lead_create_budget_exhausted = True
 
         print(
-            f"Airtable create batch {batch_number}: "
-            f"{len(created_records)} new records.",
+            f"Lead create budget ({AIRTABLE_LEAD_CREATE_BUDGET}) reached: "
+            f"importing {len(admitted)} of {len(posts)} new posts. The "
+            f"remaining {len(deferred)} are not written and stay importable "
+            f"-- re-run the same Apify run and deduplication will skip what "
+            f"landed and create the next batch.",
             flush=True,
         )
-        time.sleep(0.25)
+
+    if not admitted:
+        print("No new Facebook posts to create in Airtable.", flush=True)
+        return []
+
+    mapped = [
+        {
+            "fields": map_apify_to_airtable(
+                post,
+                apify_run_id=apify_run_id,
+                scraper_run_record_id=scraper_run_record_id,
+            )
+        }
+        for post in admitted
+    ]
+
+    try:
+        created_records = create_table_records(airtable_url(), mapped)
+    except AmbiguousWriteError as exc:
+        # The POST may or may not have landed. Reconcile against Airtable
+        # rather than replaying it, which is what would duplicate records.
+        # Only the admitted posts were ever sent, so only those are in doubt.
+        raise AmbiguousWriteError(
+            f"{exc} Reconciling before anything else happens: "
+            f"{reconcile_import(admitted)}"
+        ) from exc
+
+    created_record_ids = [
+        record["id"] for record in created_records if record.get("id")
+    ]
+
+    if summary is not None:
+        summary.creations_written += len(created_record_ids)
 
     print(
-        f"Airtable import complete: {len(created_record_ids)} created.",
+        f"Airtable import complete: {len(created_record_ids)} created, "
+        f"attributed to Apify run {apify_run_id or 'unknown'}.",
         flush=True,
     )
     return created_record_ids
@@ -853,7 +1769,7 @@ def build_ai_queue_formula() -> str:
     otherwise authoritative.
     """
     clauses = [
-        f"OR({{{FIELD_AI_STATUS}}}=BLANK(),{{{FIELD_AI_STATUS}}}='Pending')",
+        build_unprocessed_status_clause(),
         f"LEN({{{FIELD_TEXT}}}&'')>0",
         f"LEN({{{FIELD_URL}}}&'')>0",
     ]
@@ -864,89 +1780,332 @@ def build_ai_queue_formula() -> str:
     return "AND(" + ",".join(clauses) + ")"
 
 
+def build_unprocessed_status_clause() -> str:
+    """
+    The AI Status values that mean "this record still needs the model".
+
+    With RETRY_AI_ERRORS enabled, Error records are re-queued too. They are
+    not retried forever: process_ai_queue() reads the attempt count recorded
+    in AI Output and skips a record that has already used its budget.
+    """
+    statuses = [
+        f"{{{FIELD_AI_STATUS}}}=BLANK()",
+        f"{{{FIELD_AI_STATUS}}}='{AI_STATUS_PENDING}'",
+    ]
+
+    if RETRY_AI_ERRORS:
+        statuses.append(f"{{{FIELD_AI_STATUS}}}='{AI_STATUS_ERROR}'")
+
+    return "OR(" + ",".join(statuses) + ")"
+
+
 AI_QUEUE_FIELDS = [
     FIELD_URL,
     FIELD_TIME,
     FIELD_USER_NAME,
     FIELD_TEXT,
     FIELD_GROUP_TITLE,
+    FIELD_COMMENTS,
     FIELD_PREQUALIFICATION,
     FIELD_AI_STATUS,
+    FIELD_AI_OUTPUT,
+    # Read so they can be respected. Never written.
+    FIELD_HUMAN_DECISION,
+    FIELD_OUTREACH_STATUS,
 ]
 
+# AI Status values. Kept as constants rather than literals so a schema change
+# is a one-line edit. These are the values the live base already uses; no new
+# single-select option is introduced by this release.
+AI_STATUS_PENDING = "Pending"
+AI_STATUS_PROCESSED = "Processed"
+AI_STATUS_ERROR = "Error"
 
-def is_human_flagged(fields: dict[str, Any]) -> bool:
-    """Did a human mark this record 'Send to AI' in Airtable?"""
+# Human Decision values.
+HUMAN_DECISION_APPROVE = "Approve"
+HUMAN_DECISION_REVIEW = "Review"
+HUMAN_DECISION_REJECT = "Reject"
+
+#: Outreach Status values that mean the lead is already in the sales funnel.
+#: Records in these states are skipped entirely by classification, so a run
+#: can never overwrite a recorded outcome.
+ACTIVE_OUTREACH_STATUSES = frozenset(
+    {
+        "contacted",
+        "replied",
+        "meeting booked",
+        "proposal sent",
+        "won",
+        "lost",
+        "no response",
+        "do not contact",
+    }
+)
+
+
+def human_decision(fields: dict[str, Any]) -> str:
+    """Return the human's decision for a record, normalised."""
+    return str((fields or {}).get(FIELD_HUMAN_DECISION, "") or "").strip()
+
+
+def is_human_rejected(fields: dict[str, Any]) -> bool:
+    """Did a human explicitly reject this record?"""
+    return human_decision(fields).lower() == HUMAN_DECISION_REJECT.lower()
+
+
+def is_human_approved(fields: dict[str, Any]) -> bool:
+    """
+    Did a person set Human Decision = "Approve" on this record?
+
+    This is the *only* source of an explicit human override in the pipeline.
+    "Review" means someone wants to look at it, not that they have decided, so
+    it never bypasses deterministic filtering.
+    """
+    return human_decision(fields).lower() == HUMAN_DECISION_APPROVE.lower()
+
+
+def has_active_outreach(fields: dict[str, Any]) -> bool:
+    """Is this lead already somewhere in the sales funnel?"""
+    status = str(
+        (fields or {}).get(FIELD_OUTREACH_STATUS, "") or ""
+    ).strip().lower()
+
+    return status in ACTIVE_OUTREACH_STATUSES
+
+
+#: Where the cross-run AI attempt count is stored.
+#:
+#: Airtable has no AI Attempts field today, so the count rides in the AI
+#: Output JSON blob. Set AIRTABLE_AI_ATTEMPTS_FIELD once a numeric field
+#: exists and the store switches to it -- no other code changes, and nothing
+#: in the qualification architecture is affected either way.
+RETRY_STORE = ai_retry.RetryStore(
+    output_field=FIELD_AI_OUTPUT,
+    attempts_field=env_str("AIRTABLE_AI_ATTEMPTS_FIELD", ""),
+    error_status=AI_STATUS_ERROR,
+    # A failed reprocess withdraws outreach eligibility. Lead Score, Lead
+    # Tier, Qualified, and the summary all survive as history.
+    outreach_ready_field=FIELD_OUTREACH_READY,
+    outreach_copy_fields=(FIELD_SUGGESTED_DM, FIELD_SUGGESTED_COMMENT),
+    outreach_channel_field=FIELD_RECOMMENDED_CHANNEL,
+    outreach_channel_off=CHANNEL_DO_NOT_CONTACT,
+)
+
+
+def ai_attempts_so_far(fields: dict[str, Any]) -> int:
+    """How many AI attempts this record has already used, across runs."""
+    return RETRY_STORE.read_attempts(fields)
+
+
+def is_retry_exhausted(fields: dict[str, Any]) -> bool:
+    """Has this record used up its cross-run AI attempt budget?"""
+    return RETRY_STORE.is_exhausted(
+        fields,
+        max_attempts=AI_ERROR_MAX_ATTEMPTS,
+        status_field=FIELD_AI_STATUS,
+    )
+
+
+def is_airtable_prequalified(fields: dict[str, Any]) -> bool:
+    """
+    Does the Airtable Prequalification *formula* currently say 'Send to AI'?
+
+    This is a machine-generated value computed from the Request, Service, and
+    Promotion signal columns. It is not a human decision, and it must never be
+    used as one: it cannot bypass the prefilter, lift a hard rejection, or
+    approve an expired post. Its only jobs are choosing which records to fetch
+    and breaking ties in the queue order.
+
+    See ``is_human_approved`` for the real human override.
+    """
     return str(
         (fields or {}).get(FIELD_PREQUALIFICATION, "")
     ).strip().lower() == "send to ai"
 
 
 def build_prequalified_queue_formula() -> str:
-    """Records a human explicitly flagged as 'Send to AI'."""
+    """Records the Airtable formula currently marks 'Send to AI'."""
     return (
         "AND("
         f"{{{FIELD_PREQUALIFICATION}}}='Send to AI',"
-        f"OR({{{FIELD_AI_STATUS}}}=BLANK(),{{{FIELD_AI_STATUS}}}='Pending'),"
+        f"{build_unprocessed_status_clause()},"
         f"LEN({{{FIELD_TEXT}}}&'')>0,"
         f"LEN({{{FIELD_URL}}}&'')>0"
         ")"
     )
 
 
-def fetch_ai_queue() -> list[dict[str, Any]]:
+def build_record_id_formula(record_ids: Sequence[str]) -> str:
+    """Match an explicit set of records by their Airtable record ID."""
+    clauses = ",".join(f"RECORD_ID()='{rid}'" for rid in record_ids)
+    return (
+        "AND("
+        f"OR({clauses}),"
+        f"{build_unprocessed_status_clause()}"
+        ")"
+    )
+
+
+#: Record IDs per RECORD_ID() query. Airtable's formula parameter is a URL
+#: query string, so a 200-post scrape has to be asked for in pieces.
+RECORD_ID_QUERY_CHUNK = 40
+
+
+def fetch_records_by_id(record_ids: Sequence[str]) -> list[dict[str, Any]]:
+    """
+    Fetch specific records by ID, in chunks, preserving nothing about order.
+
+    Used for the current run's own imports so their evaluation cannot depend
+    on where they happen to fall in an Airtable page.
+    """
+    records: list[dict[str, Any]] = []
+
+    for chunk in chunks(list(record_ids), RECORD_ID_QUERY_CHUNK):
+        records.extend(
+            list_airtable_records(
+                formula=build_record_id_formula(chunk),
+                fields=AI_QUEUE_FIELDS,
+            )
+        )
+
+    return records
+
+
+def build_human_approved_queue_formula() -> str:
+    """Records a person set Human Decision = 'Approve' on."""
+    return (
+        "AND("
+        f"{{{FIELD_HUMAN_DECISION}}}='{HUMAN_DECISION_APPROVE}',"
+        f"{build_unprocessed_status_clause()},"
+        f"LEN({{{FIELD_TEXT}}}&'')>0,"
+        f"LEN({{{FIELD_URL}}}&'')>0"
+        ")"
+    )
+
+
+def fetch_ai_queue(
+    current_run_ids: Sequence[str] = (),
+) -> list[dict[str, Any]]:
     """
     Retrieve Airtable records that have never been processed by the AI.
 
-    Fetched in two phases so a curated Prequalification selection is never
-    lost behind an arbitrary page of the backlog:
+    Everything fetched here gets deterministic evaluation. Fetching is not
+    rationing: the OpenAI spend limit is applied later, in process_ai_queue,
+    and applies to *calls*, not to records.
 
-    1. Every record flagged 'Send to AI' by a human.
-    2. The newest remaining unprocessed records, to top up the window.
+    Four phases, in priority order:
 
-    Phase 2 is sorted server-side by post time. Without that sort, Airtable
-    returns records in table order, so truncating to a window produced an
-    arbitrary slice and the prioritisation below could only reorder that
-    slice.
+    1. Every record imported by this run, fetched by record ID.
+    2. Every record a human set Human Decision = 'Approve' on.
+    3. Every record the Airtable formula marks 'Send to AI'.
+    4. The newest remaining unprocessed backlog, up to PREFILTER_SCAN_LIMIT.
+
+    Phases 3 and 4 are historical scanning and PREFILTER_SCAN_LIMIT=0 turns
+    both off. Phases 1 and 2 are not affected by it: this run's own imports
+    are always evaluated in full, and so is anything a person set Human
+    Decision on.
+
+    Phase 1 is the one that matters for a live scrape, and it is unbounded on
+    purpose. A run that imports 50 posts evaluates all 50. Before
+    2026-08-19 there was no phase 1 at all: the whole queue was capped at
+    ``AI_BATCH_LIMIT * 5``, so a run with AI_BATCH_LIMIT=5 evaluated 25 of its
+    50 fresh imports and never looked at the other 25 -- one of which was a
+    strong lead.
+
+    Fetching this run's imports by ID also removes any dependence on Airtable
+    result ordering. Phase 4 is sorted server-side by post time because
+    truncating an unsorted query returns records in table order, so a window
+    over it is an arbitrary slice.
+
+    Phases 1-3 decide what is *looked at*, never what is sent to the model.
+    Every record from every phase goes through the same deterministic
+    prefilter, and the non-overridable gate in process_ai_queue applies to all
+    of them equally.
     """
-    prequalified = list_airtable_records(
-        formula=build_prequalified_queue_formula(),
-        fields=AI_QUEUE_FIELDS,
-    )
+    selected: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
 
-    if prequalified:
-        print(
-            f"Found {len(prequalified)} records flagged 'Send to AI'.",
-            flush=True,
-        )
-
-    seen_ids = {record.get("id") for record in prequalified}
-    window = max(AI_BATCH_LIMIT * 5, AI_BATCH_LIMIT)
-    remaining = max(window - len(prequalified), 0)
-
-    backlog: list[dict[str, Any]] = []
-    if remaining and not REQUIRE_AIRTABLE_PREQUALIFICATION:
-        backlog = [
+    def take(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Add records that are not already selected."""
+        fresh = [
             record
-            for record in list_airtable_records(
-                formula=build_ai_queue_formula(),
-                fields=AI_QUEUE_FIELDS,
-                max_records=remaining + len(prequalified),
-                sort_field=FIELD_TIME,
-                sort_direction="desc",
-            )
-            if record.get("id") not in seen_ids
-        ][:remaining]
+            for record in records
+            if record.get("id") and record.get("id") not in seen_ids
+        ]
+        seen_ids.update(record["id"] for record in fresh)
+        selected.extend(fresh)
+        return fresh
 
+    if current_run_ids:
+        imported = take(fetch_records_by_id(current_run_ids))
         print(
-            f"Topped up with {len(backlog)} newest unprocessed records.",
+            f"Evaluating {len(imported)} of this run's "
+            f"{len(current_run_ids)} imported records.",
             flush=True,
         )
 
-    records = prequalified + backlog
+    approved = take(
+        list_airtable_records(
+            formula=build_human_approved_queue_formula(),
+            fields=AI_QUEUE_FIELDS,
+        )
+    )
+    if approved:
+        print(f"Found {len(approved)} records a human approved.", flush=True)
 
-    print(f"Found {len(records)} unprocessed Airtable records.", flush=True)
-    return records
+    # Phases 3 and 4 both reach backwards into the table for records this
+    # run did not import and nobody asked for by hand. PREFILTER_SCAN_LIMIT
+    # governs both: at 0 the run looks at this run's own imports and at
+    # records a person explicitly decided on, and at nothing else.
+    if PREFILTER_SCAN_LIMIT:
+        prequalified = take(
+            list_airtable_records(
+                formula=build_prequalified_queue_formula(),
+                fields=AI_QUEUE_FIELDS,
+            )
+        )
+        if prequalified:
+            print(
+                f"Found {len(prequalified)} records the Airtable formula "
+                f"marks 'Send to AI' (machine signal, not human approval).",
+                flush=True,
+            )
+    else:
+        print(
+            "Historical backlog scanning is off (PREFILTER_SCAN_LIMIT=0). "
+            "Evaluating this run's imports and explicit human decisions "
+            "only.",
+            flush=True,
+        )
+
+    remaining = max(PREFILTER_SCAN_LIMIT - len(selected), 0)
+
+    if remaining and not REQUIRE_AIRTABLE_PREQUALIFICATION:
+        backlog = take(
+            [
+                record
+                for record in list_airtable_records(
+                    formula=build_ai_queue_formula(),
+                    fields=AI_QUEUE_FIELDS,
+                    max_records=remaining + len(selected),
+                    sort_field=FIELD_TIME,
+                    sort_direction="desc",
+                )
+                if record.get("id") not in seen_ids
+            ][:remaining]
+        )
+
+        print(
+            f"Topped up with {len(backlog)} newest unprocessed backlog "
+            f"records (scan limit {PREFILTER_SCAN_LIMIT}).",
+            flush=True,
+        )
+
+    print(
+        f"Found {len(selected)} records for deterministic evaluation.",
+        flush=True,
+    )
+    return selected
 
 
 def prioritize_ai_queue(
@@ -959,17 +2118,26 @@ def prioritize_ai_queue(
     Order the queue and attach each record's prefilter result.
 
     Priority order:
-      1. Records a human flagged 'Send to AI' in Airtable
+      1. Records a human set Human Decision = 'Approve' on
       2. Records imported during this run
-      3. Newest posts
-      4. Strongest deterministic prefilter score
-      5. Highest buying-intent signal
+      3. Provider requests
+      4. Implementation requests
+      5. Records the Airtable Prequalification formula marks 'Send to AI'
+      6. Strongest Prefilter Score
+      7. Newest posts
+      8. Least comment competition
 
-    A human's explicit selection outranks everything else: if someone went
-    through the table and marked records, those are what the run should
-    spend its batch on.
+    A human's explicit approval outranks everything else: if someone went
+    through the table and approved records, those are what the run should
+    spend its batch on. The Prequalification formula sits far lower, as the
+    machine tiebreaker it is -- ordering only, never eligibility.
+
+    Intent outranks recency on purpose. A three-day-old "looking for someone
+    to rebuild our site" is worth more than a fresh vague grumble, and the old
+    recency-first ordering let a stale backlog of weak posts eat the batch
+    before today's real leads were reached.
     """
-    scored: list[tuple[dict[str, Any], Any]] = []
+    scored: list[tuple[dict[str, Any], PrefilterResult]] = []
 
     for record in records:
         fields = record.get("fields", {}) or {}
@@ -978,26 +2146,46 @@ def prioritize_ai_queue(
             post_time=fields.get(FIELD_TIME),
             now=now,
             max_post_age_days=MAX_POST_AGE_DAYS,
+            comment_count=fields.get(FIELD_COMMENTS),
+            pass_score=PREFILTER_PASS_SCORE,
+            allow_tool_research=ALLOW_TOOL_RESEARCH_TO_AI,
         )
         scored.append((record, prefilter))
 
-    def sort_key(entry: tuple[dict[str, Any], Any]) -> tuple[Any, ...]:
+    def sort_key(
+        entry: tuple[dict[str, Any], PrefilterResult],
+    ) -> tuple[Any, ...]:
         record, prefilter = entry
         fields = record.get("fields", {}) or {}
 
-        prequalified = 1 if is_human_flagged(fields) else 0
-
+        approved = 1 if is_human_approved(fields) else 0
         imported_now = 1 if record.get("id") in created_record_ids else 0
+        prequalified = 1 if is_airtable_prequalified(fields) else 0
+
+        provider = 1 if prefilter.intent_type == intent.INTENT_PROVIDER_REQUEST else 0
+        implementation = (
+            1
+            if prefilter.intent_type == intent.INTENT_IMPLEMENTATION_REQUEST
+            else 0
+        )
 
         timestamp = parse_post_timestamp(fields.get(FIELD_TIME))
         recency = timestamp.timestamp() if timestamp else 0.0
 
+        try:
+            comments = int(fields.get(FIELD_COMMENTS) or 0)
+        except (TypeError, ValueError):
+            comments = 0
+
         return (
-            -prequalified,
+            -approved,
             -imported_now,
-            -recency,
+            -provider,
+            -implementation,
+            -prequalified,
             -prefilter.score,
-            -prefilter.intent_score,
+            -recency,
+            comments,
         )
 
     scored.sort(key=sort_key)
@@ -1040,6 +2228,11 @@ POST URL:
         try:
             token_limit = OPENAI_MAX_OUTPUT_TOKENS + ((attempt - 1) * 1000)
 
+            # Charged before the call, so a request that is made but fails
+            # still counts against the budget. This is the only place
+            # responses.create() is reached from.
+            consume_openai_request()
+
             response = client.responses.create(
                 model=OPENAI_MODEL,
                 instructions=SYSTEM_INSTRUCTIONS,
@@ -1075,6 +2268,10 @@ POST URL:
 
             return json.loads(output_text)
 
+        except OpenAIBudgetExhausted:
+            # Not a per-record failure. Retrying cannot help, and the whole
+            # run must stop asking.
+            raise
         except Exception as exc:
             last_error = exc
 
@@ -1095,13 +2292,77 @@ POST URL:
     )
 
 
+def collect_policy_disqualifiers(fields: dict[str, Any]) -> list[str]:
+    """
+    Rejections that come from pipeline policy rather than the post.
+
+    A suppressed author, an excluded group, or a human's explicit Reject all
+    veto a lead no matter how well it scores.
+    """
+    codes: list[str] = []
+
+    author = str(fields.get(FIELD_USER_NAME, "") or "").strip().lower()
+    if author and author in SUPPRESSED_AUTHORS:
+        codes.append(REJECT_SUPPRESSED_AUTHOR)
+
+    group = str(fields.get(FIELD_GROUP_TITLE, "") or "").strip().lower()
+    if group and group in DISALLOWED_GROUPS:
+        codes.append(REJECT_DISALLOWED_GROUP)
+
+    if is_human_rejected(fields):
+        codes.append(REJECT_HUMAN_REJECTED)
+
+    return codes
+
+
+def is_explicit_service_request(prefilter: PrefilterResult | None) -> bool:
+    """
+    Is this an unmistakable request for a service BruceTech actually sells?
+
+    Both halves are required.
+
+    The intent must be a request for a provider or an implementation, not
+    pain, research, or chatter.
+
+    The service must be **strongly** named: an unambiguous term the author
+    typed, such as "gohighlevel" or "microsoft 365". This reads
+    ``strong_service_match`` rather than ``match_basis == "named"`` on
+    purpose. That basis also covers a match assembled from two weak
+    categories -- "our payment system" is "named" by that measure -- which is
+    far too soft to waive a hard rejection on.
+
+    "I need help with GoHighLevel. I need an expert." qualifies. "A marketing
+    agency to get me patients" does not: that fit is adjacent, and the model
+    rules on it. "Someone to fix our payment system" does not either: no
+    single term there is unambiguous.
+    """
+    if prefilter is None:
+        return False
+
+    return bool(
+        prefilter.service_matched
+        and prefilter.strong_service_match
+        and prefilter.intent_type
+        in (
+            intent.INTENT_PROVIDER_REQUEST,
+            intent.INTENT_IMPLEMENTATION_REQUEST,
+        )
+    )
+
+
 def qualify_post(
     fields: dict[str, Any],
     *,
+    prefilter: PrefilterResult | None = None,
     now: datetime | None = None,
+    human_override: bool = False,
 ) -> tuple[LeadDecision, dict[str, Any]]:
     """
     Extract signals with the AI, then decide deterministically in Python.
+
+    The deterministic intent classification is handed to ``evaluate_lead``
+    so it can veto general-advice posts and gate outreach. The model's
+    signals only ever feed the score.
 
     Returns the decision plus the raw signals for logging.
     """
@@ -1110,6 +2371,8 @@ def qualify_post(
     decision = evaluate_lead(
         signals,
         suggested_dm=signals.get("suggested_dm", ""),
+        # Same model response, same evidence. There is no second call.
+        suggested_comment=signals.get("suggested_comment", ""),
         recommended_channel=signals.get(
             "recommended_channel", "do_not_contact"
         ),
@@ -1119,6 +2382,16 @@ def qualify_post(
         manual_review_threshold=MANUAL_REVIEW_THRESHOLD,
         hot_threshold=HOT_LEAD_THRESHOLD,
         max_post_age_days=MAX_POST_AGE_DAYS,
+        intent_type=prefilter.intent_type if prefilter else None,
+        post_text=fields.get(FIELD_TEXT),
+        min_outreach_confidence=MIN_OUTREACH_CONFIDENCE,
+        business_pain_min_score=BUSINESS_PAIN_OUTREACH_MIN_SCORE,
+        extra_disqualifiers=collect_policy_disqualifiers(fields),
+        human_override=human_override,
+        # An unambiguous ask for a named BruceTech service. Thin business
+        # context downgrades such a record to Manual Review instead of
+        # hard-rejecting it as NO_BUSINESS_CONTEXT.
+        explicit_service_request=is_explicit_service_request(prefilter),
     )
 
     return decision, signals
@@ -1128,11 +2401,58 @@ def qualify_post(
 # Airtable writes
 # ---------------------------------------------------------------------------
 
+def build_ai_output(
+    signals: dict[str, Any],
+    decision: LeadDecision,
+    prefilter: PrefilterResult | None,
+) -> str:
+    """
+    Build the AI Output audit blob.
+
+    Holds the model's raw signals plus the Python-side assessment. The
+    deterministic intent lives here because the Airtable ``Intent Type``
+    column is a formula and cannot be written to.
+    """
+    payload: dict[str, Any] = {
+        "qualification_version": QUALIFICATION_VERSION,
+        "model": OPENAI_MODEL,
+        "lead_score": decision.lead_score,
+        "tier": decision.tier,
+        "score_breakdown": decision.score_breakdown,
+        # The model's raw copy, kept for diagnostics whatever the gate
+        # decided. "written" records what actually reached Airtable, so a
+        # blank sales field can be told apart from a model that wrote
+        # nothing.
+        "outreach_copy": {
+            "written": decision.outreach_ready,
+            "suggested_dm": decision.suggested_dm,
+            "suggested_comment": decision.suggested_comment,
+        },
+        "signals": signals,
+    }
+
+    if prefilter is not None:
+        payload["intent_type"] = prefilter.intent_type
+        payload["intent_label"] = prefilter.intent_label
+        payload["prefilter_score"] = prefilter.score
+        payload["prefilter_breakdown"] = prefilter.breakdown
+        payload["service_categories"] = prefilter.service_categories
+        # How the service match was established. "adjacent" means Python
+        # inferred fit and the model's answer is what settles it.
+        payload["match_basis"] = prefilter.match_basis
+
+    try:
+        return json.dumps(payload, indent=2, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return json.dumps({"qualification_version": QUALIFICATION_VERSION})
+
+
 def map_decision_to_airtable(
     decision: LeadDecision,
     signals: dict[str, Any],
     *,
     prefilter_score: int | None = None,
+    prefilter: PrefilterResult | None = None,
 ) -> dict[str, Any]:
     """Build the Airtable field payload for a processed record."""
     summary = str(signals.get("lead_summary", "") or "")
@@ -1150,12 +2470,15 @@ def map_decision_to_airtable(
         FIELD_LEAD_SUMMARY: summary,
         FIELD_REJECTION_REASON: decision.rejection_reason or "None",
         FIELD_SUGGESTED_DM: decision.suggested_dm,
+        FIELD_SUGGESTED_COMMENT: decision.suggested_comment,
         FIELD_RECOMMENDED_CHANNEL: decision.recommended_channel,
         FIELD_EVIDENCE: str(signals.get("evidence", "") or ""),
         FIELD_LEAD_TIER: decision.tier,
         FIELD_MANUAL_REVIEW: bool(decision.manual_review),
         FIELD_OUTREACH_READY: bool(decision.outreach_ready),
         FIELD_DISQUALIFIERS: ", ".join(decision.hard_rejection_codes) or "",
+        FIELD_QUALIFICATION_VERSION: QUALIFICATION_VERSION,
+        FIELD_AI_OUTPUT: build_ai_output(signals, decision, prefilter),
     }
 
     if prefilter_score is not None:
@@ -1199,12 +2522,15 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
         for update in updates:
             fields = update.get("fields", {}) or {}
             print(
-                f"[DRY RUN] Would update {update.get('id')}: "
+                f"[DRY RUN] Would update "
+                f"{redaction.redact_record_id(update.get('id'))}: "
                 f"tier={fields.get(FIELD_LEAD_TIER)} "
                 f"score={fields.get(FIELD_LEAD_SCORE)} "
                 f"qualified={fields.get(FIELD_QUALIFIED)} "
                 f"outreach={fields.get(FIELD_OUTREACH_READY)} "
-                f"dm={'yes' if fields.get(FIELD_SUGGESTED_DM) else 'no'}",
+                f"dm={'yes' if fields.get(FIELD_SUGGESTED_DM) else 'no'} "
+                f"comment="
+                f"{'yes' if fields.get(FIELD_SUGGESTED_COMMENT) else 'no'}",
                 flush=True,
             )
         return
@@ -1212,7 +2538,12 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
     url = airtable_url()
     headers = airtable_headers()
 
-    for batch in chunks(updates, 10):
+    safe_updates = [
+        {**update, "fields": strip_read_only_fields(update.get("fields", {}))}
+        for update in updates
+    ]
+
+    for batch in chunks(safe_updates, 10):
         payload = batch if _EXTENDED_FIELDS_AVAILABLE else (
             _strip_extended_fields(batch)
         )
@@ -1254,55 +2585,114 @@ def update_airtable_records(updates: list[dict[str, Any]]) -> None:
         time.sleep(0.25)
 
 
-def mark_ai_error(record_id: str, error_message: str) -> None:
+#: Re-exported so callers and tests have one import site for retry policy.
+TRANSIENT_ERROR_MARKERS = ai_retry.TRANSIENT_ERROR_MARKERS
+is_transient_error = ai_retry.is_transient_error
+
+
+def build_error_payload(
+    error_message: str,
+    *,
+    attempts: int,
+    transient: bool,
+) -> dict[str, Any]:
+    """Build the Airtable payload for a failed record."""
+    return RETRY_STORE.build_failure_fields(
+        error_message,
+        attempts=attempts,
+        transient=transient,
+        status_field=FIELD_AI_STATUS,
+        version=QUALIFICATION_VERSION,
+    )
+
+
+def mark_ai_error(
+    record_id: str,
+    error_message: str,
+    *,
+    attempts: int = 1,
+    transient: bool = True,
+) -> None:
+    """Record an AI failure without destroying the record's lead fields."""
     if DRY_RUN:
         print(
-            f"[DRY RUN] Would mark {record_id} as Error: "
-            f"{error_message[:120]}",
+            f"[DRY RUN] Would mark "
+            f"{redaction.redact_record_id(record_id)} as Error "
+            f"(attempt {attempts}, transient={transient}): "
+            f"{redaction.scrub(error_message, limit=120)}",
             flush=True,
         )
         return
 
-    request_with_retry(
-        "PATCH",
+    update_table_records(
         airtable_url(),
-        headers=airtable_headers(),
-        json={
-            "records": [
-                {
-                    "id": record_id,
-                    "fields": {
-                        FIELD_AI_STATUS: "Error",
-                        FIELD_REJECTION_REASON: error_message[:500],
-                    },
-                }
-            ],
-            "typecast": True,
-        },
+        [
+            {
+                "id": record_id,
+                "fields": build_error_payload(
+                    error_message, attempts=attempts, transient=transient
+                ),
+            }
+        ],
     )
 
 
 def build_prefilter_rejection_update(
     record_id: str,
-    prefilter: Any,
+    prefilter: PrefilterResult,
+    *,
+    extra_codes: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Build the Airtable payload for a post rejected before the AI call."""
+    """
+    Build the Airtable payload for a post rejected before the AI call.
+
+    These records cost nothing. The intent classification and the machine
+    -readable rejection codes are recorded so a human can see *why* the post
+    never reached the model without having to re-read it -- a stale record
+    now says STALE_POST in Disqualifiers, exactly as a post-AI rejection
+    would.
+    """
+    codes = list(dict.fromkeys([*prefilter.rejection_codes, *extra_codes]))
+
     reason = " ".join(prefilter.reasons) or "Rejected by deterministic prefilter."
+    if REJECT_HUMAN_REJECTED in extra_codes:
+        reason = HARD_REJECTION_REASONS[REJECT_HUMAN_REJECTED]
+
+    diagnostics = {
+        "qualification_version": QUALIFICATION_VERSION,
+        "prefiltered": True,
+        "intent_type": prefilter.intent_type,
+        "intent_label": prefilter.intent_label,
+        "service_matched": prefilter.service_matched,
+        "service_categories": prefilter.service_categories,
+        "prefilter_score": prefilter.score,
+        "prefilter_breakdown": prefilter.breakdown,
+        "reasons": prefilter.reasons,
+        "rejection_codes": codes,
+        "match_basis": prefilter.match_basis,
+        "ai_called": False,
+    }
 
     return {
         "id": record_id,
         "fields": {
-            FIELD_AI_STATUS: "Processed",
+            FIELD_AI_STATUS: AI_STATUS_PROCESSED,
             FIELD_QUALIFIED: False,
             FIELD_LEAD_SCORE: 0,
             FIELD_SERVICE_MATCH: "None",
             FIELD_REJECTION_REASON: reason[:500],
             FIELD_SUGGESTED_DM: "",
+            FIELD_SUGGESTED_COMMENT: "",
             FIELD_RECOMMENDED_CHANNEL: "do_not_contact",
-            FIELD_LEAD_TIER: "Rejected",
+            FIELD_LEAD_TIER: TIER_REJECTED,
             FIELD_MANUAL_REVIEW: False,
             FIELD_OUTREACH_READY: False,
+            FIELD_DISQUALIFIERS: ", ".join(codes),
             FIELD_PREFILTER_SCORE: int(prefilter.score),
+            FIELD_QUALIFICATION_VERSION: QUALIFICATION_VERSION,
+            FIELD_AI_OUTPUT: json.dumps(
+                diagnostics, indent=2, sort_keys=True, default=str
+            ),
         },
     }
 
@@ -1311,74 +2701,410 @@ def build_prefilter_rejection_update(
 # AI queue processing
 # ---------------------------------------------------------------------------
 
+@dataclass
+class RunSummary:
+    """Counters for one pipeline execution, printed at the end."""
+
+    apify_run_id: str = ""
+    dataset_id: str = ""
+    dataset_items: int = 0
+    new_leads: int = 0
+    duplicates_skipped: int = 0
+    queue_size: int = 0
+    skipped_in_funnel: int = 0
+    skipped_retry_exhausted: int = 0
+    prefilter_accepted: int = 0
+    prefilter_rejected: int = 0
+    #: True when the run stopped early on OPENAI_REQUEST_BUDGET.
+    budget_exhausted: bool = False
+    #: Rejected before the AI call because the post was past MAX_POST_AGE_DAYS.
+    #: Counted inside prefilter_rejected; broken out so a run that spends
+    #: nothing on expired leads says so on its own line.
+    stale_skipped: int = 0
+    human_rejected: int = 0
+    provider_requests: int = 0
+    implementation_requests: int = 0
+    business_pain: int = 0
+    tool_research: int = 0
+    ai_processed: int = 0
+    ai_errors: int = 0
+    hot: int = 0
+    qualified: int = 0
+    manual_review: int = 0
+    rejected: int = 0
+    outreach_ready: int = 0
+
+    # --- Airtable write accounting -----------------------------------
+    #
+    # Kept separate from the counters above on purpose. Those record what
+    # the pipeline *decided* about a record; these record what it actually
+    # changed. Before AIRTABLE_LEAD_UPDATE_BUDGET existed the two were the
+    # same number and nothing said so, which is how a run that rejected two
+    # hundred stale posts could have written two hundred records without
+    # anything in its output looking unusual.
+
+    #: Records the queue genuinely evaluated: everything except the ones
+    #: skipped for being in the sales funnel or out of AI retries.
+    records_evaluated: int = 0
+    #: Records that needed a lead-record mutation, budget or no budget.
+    update_candidates: int = 0
+    #: Mutations actually queued for Airtable, or simulated under DRY_RUN.
+    updates_written: int = 0
+    #: Update candidates left untouched because the budget was spent. These
+    #: records are unchanged and still Pending for a later run.
+    deferred_no_update_budget: int = 0
+    #: Prefilter-accepted records not sent to the model because
+    #: AI_BATCH_LIMIT was reached. Also unchanged and still Pending.
+    deferred_ai_batch_limit: int = 0
+    #: True when AIRTABLE_LEAD_UPDATE_BUDGET stopped at least one write.
+    lead_update_budget_exhausted: bool = False
+
+    #: New posts this run offered to Airtable for creation.
+    creation_candidates: int = 0
+    #: Records actually created, or simulated under DRY_RUN.
+    creations_written: int = 0
+    #: New posts left uncreated because AIRTABLE_LEAD_CREATE_BUDGET was
+    #: spent. Not lost: deduplication makes them new again next run.
+    creations_deferred: int = 0
+    #: True when AIRTABLE_LEAD_CREATE_BUDGET stopped at least one creation.
+    lead_create_budget_exhausted: bool = False
+
+    def render(self) -> str:
+        return "\n".join(
+            [
+                "-" * 62,
+                "RUN SUMMARY",
+                "-" * 62,
+                f"  Apify run ID          {self.apify_run_id or 'n/a'}",
+                f"  Dataset ID            {self.dataset_id or 'n/a'}",
+                f"  Dataset items         {self.dataset_items}",
+                f"  New unique leads      {self.new_leads}",
+                f"  Duplicates skipped    {self.duplicates_skipped}",
+                "",
+                f"  AI queue size         {self.queue_size}",
+                f"  Skipped (in funnel)   {self.skipped_in_funnel}",
+                f"  Skipped (retries up)  {self.skipped_retry_exhausted}",
+                f"  Prefilter accepted    {self.prefilter_accepted}",
+                f"  Prefilter rejected    {self.prefilter_rejected}",
+                f"  Stale (no AI call)    {self.stale_skipped}",
+                f"  Human rejected        {self.human_rejected}",
+                "",
+                f"  Provider requests     {self.provider_requests}",
+                f"  Implementation reqs   {self.implementation_requests}",
+                f"  Business pain         {self.business_pain}",
+                f"  Tool research         {self.tool_research}",
+                "",
+                f"  AI processed          {self.ai_processed}",
+                f"  OpenAI requests       {openai_requests_made()}"
+                + (" (BUDGET EXHAUSTED)" if self.budget_exhausted else ""),
+                f"  AI errors             {self.ai_errors}",
+                f"  Hot                   {self.hot}",
+                f"  Qualified             {self.qualified}",
+                f"  Manual review         {self.manual_review}",
+                f"  Rejected              {self.rejected}",
+                f"  Outreach ready        {self.outreach_ready}",
+                "",
+                f"  Creation candidates   {self.creation_candidates}",
+                f"  Creations {'simulated' if DRY_RUN else 'written  '}   "
+                f"{self.creations_written}"
+                + ("  [DRY RUN: nothing written]" if DRY_RUN else ""),
+                f"  Creations deferred    {self.creations_deferred}"
+                + (
+                    "  [BUDGET EXHAUSTED]"
+                    if self.lead_create_budget_exhausted
+                    else ""
+                ),
+                "  Lead create budget    "
+                + (
+                    "not spent (dry run)"
+                    if DRY_RUN
+                    else str(AIRTABLE_LEAD_CREATE_BUDGET)
+                    if AIRTABLE_LEAD_CREATE_BUDGET
+                    else "unlimited"
+                ),
+                "",
+                f"  Records evaluated     {self.records_evaluated}",
+                f"  Update candidates     {self.update_candidates}",
+                f"  Updates {'simulated' if DRY_RUN else 'written  '}     "
+                f"{self.updates_written}"
+                + ("  [DRY RUN: nothing written]" if DRY_RUN else ""),
+                f"  Deferred (no budget)  {self.deferred_no_update_budget}"
+                + (
+                    "  [BUDGET EXHAUSTED]"
+                    if self.lead_update_budget_exhausted
+                    else ""
+                ),
+                f"  Deferred (AI limit)   {self.deferred_ai_batch_limit}",
+                "  Lead update budget    "
+                + (
+                    "not spent (dry run)"
+                    if DRY_RUN
+                    else str(AIRTABLE_LEAD_UPDATE_BUDGET)
+                    if AIRTABLE_LEAD_UPDATE_BUDGET
+                    else "unlimited"
+                ),
+                "-" * 62,
+            ]
+        )
+
+
 def process_ai_queue(
-    prioritized: list[tuple[dict[str, Any], Any]],
+    prioritized: list[tuple[dict[str, Any], PrefilterResult]],
     *,
+    summary: RunSummary | None = None,
     now: datetime | None = None,
-) -> None:
+) -> RunSummary:
+    """
+    Work the prioritised queue: prefilter, then AI, then deterministic scoring.
+
+    Records already in the sales funnel are skipped outright -- reclassifying
+    a lead someone has already contacted would overwrite the sales record for
+    no benefit.
+    """
+    summary = summary or RunSummary()
+    summary.queue_size = len(prioritized)
+
     if not prioritized:
         print("No records require AI qualification.", flush=True)
-        return
+        return summary
 
     pending_updates: list[dict[str, Any]] = []
-    counts = {
-        "hot": 0,
-        "qualified": 0,
-        "manual_review": 0,
-        "rejected": 0,
-        "prefiltered": 0,
-        "errors": 0,
-    }
-    processed_by_ai = 0
+    budget_notice_printed = False
+
+    def flush(force: bool = False) -> None:
+        nonlocal pending_updates
+        if pending_updates and (force or len(pending_updates) >= 10):
+            update_airtable_records(pending_updates)
+            pending_updates = []
+
+    def claim_update(position: int) -> bool:
+        """
+        Reserve one lead-record mutation for the record at ``position``.
+
+        Returns False when AIRTABLE_LEAD_UPDATE_BUDGET is spent, in which
+        case the caller must write nothing: the record keeps whatever it
+        already had, stays Pending, and is picked up by a later run.
+
+        The reservation is taken here, where the change to a record is
+        decided, rather than where the PATCH is sent. Ten records written in
+        one batched request are ten mutations, which is what an operator
+        capping the blast radius of a validation run means by "three".
+        """
+        nonlocal budget_notice_printed
+
+        summary.update_candidates += 1
+
+        try:
+            consume_lead_update()
+        except LeadUpdateBudgetExhausted as exc:
+            summary.deferred_no_update_budget += 1
+            summary.lead_update_budget_exhausted = True
+
+            if not budget_notice_printed:
+                budget_notice_printed = True
+                print(
+                    f"[{position}/{len(prioritized)}] {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return False
+
+        summary.updates_written += 1
+        return True
 
     for index, (record, prefilter) in enumerate(prioritized, start=1):
         record_id = record["id"]
         fields = record.get("fields", {}) or {}
-        author = fields.get(FIELD_USER_NAME, "")
-        post_url = fields.get(FIELD_URL, "")
 
-        # A human's explicit 'Send to AI' overrides the keyword prefilter.
-        # Someone reviewed this record; do not silently reject it on a
-        # keyword miss.
-        human_flagged = is_human_flagged(fields)
+        # The only thing this loop prints about which record it is looking
+        # at. A keyed fingerprint is stable within the run, so two lines
+        # about one record can be matched up, and means nothing outside it.
+        # The post URL, the post text, and the author's name never reach a
+        # log line -- this workflow's logs are readable by anyone who can
+        # read the repository, and the posts belong to other people.
+        ref = redaction.redact_record_id(record_id)
+
+        # Count what the deterministic classifier saw, whatever happens next.
+        if prefilter.intent_type == intent.INTENT_PROVIDER_REQUEST:
+            summary.provider_requests += 1
+        elif prefilter.intent_type == intent.INTENT_IMPLEMENTATION_REQUEST:
+            summary.implementation_requests += 1
+        elif prefilter.intent_type == intent.INTENT_BUSINESS_PAIN:
+            summary.business_pain += 1
+        elif prefilter.intent_type == intent.INTENT_TOOL_RESEARCH:
+            summary.tool_research += 1
+
+        # Never touch a lead that is already in the sales funnel.
+        if has_active_outreach(fields):
+            summary.skipped_in_funnel += 1
+            print(
+                f"[{index}/{len(prioritized)}] Skipped: already "
+                f"{fields.get(FIELD_OUTREACH_STATUS)!r} in the funnel. "
+                f"{ref}",
+                flush=True,
+            )
+            continue
+
+        # A record that has burned its cross-run retry budget is left alone.
+        if is_retry_exhausted(fields):
+            summary.skipped_retry_exhausted += 1
+            print(
+                f"[{index}/{len(prioritized)}] Skipped: "
+                f"{AI_ERROR_MAX_ATTEMPTS} failed AI attempts already. "
+                f"{ref}",
+                flush=True,
+            )
+            continue
+
+        # Past the two skips above, this record genuinely gets evaluated.
+        summary.records_evaluated += 1
+
+        # A human's explicit Approve overrides the intent heuristics only.
+        # It is read from Human Decision, never from the machine-generated
+        # Prequalification formula.
+        human_approved = is_human_approved(fields)
+
+        # A human's explicit Reject ends it here. Asking the model about a
+        # record someone has already turned down cannot change the outcome,
+        # so it must not cost a call.
+        if is_human_rejected(fields):
+            summary.human_rejected += 1
+            summary.rejected += 1
+
+            if not claim_update(index):
+                continue
+
+            pending_updates.append(
+                build_prefilter_rejection_update(
+                    record_id,
+                    prefilter,
+                    extra_codes=[REJECT_HUMAN_REJECTED],
+                )
+            )
+            print(
+                f"[{index}/{len(prioritized)}] Skipped: Human Decision is "
+                f"{HUMAN_DECISION_REJECT!r}. {ref}",
+                flush=True,
+            )
+            flush()
+            continue
+
+        # Non-overridable pre-AI gate.
+        #
+        # STALE_POST is the reason this exists. An expired post is rejected
+        # by evaluate_lead() anyway, so sending it to the model buys nothing
+        # and costs a call -- which is exactly what happened in production on
+        # 2026-08-18, when six formula-prequalified records skipped the
+        # prefilter and five posts between 17 and 25 days old were paid for
+        # before being rejected as stale.
+        #
+        # This runs before ENFORCE_PYTHON_PREFILTER, before the human
+        # override, and before get_openai_client(). Nothing lifts it.
+        blocking_codes = prefilter.non_overridable_codes
+        if blocking_codes:
+            if prefilter.is_stale:
+                summary.stale_skipped += 1
+            summary.prefilter_rejected += 1
+            summary.rejected += 1
+
+            if not claim_update(index):
+                continue
+
+            pending_updates.append(
+                build_prefilter_rejection_update(record_id, prefilter)
+            )
+            print(
+                f"[{index}/{len(prioritized)}] Blocked before AI "
+                f"({', '.join(blocking_codes)}) "
+                f"intent={prefilter.intent_type} "
+                f"score={prefilter.score} {ref}",
+                flush=True,
+            )
+            flush()
+            continue
 
         # Deterministic prefilter: never spend a token on an obvious reject.
+        # Past this point a human Approve may let a record through, because
+        # everything still standing is a heuristic judgement -- intent, or a
+        # Prefilter Score below the minimum.
         if (
             ENFORCE_PYTHON_PREFILTER
             and not prefilter.passed
-            and not human_flagged
+            and not human_approved
         ):
-            counts["prefiltered"] += 1
-            counts["rejected"] += 1
+            summary.prefilter_rejected += 1
+            summary.rejected += 1
+
+            if not claim_update(index):
+                continue
+
             pending_updates.append(
                 build_prefilter_rejection_update(record_id, prefilter)
             )
             print(
                 f"[{index}/{len(prioritized)}] Prefiltered out "
-                f"(score={prefilter.score}) URL={post_url}",
+                f"(intent={prefilter.intent_type} "
+                f"service={prefilter.service_matched} "
+                f"score={prefilter.score}) {ref}",
                 flush=True,
             )
-
-            if len(pending_updates) == 10:
-                update_airtable_records(pending_updates)
-                pending_updates = []
+            flush()
             continue
 
-        if processed_by_ai >= AI_BATCH_LIMIT:
+        summary.prefilter_accepted += 1
+
+        if summary.ai_processed >= AI_BATCH_LIMIT:
+            summary.deferred_ai_batch_limit += 1
+            continue
+
+        # An OpenAI result is only worth paying for if there is somewhere to
+        # put it. Checking first means the budget can never be spent on a
+        # call whose answer is then thrown away -- the record is left exactly
+        # as it was, and the next run asks the model instead.
+        #
+        # The pipeline is single-threaded and nothing else consumes the
+        # budget between here and the write below, so this check is a valid
+        # reservation for the one mutation this record will make: either the
+        # qualification result, or the AI-error state if the call fails.
+        if not has_lead_update_budget():
+            summary.update_candidates += 1
+            summary.deferred_no_update_budget += 1
+            summary.lead_update_budget_exhausted = True
+
+            if not budget_notice_printed:
+                budget_notice_printed = True
+                print(
+                    f"[{index}/{len(prioritized)}] Lead update budget "
+                    f"({AIRTABLE_LEAD_UPDATE_BUDGET}) is spent. Not calling "
+                    f"OpenAI for records whose result could not be saved.",
+                    file=sys.stderr,
+                    flush=True,
+                )
             continue
 
         try:
-            processed_by_ai += 1
-            decision, signals = qualify_post(fields, now=now)
+            summary.ai_processed += 1
+            decision, signals = qualify_post(
+                fields,
+                prefilter=prefilter,
+                now=now,
+                human_override=human_approved,
+            )
 
             if decision.tier == "Hot":
-                counts["hot"] += 1
+                summary.hot += 1
             elif decision.tier == "Qualified":
-                counts["qualified"] += 1
+                summary.qualified += 1
             elif decision.tier == TIER_MANUAL_REVIEW:
-                counts["manual_review"] += 1
+                summary.manual_review += 1
             else:
-                counts["rejected"] += 1
+                summary.rejected += 1
+
+            if decision.outreach_ready:
+                summary.outreach_ready += 1
+
+            if not claim_update(index):
+                continue
 
             pending_updates.append(
                 {
@@ -1387,6 +3113,7 @@ def process_ai_queue(
                         decision,
                         signals,
                         prefilter_score=prefilter.score,
+                        prefilter=prefilter,
                     ),
                 }
             )
@@ -1395,9 +3122,10 @@ def process_ai_queue(
                 f"[{index}/{len(prioritized)}] "
                 f"Score={decision.lead_score} "
                 f"Tier={decision.tier} "
+                f"Intent={prefilter.intent_type} "
                 f"Qualified={decision.qualified} "
                 f"Outreach={decision.outreach_ready} "
-                f"Author={author!r} URL={post_url}",
+                f"{ref}",
                 flush=True,
             )
 
@@ -1408,47 +3136,246 @@ def process_ai_queue(
                     flush=True,
                 )
 
-            if len(pending_updates) == 10:
-                update_airtable_records(pending_updates)
-                pending_updates = []
+            flush()
 
-        except Exception as exc:
-            counts["errors"] += 1
+        except OpenAIBudgetExhausted as exc:
+            # The run has spent its request budget. Every remaining record
+            # would fail the same way, and marking them all as AI errors
+            # would burn their retry budgets for a problem that is not
+            # theirs. Stop asking and leave them Pending for the next run.
+            summary.budget_exhausted = True
+            print(
+                f"[{index}/{len(prioritized)}] {exc} "
+                f"Stopping the queue; {len(prioritized) - index + 1} "
+                f"records remain Pending for the next run.",
+                file=sys.stderr,
+                flush=True,
+            )
+            summary.ai_processed -= 1
+            break
+
+        except Exception as exc:  # noqa: BLE001 - one bad record must not
+            # abort the batch; the failure is recorded and bounded.
+            summary.ai_errors += 1
+            transient = is_transient_error(exc)
+
+            # A permanent failure consumes the whole budget immediately, so
+            # it is never retried. A transient one gets another go next run.
+            attempts = RETRY_STORE.next_attempt_count(
+                fields,
+                transient=transient,
+                max_attempts=AI_ERROR_MAX_ATTEMPTS,
+            )
+
             print(
                 f"[{index}/{len(prioritized)}] AI processing failed for "
-                f"{record_id}: {exc}",
+                f"{ref} (attempt {attempts}/{AI_ERROR_MAX_ATTEMPTS}, "
+                f"transient={transient}): "
+                f"{redaction.scrub(exc, limit=300)}",
                 file=sys.stderr,
                 flush=True,
             )
 
+            if not claim_update(index):
+                continue
+
             try:
-                mark_ai_error(record_id, str(exc))
-            except Exception as mark_exc:
+                mark_ai_error(
+                    record_id,
+                    str(exc),
+                    attempts=attempts,
+                    transient=transient,
+                )
+            except Exception as mark_exc:  # noqa: BLE001 - best effort
                 print(
-                    f"Could not mark {record_id} as Error: {mark_exc}",
+                    f"Could not mark {ref} as Error: "
+                    f"{redaction.scrub(mark_exc, limit=300)}",
                     file=sys.stderr,
                     flush=True,
                 )
 
-    update_airtable_records(pending_updates)
-
-    print(
-        "AI processing complete: "
-        f"{counts['hot']} hot, "
-        f"{counts['qualified']} qualified, "
-        f"{counts['manual_review']} manual review, "
-        f"{counts['rejected']} rejected "
-        f"({counts['prefiltered']} prefiltered), "
-        f"{counts['errors']} errors.",
-        flush=True,
-    )
+    flush(force=True)
+    return summary
 
 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
+def validate_airtable_schema() -> None:
+    """
+    Best-effort preflight check that the Raw Signals fields exist.
+
+    Uses the Airtable metadata API. Tokens without the ``schema.bases:read``
+    scope cannot read it, in which case the check is skipped with a note
+    rather than blocking the run -- the write path still degrades gracefully.
+
+    This never creates, renames, or deletes anything. It only reads.
+    """
+    base_id = require_env("AIRTABLE_BASE_ID")
+    table_name = require_env("AIRTABLE_TABLE_NAME")
+
+    try:
+        response = request_with_retry(
+            "GET",
+            f"https://api.airtable.com/v0/meta/bases/{base_id}/tables",
+            headers=airtable_headers(),
+            max_attempts=2,
+        )
+        tables = (response.json() or {}).get("tables", [])
+    except Exception as exc:  # noqa: BLE001 - preflight must never block
+        print(
+            f"Skipping Airtable schema validation ({exc}). The token most "
+            f"likely lacks the schema.bases:read scope.",
+            flush=True,
+        )
+        return
+
+    table = next(
+        (
+            item
+            for item in tables
+            if str(item.get("name", "")).strip() == table_name.strip()
+        ),
+        None,
+    )
+
+    if table is None:
+        raise RuntimeError(
+            f"Airtable table {table_name!r} was not found in base {base_id}. "
+            f"Check AIRTABLE_TABLE_NAME."
+        )
+
+    fields = table.get("fields", [])
+    present = {str(field.get("name", "")).strip() for field in fields}
+    present_ids = {str(field.get("id", "")).strip() for field in fields}
+
+    missing = [
+        name
+        for name in REQUIRED_RAW_SIGNAL_FIELDS
+        if name not in present
+        and KNOWN_FIELD_IDS.get(name, "") not in present_ids
+    ]
+
+    if missing:
+        raise RuntimeError(
+            f"Airtable table {table_name!r} is missing required fields: "
+            f"{', '.join(missing)}. Create them in Airtable (see README.md) "
+            f"and re-run. No records were modified."
+        )
+
+    print(
+        f"Airtable schema validated: all {len(REQUIRED_RAW_SIGNAL_FIELDS)} "
+        f"required fields present in {table_name!r}.",
+        flush=True,
+    )
+
+
+def log_scraper_run(
+    run: apify_runs.ApifyRun,
+) -> scraper_runs.ScraperRunRecord | None:
+    """Upsert the Facebook Post Scraper Runs record for this Apify run."""
+    if not LOG_SCRAPER_RUNS:
+        print("Scraper run logging is disabled.", flush=True)
+        return None
+
+    table_url = airtable_table_url(SCRAPER_RUNS_TABLE)
+
+    try:
+        return scraper_runs.upsert_scraper_run(
+            run,
+            lister=list_scraper_run_records,
+            # Scraper Runs shares no column names with Raw Signals.
+            creator=lambda records: create_table_records(
+                table_url, records, protected=SCRAPER_RUNS_PROTECTED_FIELDS
+            ),
+            updater=lambda updates: update_table_records(
+                table_url, updates, protected=SCRAPER_RUNS_PROTECTED_FIELDS
+            ),
+            run_input=fetch_apify_run_input(run),
+            dry_run=DRY_RUN,
+        )
+    except Exception as exc:  # noqa: BLE001 - logging must not lose the import
+        print(
+            f"Could not log Apify run {run.id} to {SCRAPER_RUNS_TABLE}: "
+            f"{exc}. Imported posts will still carry the run ID.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def scraper_run_dates() -> dict[str, str]:
+    """Map each scraper-run record ID to its Run Date, for Last Run."""
+    try:
+        records = list_scraper_run_records(
+            fields=[scraper_runs.FIELD_RUN_DATE]
+        )
+    except Exception as exc:  # noqa: BLE001 - Last Run is optional
+        print(f"Could not read scraper run dates: {exc}", flush=True)
+        return {}
+
+    dates: dict[str, str] = {}
+
+    for record in records:
+        record_id = record.get("id")
+        run_date = (record.get("fields", {}) or {}).get(
+            scraper_runs.FIELD_RUN_DATE
+        )
+
+        if record_id and run_date:
+            dates[str(record_id)] = str(run_date)
+
+    return dates
+
+
+RAW_SIGNAL_FIELD_NAMES = group_performance.RawSignalFieldNames(
+    group_title=FIELD_GROUP_TITLE,
+    text=FIELD_TEXT,
+    qualified=FIELD_QUALIFIED,
+    outreach_ready=FIELD_OUTREACH_READY,
+    outreach_status=FIELD_OUTREACH_STATUS,
+    legacy_contacted=FIELD_CONTACTED_LEGACY,
+    evidence=FIELD_EVIDENCE,
+    intent_type=FIELD_INTENT_TYPE,
+    scraper_run=FIELD_SCRAPER_RUN,
+)
+
+
+def refresh_group_performance() -> None:
+    """Recompute the Facebook Group Performance operational counts."""
+    if not UPDATE_GROUP_PERFORMANCE:
+        print("Group performance refresh is disabled.", flush=True)
+        return
+
+    performance_url = airtable_table_url(GROUP_PERFORMANCE_TABLE)
+
+    try:
+        group_performance.refresh_group_performance(
+            raw_signal_lister=list_airtable_records,
+            performance_lister=list_group_performance_records,
+            performance_updater=lambda updates: update_table_records(
+                performance_url,
+                updates,
+                protected=group_performance.NEVER_WRITE_FIELDS,
+            ),
+            fields=RAW_SIGNAL_FIELD_NAMES,
+            run_dates=scraper_run_dates(),
+            dry_run=DRY_RUN,
+        )
+    except Exception as exc:  # noqa: BLE001 - reporting must not fail the run
+        print(
+            f"Could not refresh {GROUP_PERFORMANCE_TABLE}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def main() -> None:
+    # Before anything at all: a bad budget must not cost an Airtable read,
+    # an Apify resolution, or an OpenAI client.
+    validate_budget_configuration()
+
     started_at = datetime.now(timezone.utc)
 
     print(
@@ -1456,27 +3383,68 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"Thresholds: hot>={HOT_LEAD_THRESHOLD}, "
+        f"Qualification {QUALIFICATION_VERSION}: "
+        f"hot>={HOT_LEAD_THRESHOLD}, "
         f"qualified>={QUALIFICATION_THRESHOLD}, "
         f"manual review>={MANUAL_REVIEW_THRESHOLD}, "
-        f"max post age={MAX_POST_AGE_DAYS}d.",
+        f"max post age={MAX_POST_AGE_DAYS}d, "
+        f"prefilter pass>={PREFILTER_PASS_SCORE}, "
+        f"min outreach confidence={MIN_OUTREACH_CONFIDENCE}.",
         flush=True,
     )
 
     if DRY_RUN:
         print(
-            "DRY RUN: Airtable will not be modified. Records will be read "
-            "and scored, and the intended writes printed.",
+            "DRY RUN: Airtable will not be modified and no Apify task will "
+            "be started. Records will be read and scored, and the intended "
+            "writes printed.",
             flush=True,
         )
 
-    # 1. Collect posts from Apify.
-    apify_posts = collect_apify_posts()
+    summary = RunSummary()
+    reset_openai_request_budget()
+    reset_lead_update_budget()
+    reset_lead_create_budget()
 
-    # 2. Import only posts that are new by ID, canonical URL, or fingerprint.
+    if not DRY_RUN:
+        validate_airtable_schema()
+
+    # 1. Resolve exactly one Apify run and read that run's own dataset.
+    #    In dry-run mode a paid task run is never started; the last
+    #    successful run is read instead.
+    run = resolve_apify_run(
+        start_new_run=APIFY_START_NEW_RUN and not DRY_RUN
+    )
+
+    if DRY_RUN and APIFY_START_NEW_RUN:
+        print(
+            "DRY RUN: skipped starting a new (paid) Apify task run; read the "
+            f"last successful run {run.id} instead.",
+            flush=True,
+        )
+
+    apify_posts = collect_apify_posts(run)
+
+    summary.apify_run_id = run.id
+    summary.dataset_id = run.dataset_id
+    summary.dataset_items = run.item_count or 0
+
+    # 2. Log the run, then import only posts that are new by ID, canonical
+    #    URL, or fingerprint -- each linked to the run that produced it.
+    scraper_run = log_scraper_run(run)
+
     seen_keys = fetch_existing_identity_keys()
     new_posts = select_new_posts(apify_posts, seen_keys)
-    created_record_ids = create_new_posts_in_airtable(new_posts)
+
+    summary.new_leads = len(new_posts)
+    summary.duplicates_skipped = len(apify_posts) - len(new_posts)
+
+    created_record_ids = create_new_posts_in_airtable(
+        new_posts,
+        apify_run_id=run.id,
+        scraper_run_record_id=scraper_run.record_id if scraper_run else "",
+        summary=summary,
+    )
 
     if created_record_ids:
         print("Waiting for Airtable formulas to calculate...", flush=True)
@@ -1485,13 +3453,38 @@ def main() -> None:
         print("No new Facebook posts were imported.", flush=True)
 
     # 3. Prioritise the backlog, then qualify.
-    ai_records = fetch_ai_queue()
-    prioritized = prioritize_ai_queue(ai_records, set(created_record_ids))
-    process_ai_queue(prioritized)
+    ai_records = fetch_ai_queue(created_record_ids)
+    current_run_ids = set(created_record_ids)
+
+    if DRY_RUN and new_posts:
+        # Nothing was created, so evaluate the scrape in memory instead. This
+        # is the whole point of a dry run: see what today's posts would do.
+        dry_run_records = build_dry_run_records(
+            new_posts,
+            apify_run_id=run.id,
+            scraper_run_record_id=(
+                scraper_run.record_id if scraper_run else ""
+            ),
+        )
+        print(
+            f"[DRY RUN] Evaluating {len(dry_run_records)} newly scraped "
+            f"posts in memory. They are not in Airtable and are not "
+            f"written there.",
+            flush=True,
+        )
+        ai_records = dry_run_records + ai_records
+        current_run_ids |= {record["id"] for record in dry_run_records}
+
+    prioritized = prioritize_ai_queue(ai_records, current_run_ids)
+    process_ai_queue(prioritized, summary=summary)
+
+    # 4. Refresh the measurement loop.
+    refresh_group_performance()
 
     completed_at = datetime.now(timezone.utc)
     duration = (completed_at - started_at).total_seconds()
 
+    print(summary.render(), flush=True)
     print(
         f"BruceTech pipeline completed at {completed_at.isoformat()} "
         f"in {duration:.1f}s.",
