@@ -375,6 +375,70 @@ Additional safety, retry, outreach, and Airtable write-budget settings are docum
 
 ---
 
+
+## Environment variables
+
+Production credentials should be stored as GitHub Actions secrets or local environment variables and must never be committed.
+
+### Required secrets
+
+| Variable | Purpose |
+|---|---|
+| `APIFY_TOKEN` | Apify API token |
+| `APIFY_TASK_ID` | Apify task to read or run |
+| `AIRTABLE_TOKEN` | Airtable personal access token |
+| `AIRTABLE_BASE_ID` | Airtable base ID |
+| `AIRTABLE_TABLE_NAME` | Raw Signals table name |
+| `OPENAI_API_KEY` | OpenAI API key |
+
+### Runtime and safety controls
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `QUALIFICATION_THRESHOLD` | `65` | Minimum score to qualify |
+| `MANUAL_REVIEW_THRESHOLD` | `55` | Minimum score for manual review |
+| `HOT_LEAD_THRESHOLD` | `80` | Minimum score for the Hot tier |
+| `MAX_POST_AGE_DAYS` | `5` | Posts older than this are rejected |
+| `AI_BATCH_LIMIT` | `20` | Maximum records sent to the model per run |
+| `OPENAI_MAX_ATTEMPTS` | `3` | Maximum model attempts per record within a run |
+| `OPENAI_REQUEST_BUDGET` | `AI_BATCH_LIMIT × OPENAI_MAX_ATTEMPTS` | Hard ceiling on actual OpenAI API requests; `0` disables the ceiling |
+| `PREFILTER_SCAN_LIMIT` | `200` | Maximum historical backlog records scanned; `0` turns historical scanning off |
+| `AIRTABLE_LEAD_UPDATE_BUDGET` | `0` (unlimited) | Maximum lead records changed in Airtable during the run |
+| `AIRTABLE_LEAD_CREATE_BUDGET` | `0` (unlimited) | Maximum new lead records created in Airtable during the run |
+| `LOG_FINGERPRINT_SALT` | random per run | Salt used for privacy-preserving log fingerprints |
+| `DRY_RUN` | `false` | Evaluate normally without Airtable writes or starting a paid Apify run |
+| `RUN_APIFY_TASK` | `false` | Start a fresh Apify task and use that exact run |
+| `APIFY_RUN_ID` | blank | Pin processing to one exact Apify run |
+
+### Recommended AI request budgets
+
+`AI_BATCH_LIMIT` counts records sent to the model. `OPENAI_REQUEST_BUDGET` counts actual API requests, including retries.
+
+| Situation | `AI_BATCH_LIMIT` | `OPENAI_REQUEST_BUDGET` | Worst case |
+|---|---|---|---|
+| Testing a change | `5` | leave blank (derives 15) | 15 requests |
+| Normal daily run | `20` | leave blank (derives 60) | 60 requests |
+| Working a backlog | `100` | `150` | 150 requests |
+| Diagnosing retry storms | `5` | `5` | 5 requests |
+
+Leaving `OPENAI_REQUEST_BUDGET` blank derives the ceiling from `AI_BATCH_LIMIT × OPENAI_MAX_ATTEMPTS`. With the normal defaults, 20 records and 3 attempts derive a ceiling of 60 requests.
+
+### What the logs may say
+
+Workflow logs are designed to expose operational state without publishing lead identities or source content.
+
+| Printed in full | Never printed |
+|---|---|
+| Queue position and totals | Post URL |
+| Intent type and Prefilter Score | Post text |
+| Rejection codes and disqualifiers | Author name |
+| Tier, score, qualified, and outreach flags | Full Airtable record ID |
+| Apify run and dataset IDs | Raw lead content |
+
+Records may be represented by keyed fingerprints for debugging without exposing the underlying source data.
+
+---
+
 ## Running Locally
 
 ### 1. Create a virtual environment
