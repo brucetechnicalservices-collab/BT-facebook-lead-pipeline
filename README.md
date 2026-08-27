@@ -93,6 +93,68 @@ Lead decision         Suggested outreach
 
 ---
 
+## BruceTech CRM
+
+The Facebook Lead Pipeline feeds qualified and reviewable opportunities into the broader **BruceTech CRM**, where leads from multiple acquisition channels can be reviewed, prioritized, and tracked through outreach.
+
+### Live CRM
+
+**[View the BruceTech CRM →](https://crm.brucetech.ca)**
+
+> The CRM application is publicly viewable for portfolio purposes, while the CRM source repository and production configuration remain private.
+
+![BruceTech CRM Dashboard](docs/images/brucetech-crm-dashboard.png)
+
+### CRM capabilities
+
+The CRM brings multiple BruceTech lead-generation workflows into a centralized interface:
+
+- **Facebook leads** generated and qualified by this pipeline
+- **Google Maps leads** from local-business prospecting workflows
+- **Reddit leads** from community lead-generation workflows
+- centralized lead qualification and review
+- lead scoring and priority views
+- outreach status tracking
+- source-specific dashboards
+- recent lead activity
+- qualified vs. review-required reporting
+- centralized sales workflow visibility
+
+### System relationship
+
+```text
+Facebook Groups
+      |
+      v
+    Apify
+      |
+      v
+Facebook Lead Pipeline
+      |
+      +--> Normalize + deduplicate
+      |
+      +--> Intent + service matching
+      |
+      +--> OpenAI signal extraction
+      |
+      +--> Deterministic qualification
+      |
+      v
+   Airtable
+      |
+      v
+BruceTech CRM
+      |
+      +--> Lead review
+      +--> Prioritization
+      +--> Outreach tracking
+      +--> Sales workflow
+```
+
+The CRM is a separate internal BruceTech application. This repository contains the Facebook acquisition and qualification pipeline, while CRM application code and production data are maintained privately.
+
+---
+
 ## Engineering Highlights
 
 ### Deterministic qualification
